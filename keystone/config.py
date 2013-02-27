@@ -259,7 +259,8 @@ register_str('user_name_attribute', group='ldap', default='sn')
 register_str('user_mail_attribute', group='ldap', default='email')
 register_str('user_pass_attribute', group='ldap', default='userPassword')
 register_str('user_enabled_attribute', group='ldap', default='enabled')
-register_str('user_domain_id_attribute', group='ldap', default='domain_id')
+register_str('user_domain_id_attribute', group='ldap',
+             default='businessCategory')
 register_int('user_enabled_mask', group='ldap', default=0)
 register_str('user_enabled_default', group='ldap', default='True')
 register_list('user_attribute_ignore', group='ldap',
@@ -267,6 +268,8 @@ register_list('user_attribute_ignore', group='ldap',
 register_bool('user_allow_create', group='ldap', default=True)
 register_bool('user_allow_update', group='ldap', default=True)
 register_bool('user_allow_delete', group='ldap', default=True)
+register_bool('user_enabled_emulation', group='ldap', default=False)
+register_str('user_enabled_emulation_dn', group='ldap', default=None)
 
 register_str('tenant_tree_dn', group='ldap', default=None)
 register_str('tenant_filter', group='ldap', default=None)
@@ -274,13 +277,16 @@ register_str('tenant_objectclass', group='ldap', default='groupOfNames')
 register_str('tenant_id_attribute', group='ldap', default='cn')
 register_str('tenant_member_attribute', group='ldap', default='member')
 register_str('tenant_name_attribute', group='ldap', default='ou')
-register_str('tenant_desc_attribute', group='ldap', default='desc')
+register_str('tenant_desc_attribute', group='ldap', default='description')
 register_str('tenant_enabled_attribute', group='ldap', default='enabled')
-register_str('tenant_domain_id_attribute', group='ldap', default='domain_id')
+register_str('tenant_domain_id_attribute', group='ldap',
+             default='businessCategory')
 register_list('tenant_attribute_ignore', group='ldap', default='')
 register_bool('tenant_allow_create', group='ldap', default=True)
 register_bool('tenant_allow_update', group='ldap', default=True)
 register_bool('tenant_allow_delete', group='ldap', default=True)
+register_bool('tenant_enabled_emulation', group='ldap', default=False)
+register_str('tenant_enabled_emulation_dn', group='ldap', default=None)
 
 register_str('role_tree_dn', group='ldap', default=None)
 register_str('role_filter', group='ldap', default=None)
@@ -299,7 +305,7 @@ register_str('group_objectclass', group='ldap', default='groupOfNames')
 register_str('group_id_attribute', group='ldap', default='cn')
 register_str('group_name_attribute', group='ldap', default='ou')
 register_str('group_member_attribute', group='ldap', default='member')
-register_str('group_desc_attribute', group='ldap', default='desc')
+register_str('group_desc_attribute', group='ldap', default='description')
 register_str('group_domain_id_attribute', group='ldap', default='domain_id')
 register_list('group_attribute_ignore', group='ldap', default='')
 register_bool('group_allow_create', group='ldap', default=True)
@@ -310,3 +316,11 @@ register_bool('group_allow_delete', group='ldap', default=True)
 register_str('url', group='pam', default=None)
 register_str('userid', group='pam', default=None)
 register_str('password', group='pam', default=None)
+
+# default authentication methods
+register_list('methods', group='auth',
+              default=['password', 'token'])
+register_str('password', group='auth',
+             default='keystone.auth.methods.token.Token')
+register_str('token', group='auth',
+             default='keystone.auth.methods.password.Password')

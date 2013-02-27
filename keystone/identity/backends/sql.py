@@ -25,19 +25,6 @@ from keystone import exception
 from keystone import identity
 
 
-def handle_conflicts(type='object'):
-    """Converts IntegrityError into HTTP 409 Conflict."""
-    def decorator(method):
-        @functools.wraps(method)
-        def wrapper(*args, **kwargs):
-            try:
-                return method(*args, **kwargs)
-            except sql.IntegrityError as e:
-                raise exception.Conflict(type=type, details=str(e.orig))
-        return wrapper
-    return decorator
-
-
 class User(sql.ModelBase, sql.DictBase):
     __tablename__ = 'user'
     attributes = ['id', 'name', 'domain_id', 'password', 'enabled']
@@ -205,8 +192,20 @@ class Identity(sql.Base, identity.Driver):
             raise AssertionError('Invalid user / password')
 
         if tenant_id is not None:
+            # FIXME(gyee): this should really be
+            # get_roles_for_user_and_project() after the dusts settle
             if tenant_id not in self.get_projects_for_user(user_id):
-                raise AssertionError('Invalid tenant')
+                # get_roles_for_user_and_project() returns a set
+                roles = []
+                try:
+                    roles = self.get_roles_for_user_and_project(user_id,
+                                                                tenant_id)
+                except:
+                    # FIXME(gyee): we should never get into this situation
+                    # after user project role migration is completed
+                    pass
+                if not roles:
+                    raise AssertionError('Invalid tenant')
 
             try:
                 tenant_ref = self.get_project(tenant_id)
@@ -387,14 +386,56 @@ class Identity(sql.Base, identity.Driver):
         membership_refs = query.all()
         return [x.project_id for x in membership_refs]
 
+    def _get_user_group_project_roles(self, metadata_ref, user_id, project_id):
+        group_refs = self.list_groups_for_user(user_id=user_id)
+        for x in group_refs:
+            try:
+                metadata_ref.update(
+                    self.get_metadata(group_id=x['id'],
+                                      tenant_id=project_id))
+            except exception.MetadataNotFound:
+                # no group grant, skip
+                pass
+
+    def _get_user_project_roles(self, metadata_ref, user_id, project_id):
+        try:
+            metadata_ref.update(self.get_metadata(user_id, project_id))
+        except exception.MetadataNotFound:
+            pass
+
+    def _get_user_group_domain_roles(self, metadata_ref, user_id, domain_id):
+        group_refs = self.list_groups_for_user(user_id=user_id)
+        for x in group_refs:
+            try:
+                metadata_ref.update(
+                    self.get_metadata(group_id=x['id'],
+                                      domain_id=domain_id))
+            except exception.MetadataNotFound:
+                # no group grant, skip
+                pass
+
+    def _get_user_domain_roles(self, metadata_ref, user_id, domain_id):
+        try:
+            metadata_ref.update(self.get_metadata(user_id,
+                                                  domain_id=domain_id))
+        except exception.MetadataNotFound:
+            pass
+
     def get_roles_for_user_and_project(self, user_id, tenant_id):
         self.get_user(user_id)
         self.get_project(tenant_id)
-        try:
-            metadata_ref = self.get_metadata(user_id, tenant_id)
-        except exception.MetadataNotFound:
-            metadata_ref = {}
-        return metadata_ref.get('roles', [])
+        metadata_ref = {}
+        self._get_user_project_roles(metadata_ref, user_id, tenant_id)
+        self._get_user_group_project_roles(metadata_ref, user_id, tenant_id)
+        return list(set(metadata_ref.get('roles', [])))
+
+    def get_roles_for_user_and_domain(self, user_id, domain_id):
+        self.get_user(user_id)
+        self.get_domain(domain_id)
+        metadata_ref = {}
+        self._get_user_domain_roles(metadata_ref, user_id, domain_id)
+        self._get_user_group_domain_roles(metadata_ref, user_id, domain_id)
+        return list(set(metadata_ref.get('roles', [])))
 
     def add_role_to_user_and_project(self, user_id, tenant_id, role_id):
         self.get_user(user_id)
@@ -440,7 +481,7 @@ class Identity(sql.Base, identity.Driver):
             raise exception.RoleNotFound(message=msg)
 
     # CRUD
-    @handle_conflicts(type='project')
+    @sql.handle_conflicts(type='project')
     def create_project(self, tenant_id, tenant):
         tenant['name'] = clean.project_name(tenant['name'])
         session = self.get_session()
@@ -450,7 +491,7 @@ class Identity(sql.Base, identity.Driver):
             session.flush()
         return tenant_ref.to_dict()
 
-    @handle_conflicts(type='project')
+    @sql.handle_conflicts(type='project')
     def update_project(self, tenant_id, tenant):
         session = self.get_session()
 
@@ -473,7 +514,7 @@ class Identity(sql.Base, identity.Driver):
             session.flush()
         return tenant_ref.to_dict(include_extra_dict=True)
 
-    @handle_conflicts(type='project')
+    @sql.handle_conflicts(type='project')
     def delete_project(self, tenant_id):
         session = self.get_session()
 
@@ -502,7 +543,7 @@ class Identity(sql.Base, identity.Driver):
             session.delete(tenant_ref)
             session.flush()
 
-    @handle_conflicts(type='metadata')
+    @sql.handle_conflicts(type='metadata')
     def create_metadata(self, user_id, tenant_id, metadata,
                         domain_id=None, group_id=None):
         session = self.get_session()
@@ -528,7 +569,7 @@ class Identity(sql.Base, identity.Driver):
             session.flush()
         return metadata
 
-    @handle_conflicts(type='metadata')
+    @sql.handle_conflicts(type='metadata')
     def update_metadata(self, user_id, tenant_id, metadata,
                         domain_id=None, group_id=None):
         session = self.get_session()
@@ -560,7 +601,7 @@ class Identity(sql.Base, identity.Driver):
 
     # domain crud
 
-    @handle_conflicts(type='domain')
+    @sql.handle_conflicts(type='domain')
     def create_domain(self, domain_id, domain):
         session = self.get_session()
         with session.begin():
@@ -589,7 +630,7 @@ class Identity(sql.Base, identity.Driver):
             raise exception.DomainNotFound(domain_id=domain_name)
         return ref.to_dict()
 
-    @handle_conflicts(type='domain')
+    @sql.handle_conflicts(type='domain')
     def update_domain(self, domain_id, domain):
         session = self.get_session()
         with session.begin():
@@ -635,7 +676,7 @@ class Identity(sql.Base, identity.Driver):
 
     # user crud
 
-    @handle_conflicts(type='user')
+    @sql.handle_conflicts(type='user')
     def create_user(self, user_id, user):
         user['name'] = clean.user_name(user['name'])
         if 'enabled' not in user:
@@ -678,7 +719,7 @@ class Identity(sql.Base, identity.Driver):
         return identity.filter_user(
             self._get_user_by_name(user_name, domain_id))
 
-    @handle_conflicts(type='user')
+    @sql.handle_conflicts(type='user')
     def update_user(self, user_id, user):
         if 'name' in user:
             user['name'] = clean.user_name(user['name'])
@@ -788,7 +829,7 @@ class Identity(sql.Base, identity.Driver):
 
     # group crud
 
-    @handle_conflicts(type='group')
+    @sql.handle_conflicts(type='group')
     def create_group(self, group_id, group):
         session = self.get_session()
         with session.begin():
@@ -812,7 +853,7 @@ class Identity(sql.Base, identity.Driver):
     def get_group(self, group_id):
         return self._get_group(group_id)
 
-    @handle_conflicts(type='group')
+    @sql.handle_conflicts(type='group')
     def update_group(self, group_id, group):
         session = self.get_session()
 
@@ -860,7 +901,7 @@ class Identity(sql.Base, identity.Driver):
 
     # credential crud
 
-    @handle_conflicts(type='credential')
+    @sql.handle_conflicts(type='credential')
     def create_credential(self, credential_id, credential):
         session = self.get_session()
         with session.begin():
@@ -881,7 +922,7 @@ class Identity(sql.Base, identity.Driver):
             raise exception.CredentialNotFound(credential_id=credential_id)
         return ref.to_dict()
 
-    @handle_conflicts(type='credential')
+    @sql.handle_conflicts(type='credential')
     def update_credential(self, credential_id, credential):
         session = self.get_session()
         with session.begin():
@@ -913,7 +954,7 @@ class Identity(sql.Base, identity.Driver):
 
     # role crud
 
-    @handle_conflicts(type='role')
+    @sql.handle_conflicts(type='role')
     def create_role(self, role_id, role):
         session = self.get_session()
         with session.begin():
@@ -934,7 +975,7 @@ class Identity(sql.Base, identity.Driver):
             raise exception.RoleNotFound(role_id=role_id)
         return ref.to_dict()
 
-    @handle_conflicts(type='role')
+    @sql.handle_conflicts(type='role')
     def update_role(self, role_id, role):
         session = self.get_session()
         with session.begin():

@@ -145,6 +145,7 @@
 # user_tree_dn = ou=Users,dc=example,dc=com
 # user_filter =
 # user_objectclass = inetOrgPerson
+# user_domain_id_attribute = businessCategory
 # user_id_attribute = cn
 # user_name_attribute = sn
 # user_mail_attribute = email
@@ -156,10 +157,13 @@
 # user_allow_create = True
 # user_allow_update = True
 # user_allow_delete = True
+# user_enabled_emulation = False
+# user_enabled_emulation_dn =
 
 # tenant_tree_dn = ou=Groups,dc=example,dc=com
 # tenant_filter =
 # tenant_objectclass = groupOfNames
+# tenant_domain_id_attribute = businessCategory
 # tenant_id_attribute = cn
 # tenant_member_attribute = member
 # tenant_name_attribute = ou
@@ -169,6 +173,8 @@
 # tenant_allow_create = True
 # tenant_allow_update = True
 # tenant_allow_delete = True
+# tenant_enabled_emulation = False
+# tenant_enabled_emulation_dn =
 
 # role_tree_dn = ou=Roles,dc=example,dc=com
 # role_filter =
@@ -192,6 +198,11 @@
 # group_allow_create = True
 # group_allow_update = True
 # group_allow_delete = True
+
+[auth]
+methods = password,token
+password = keystone.auth.methods.password.Password
+token = keystone.auth.methods.token.Token
 
 [filter:debug]
 paste.filter_factory = keystone.common.wsgi:Debug.factory

@@ -16,6 +16,7 @@
 
 import webob.dec
 
+from keystone.common import logging
 from keystone.common import serializer
 from keystone.common import utils
 from keystone.common import wsgi
@@ -25,10 +26,15 @@ from keystone.openstack.common import jsonutils
 
 
 CONF = config.CONF
+LOG = logging.getLogger(__name__)
 
 
 # Header used to transmit the auth token
 AUTH_TOKEN_HEADER = 'X-Auth-Token'
+
+
+# Header used to transmit the subject token
+SUBJECT_TOKEN_HEADER = 'X-Subject-Token'
 
 
 # Environment variable used to pass the request context
@@ -44,6 +50,9 @@ class TokenAuthMiddleware(wsgi.Middleware):
         token = request.headers.get(AUTH_TOKEN_HEADER)
         context = request.environ.get(CONTEXT_ENV, {})
         context['token_id'] = token
+        if SUBJECT_TOKEN_HEADER in request.headers:
+            context['subject_token_id'] = (
+                request.headers.get(SUBJECT_TOKEN_HEADER))
         request.environ[CONTEXT_ENV] = context
 
 
@@ -151,6 +160,7 @@ class XmlBodyMiddleware(wsgi.Middleware):
                 body_obj = jsonutils.loads(response.body)
                 response.body = serializer.to_xml(body_obj)
             except Exception:
+                LOG.exception('Serializer failed')
                 raise exception.Error(message=response.body)
         return response
 

@@ -326,7 +326,7 @@ class ApiShimMixin(object):
 
 
 # TODO(termie): turn this into a data object and move logic to driver
-class UserApi(common_ldap.BaseLdap, ApiShimMixin):
+class UserApi(common_ldap.EnabledEmuMixIn, common_ldap.BaseLdap, ApiShimMixin):
     DEFAULT_OU = 'ou=Users'
     DEFAULT_STRUCTURAL_CLASSES = ['person']
     DEFAULT_ID_ATTR = 'cn'
@@ -486,7 +486,8 @@ class UserApi(common_ldap.BaseLdap, ApiShimMixin):
 
 
 # TODO(termie): turn this into a data object and move logic to driver
-class ProjectApi(common_ldap.BaseLdap, ApiShimMixin):
+class ProjectApi(common_ldap.EnabledEmuMixIn, common_ldap.BaseLdap,
+                 ApiShimMixin):
     DEFAULT_OU = 'ou=Groups'
     DEFAULT_STRUCTURAL_CLASSES = []
     DEFAULT_OBJECTCLASS = 'groupOfNames'
@@ -495,7 +496,7 @@ class ProjectApi(common_ldap.BaseLdap, ApiShimMixin):
     DEFAULT_ATTRIBUTE_IGNORE = []
     options_name = 'tenant'
     attribute_mapping = {'name': 'ou',
-                         'description': 'desc',
+                         'description': 'description',
                          'tenantId': 'cn',
                          'enabled': 'enabled',
                          'domain_id': 'domain_id'}
@@ -911,7 +912,7 @@ class GroupApi(common_ldap.BaseLdap, ApiShimMixin):
     DEFAULT_ATTRIBUTE_IGNORE = []
     options_name = 'group'
     attribute_mapping = {'name': 'ou',
-                         'description': 'desc',
+                         'description': 'description',
                          'groupId': 'cn',
                          'domain_id': 'domain_id'}
     model = models.Group
