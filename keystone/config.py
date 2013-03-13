@@ -179,9 +179,9 @@ register_cli_int('pydev-debug-port', default=None)
 
 register_str('admin_token', default='ADMIN')
 register_str('bind_host', default='0.0.0.0')
-register_str('compute_port', default=8774)
-register_str('admin_port', default=35357)
-register_str('public_port', default=5000)
+register_int('compute_port', default=8774)
+register_int('admin_port', default=35357)
+register_int('public_port', default=5000)
 register_str('public_endpoint', default='http://localhost:%(public_port)d/')
 register_str('admin_endpoint', default='http://localhost:%(admin_port)d/')
 register_str('onready')
@@ -235,6 +235,8 @@ register_str('driver', group='policy',
              default='keystone.policy.backends.sql.Policy')
 register_str('driver', group='token',
              default='keystone.token.backends.kvs.Token')
+register_str('driver', group='trust',
+             default='keystone.trust.backends.sql.Trust')
 register_str('driver', group='ec2',
              default='keystone.contrib.ec2.backends.kvs.Ec2')
 register_str('driver', group='stats',
@@ -250,6 +252,7 @@ register_bool('use_dumb_member', group='ldap', default=False)
 register_str('dumb_member', group='ldap', default='cn=dumb,dc=nonexistent')
 register_bool('allow_subtree_delete', group='ldap', default=False)
 register_str('query_scope', group='ldap', default='one')
+register_int('page_size', group='ldap', default=0)
 
 register_str('user_tree_dn', group='ldap', default=None)
 register_str('user_filter', group='ldap', default=None)

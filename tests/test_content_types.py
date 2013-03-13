@@ -90,7 +90,7 @@ class RestfulTestCase(test.TestCase):
         # Initialize headers dictionary
         headers = {} if not headers else headers
 
-        connection = httplib.HTTPConnection(host, port, timeout=10)
+        connection = httplib.HTTPConnection(host, port, timeout=100000)
 
         # Perform the request
         connection.request(method, path, body, headers)
@@ -373,7 +373,6 @@ class CoreApiTests(object):
                     'tenantId': self.tenant_bar['id'],
                 },
             },
-            # TODO(dolph): creating a token should result in a 201 Created
             expected_status=200)
         self.assertValidAuthenticationResponse(r)
 
@@ -389,7 +388,6 @@ class CoreApiTests(object):
                     },
                 },
             },
-            # TODO(dolph): creating a token should result in a 201 Created
             expected_status=200)
         self.assertValidAuthenticationResponse(r)
 

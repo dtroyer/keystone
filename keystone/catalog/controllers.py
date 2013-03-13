@@ -58,7 +58,7 @@ class Endpoint(controller.V2Controller):
         self.assert_admin(context)
         legacy_endpoints = {}
         for endpoint in self.catalog_api.list_endpoints(context):
-            if not endpoint['legacy_endpoint_id']:
+            if not endpoint.get('legacy_endpoint_id'):
                 # endpoints created in v3 should not appear on the v2 API
                 continue
 
@@ -157,6 +157,17 @@ class ServiceV3(controller.V3Controller):
 class EndpointV3(controller.V3Controller):
     collection_name = 'endpoints'
     member_name = 'endpoint'
+
+    @classmethod
+    def filter_endpoint(cls, ref):
+        if 'legacy_endpoint_id' in ref:
+            ref.pop('legacy_endpoint_id')
+        return ref
+
+    @classmethod
+    def wrap_member(cls, context, ref):
+        ref = cls.filter_endpoint(ref)
+        return super(EndpointV3, cls).wrap_member(context, ref)
 
     @controller.protected
     def create_endpoint(self, context, endpoint):

@@ -14,8 +14,6 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import functools
-
 from keystone import clean
 from keystone import config
 from keystone.common import sql
@@ -42,7 +40,7 @@ class User(sql.ModelBase, sql.DictBase):
 
 class Group(sql.ModelBase, sql.DictBase):
     __tablename__ = 'group'
-    attributes = ['id', 'name', 'domain_id']
+    attributes = ['id', 'name', 'domain_id', 'description']
     id = sql.Column(sql.String(64), primary_key=True)
     name = sql.Column(sql.String(64), nullable=False)
     domain_id = sql.Column(sql.String(64), sql.ForeignKey('domain.id'),
@@ -78,7 +76,7 @@ class Domain(sql.ModelBase, sql.DictBase):
 
 class Project(sql.ModelBase, sql.DictBase):
     __tablename__ = 'project'
-    attributes = ['id', 'name', 'domain_id']
+    attributes = ['id', 'name', 'domain_id', 'description', 'enabled']
     id = sql.Column(sql.String(64), primary_key=True)
     name = sql.Column(sql.String(64), nullable=False)
     domain_id = sql.Column(sql.String(64), sql.ForeignKey('domain.id'),
@@ -195,18 +193,7 @@ class Identity(sql.Base, identity.Driver):
             # FIXME(gyee): this should really be
             # get_roles_for_user_and_project() after the dusts settle
             if tenant_id not in self.get_projects_for_user(user_id):
-                # get_roles_for_user_and_project() returns a set
-                roles = []
-                try:
-                    roles = self.get_roles_for_user_and_project(user_id,
-                                                                tenant_id)
-                except:
-                    # FIXME(gyee): we should never get into this situation
-                    # after user project role migration is completed
-                    pass
-                if not roles:
-                    raise AssertionError('Invalid tenant')
-
+                raise AssertionError('Invalid project')
             try:
                 tenant_ref = self.get_project(tenant_id)
                 metadata_ref = self.get_metadata(user_id, tenant_id)
@@ -215,7 +202,6 @@ class Identity(sql.Base, identity.Driver):
                 metadata_ref = {}
             except exception.MetadataNotFound:
                 metadata_ref = {}
-
         return (identity.filter_user(user_ref), tenant_ref, metadata_ref)
 
     def get_project(self, tenant_id):
@@ -403,38 +389,12 @@ class Identity(sql.Base, identity.Driver):
         except exception.MetadataNotFound:
             pass
 
-    def _get_user_group_domain_roles(self, metadata_ref, user_id, domain_id):
-        group_refs = self.list_groups_for_user(user_id=user_id)
-        for x in group_refs:
-            try:
-                metadata_ref.update(
-                    self.get_metadata(group_id=x['id'],
-                                      domain_id=domain_id))
-            except exception.MetadataNotFound:
-                # no group grant, skip
-                pass
-
-    def _get_user_domain_roles(self, metadata_ref, user_id, domain_id):
-        try:
-            metadata_ref.update(self.get_metadata(user_id,
-                                                  domain_id=domain_id))
-        except exception.MetadataNotFound:
-            pass
-
     def get_roles_for_user_and_project(self, user_id, tenant_id):
         self.get_user(user_id)
         self.get_project(tenant_id)
         metadata_ref = {}
         self._get_user_project_roles(metadata_ref, user_id, tenant_id)
         self._get_user_group_project_roles(metadata_ref, user_id, tenant_id)
-        return list(set(metadata_ref.get('roles', [])))
-
-    def get_roles_for_user_and_domain(self, user_id, domain_id):
-        self.get_user(user_id)
-        self.get_domain(domain_id)
-        metadata_ref = {}
-        self._get_user_domain_roles(metadata_ref, user_id, domain_id)
-        self._get_user_group_domain_roles(metadata_ref, user_id, domain_id)
         return list(set(metadata_ref.get('roles', [])))
 
     def add_role_to_user_and_project(self, user_id, tenant_id, role_id):
@@ -622,6 +582,7 @@ class Identity(sql.Base, identity.Driver):
             raise exception.DomainNotFound(domain_id=domain_id)
         return ref.to_dict()
 
+    @sql.handle_conflicts(type='domain')
     def get_domain_by_name(self, domain_name):
         session = self.get_session()
         try:
@@ -679,8 +640,6 @@ class Identity(sql.Base, identity.Driver):
     @sql.handle_conflicts(type='user')
     def create_user(self, user_id, user):
         user['name'] = clean.user_name(user['name'])
-        if 'enabled' not in user:
-            user['enabled'] = True
         user = utils.hash_user_password(user)
         session = self.get_session()
         with session.begin():
