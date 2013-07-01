@@ -39,7 +39,7 @@ class Tenant(controller.V2Controller):
                 context, context['query_string'].get('name'))
 
         self.assert_admin(context)
-        tenant_refs = self.identity_api.list_projects(context)
+        tenant_refs = self.identity_api.list_projects()
         for tenant_ref in tenant_refs:
             tenant_ref = self._filter_domain_id(tenant_ref)
         params = {
@@ -58,19 +58,16 @@ class Tenant(controller.V2Controller):
 
         """
         try:
-            token_ref = self.token_api.get_token(context=context,
-                                                 token_id=context['token_id'])
+            token_ref = self.token_api.get_token(context['token_id'])
         except exception.NotFound as e:
             LOG.warning('Authentication failed: %s' % e)
             raise exception.Unauthorized(e)
 
         user_ref = token_ref['user']
-        tenant_ids = self.identity_api.get_projects_for_user(
-            context, user_ref['id'])
+        tenant_ids = self.identity_api.get_projects_for_user(user_ref['id'])
         tenant_refs = []
         for tenant_id in tenant_ids:
-            ref = self.identity_api.get_project(
-                context=context, tenant_id=tenant_id)
+            ref = self.identity_api.get_project(tenant_id)
             tenant_refs.append(self._filter_domain_id(ref))
         params = {
             'limit': context['query_string'].get('limit'),
@@ -81,13 +78,13 @@ class Tenant(controller.V2Controller):
     def get_project(self, context, tenant_id):
         # TODO(termie): this stuff should probably be moved to middleware
         self.assert_admin(context)
-        ref = self.identity_api.get_project(context, tenant_id)
+        ref = self.identity_api.get_project(tenant_id)
         return {'tenant': self._filter_domain_id(ref)}
 
     def get_project_by_name(self, context, tenant_name):
         self.assert_admin(context)
         ref = self.identity_api.get_project_by_name(
-            context, tenant_name, DEFAULT_DOMAIN_ID)
+            tenant_name, DEFAULT_DOMAIN_ID)
         return {'tenant': self._filter_domain_id(ref)}
 
     # CRUD Extension
@@ -101,7 +98,7 @@ class Tenant(controller.V2Controller):
         self.assert_admin(context)
         tenant_ref['id'] = tenant_ref.get('id', uuid.uuid4().hex)
         tenant = self.identity_api.create_project(
-            context, tenant_ref['id'],
+            tenant_ref['id'],
             self._normalize_domain_id(context, tenant_ref))
         return {'tenant': self._filter_domain_id(tenant)}
 
@@ -112,16 +109,16 @@ class Tenant(controller.V2Controller):
         clean_tenant = tenant.copy()
         clean_tenant.pop('domain_id', None)
         tenant_ref = self.identity_api.update_project(
-            context, tenant_id, clean_tenant)
+            tenant_id, clean_tenant)
         return {'tenant': tenant_ref}
 
     def delete_project(self, context, tenant_id):
         self.assert_admin(context)
-        self.identity_api.delete_project(context, tenant_id)
+        self.identity_api.delete_project(tenant_id)
 
     def get_project_users(self, context, tenant_id, **kw):
         self.assert_admin(context)
-        user_refs = self.identity_api.get_project_users(context, tenant_id)
+        user_refs = self.identity_api.get_project_users(tenant_id)
         for user_ref in user_refs:
             self._filter_domain_id(user_ref)
         return {'users': user_refs}
@@ -161,36 +158,10 @@ class Tenant(controller.V2Controller):
         return o
 
 
-def delete_tokens_for_user(context, token_api, trust_api, user_id):
-    try:
-        #First delete tokens that could get other tokens.
-        for token_id in token_api.list_tokens(context, user_id):
-            token_api.delete_token(context, token_id)
-        #now delete trust tokens
-        for trust in trust_api.list_trusts_for_trustee(context, user_id):
-            token_list = token_api.list_tokens(context, user_id,
-                                               trust_id=trust['id'])
-            for token in token_list:
-                token_api.delete_token(context, token)
-    except exception.NotImplemented:
-        # The users status has been changed but tokens remain valid for
-        # backends that can't list tokens for users
-        LOG.warning(_('User %s status has changed, but existing tokens '
-                    'remain valid') % user_id)
-
-
-def delete_tokens_for_group(context, identity_api, token_api, trust_api,
-                            group_id):
-    user_refs = identity_api.list_users_in_group(context, group_id)
-    for user in user_refs:
-        delete_tokens_for_user(
-            context, token_api, trust_api, user['id'])
-
-
 class User(controller.V2Controller):
     def get_user(self, context, user_id):
         self.assert_admin(context)
-        ref = self.identity_api.get_user(context, user_id)
+        ref = self.identity_api.get_user(user_id)
         return {'user': self._filter_domain_id(ref)}
 
     def get_users(self, context):
@@ -201,7 +172,7 @@ class User(controller.V2Controller):
                 context, context['query_string'].get('name'))
 
         self.assert_admin(context)
-        user_list = self.identity_api.list_users(context)
+        user_list = self.identity_api.list_users()
         for x in user_list:
             self._filter_domain_id(x)
         return {'users': user_list}
@@ -209,7 +180,7 @@ class User(controller.V2Controller):
     def get_user_by_name(self, context, user_name):
         self.assert_admin(context)
         ref = self.identity_api.get_user_by_name(
-            context, user_name, DEFAULT_DOMAIN_ID)
+            user_name, DEFAULT_DOMAIN_ID)
         return {'user': self._filter_domain_id(ref)}
 
     # CRUD extension
@@ -220,36 +191,41 @@ class User(controller.V2Controller):
         if 'name' not in user or not user['name']:
             msg = 'Name field is required and cannot be empty'
             raise exception.ValidationError(message=msg)
+        if 'enabled' in user and not isinstance(user['enabled'], bool):
+            msg = 'Enabled field must be a boolean'
+            raise exception.ValidationError(message=msg)
 
         default_tenant_id = user.get('tenantId', None)
         if (default_tenant_id is not None
-                and self.identity_api.get_project(context,
-                                                  default_tenant_id) is None):
+                and self.identity_api.get_project(default_tenant_id) is None):
             raise exception.ProjectNotFound(project_id=default_tenant_id)
         user_id = uuid.uuid4().hex
         user_ref = self._normalize_domain_id(context, user.copy())
         user_ref['id'] = user_id
-        new_user_ref = self.identity_api.create_user(
-            context, user_id, user_ref)
+        new_user_ref = self.identity_api.create_user(user_id, user_ref)
         if default_tenant_id:
-            self.identity_api.add_user_to_project(context,
-                                                  default_tenant_id, user_id)
+            self.identity_api.add_user_to_project(default_tenant_id, user_id)
         return {'user': self._filter_domain_id(new_user_ref)}
 
     def update_user(self, context, user_id, user):
         # NOTE(termie): this is really more of a patch than a put
         self.assert_admin(context)
-        user_ref = self.identity_api.update_user(context, user_id, user)
+
+        if 'enabled' in user and not isinstance(user['enabled'], bool):
+            msg = 'Enabled field should be a boolean'
+            raise exception.ValidationError(message=msg)
+
+        user_ref = self.identity_api.update_user(user_id, user)
 
         if user.get('password') or not user.get('enabled', True):
         # If the password was changed or the user was disabled we clear tokens
-            delete_tokens_for_user(context, self.token_api, self.trust_api,
-                                   user_id)
+            self._delete_tokens_for_user(user_id)
         return {'user': self._filter_domain_id(user_ref)}
 
     def delete_user(self, context, user_id):
         self.assert_admin(context)
-        self.identity_api.delete_user(context, user_id)
+        self.identity_api.delete_user(user_id)
+        self._delete_tokens_for_user(user_id)
 
     def set_user_enabled(self, context, user_id, user):
         return self.update_user(context, user_id, user)
@@ -260,10 +236,15 @@ class User(controller.V2Controller):
     def update_user_project(self, context, user_id, user):
         """Update the default tenant."""
         self.assert_admin(context)
-        # ensure that we're a member of that tenant
-        default_tenant_id = user.get('tenantId')
-        self.identity_api.add_user_to_project(context,
-                                              default_tenant_id, user_id)
+
+        try:
+            # ensure that we're a member of that tenant
+            self.identity_api.add_user_to_project(
+                user.get('tenantId'), user_id)
+        except exception.Conflict:
+            # we're already a member of that tenant
+            pass
+
         return self.update_user(context, user_id, user)
 
 
@@ -282,14 +263,14 @@ class Role(controller.V2Controller):
                                                    'tenant ID required')
 
         roles = self.identity_api.get_roles_for_user_and_project(
-            context, user_id, tenant_id)
-        return {'roles': [self.identity_api.get_role(context, x)
+            user_id, tenant_id)
+        return {'roles': [self.identity_api.get_role(x)
                           for x in roles]}
 
     # CRUD extension
     def get_role(self, context, role_id):
         self.assert_admin(context)
-        return {'role': self.identity_api.get_role(context, role_id)}
+        return {'role': self.identity_api.get_role(role_id)}
 
     def create_role(self, context, role):
         role = self._normalize_dict(role)
@@ -301,16 +282,16 @@ class Role(controller.V2Controller):
 
         role_id = uuid.uuid4().hex
         role['id'] = role_id
-        role_ref = self.identity_api.create_role(context, role_id, role)
+        role_ref = self.identity_api.create_role(role_id, role)
         return {'role': role_ref}
 
     def delete_role(self, context, role_id):
         self.assert_admin(context)
-        self.identity_api.delete_role(context, role_id)
+        self.identity_api.delete_role(role_id)
 
     def get_roles(self, context):
         self.assert_admin(context)
-        return {'roles': self.identity_api.list_roles(context)}
+        return {'roles': self.identity_api.list_roles()}
 
     def add_role_to_user(self, context, user_id, role_id, tenant_id=None):
         """Add a role to a user and tenant pair.
@@ -325,10 +306,9 @@ class Role(controller.V2Controller):
                                                    'tenant_id required')
 
         self.identity_api.add_role_to_user_and_project(
-            context, user_id, tenant_id, role_id)
-        self.token_api.revoke_tokens(context, user_id, tenant_id)
+            user_id, tenant_id, role_id)
 
-        role_ref = self.identity_api.get_role(context, role_id)
+        role_ref = self.identity_api.get_role(role_id)
         return {'role': role_ref}
 
     def remove_role_from_user(self, context, user_id, role_id, tenant_id=None):
@@ -346,9 +326,8 @@ class Role(controller.V2Controller):
         # This still has the weird legacy semantics that adding a role to
         # a user also adds them to a tenant, so we must follow up on that
         self.identity_api.remove_role_from_user_and_project(
-            context, user_id, tenant_id, role_id)
-        delete_tokens_for_user(
-            context, self.token_api, self.trust_api, user_id)
+            user_id, tenant_id, role_id)
+        self._delete_tokens_for_user(user_id)
 
     # COMPAT(diablo): CRUD extension
     def get_role_refs(self, context, user_id):
@@ -362,12 +341,12 @@ class Role(controller.V2Controller):
         """
         self.assert_admin(context)
         # Ensure user exists by getting it first.
-        self.identity_api.get_user(context, user_id)
-        tenant_ids = self.identity_api.get_projects_for_user(context, user_id)
+        self.identity_api.get_user(user_id)
+        tenant_ids = self.identity_api.get_projects_for_user(user_id)
         o = []
         for tenant_id in tenant_ids:
             role_ids = self.identity_api.get_roles_for_user_and_project(
-                context, user_id, tenant_id)
+                user_id, tenant_id)
             for role_id in role_ids:
                 ref = {'roleId': role_id,
                        'tenantId': tenant_id,
@@ -389,10 +368,10 @@ class Role(controller.V2Controller):
         tenant_id = role.get('tenantId')
         role_id = role.get('roleId')
         self.identity_api.add_role_to_user_and_project(
-            context, user_id, tenant_id, role_id)
-        self.token_api.revoke_tokens(context, user_id, tenant_id)
+            user_id, tenant_id, role_id)
+        self._delete_tokens_for_user(user_id)
 
-        role_ref = self.identity_api.get_role(context, role_id)
+        role_ref = self.identity_api.get_role(role_id)
         return {'role': role_ref}
 
     # COMPAT(diablo): CRUD extension
@@ -413,10 +392,8 @@ class Role(controller.V2Controller):
         tenant_id = role_ref_ref.get('tenantId')[0]
         role_id = role_ref_ref.get('roleId')[0]
         self.identity_api.remove_role_from_user_and_project(
-            context, user_id, tenant_id, role_id)
-        roles = self.identity_api.get_roles_for_user_and_project(
-            context, user_id, tenant_id)
-        self.token_api.revoke_tokens(context, user_id, tenant_id)
+            user_id, tenant_id, role_id)
+        self._delete_tokens_for_user(user_id)
 
 
 class DomainV3(controller.V3Controller):
@@ -426,54 +403,107 @@ class DomainV3(controller.V3Controller):
     @controller.protected
     def create_domain(self, context, domain):
         ref = self._assign_unique_id(self._normalize_dict(domain))
-        ref = self.identity_api.create_domain(context, ref['id'], ref)
+        ref = self.identity_api.create_domain(ref['id'], ref)
         return DomainV3.wrap_member(context, ref)
 
     @controller.filterprotected('enabled', 'name')
     def list_domains(self, context, filters):
-        refs = self.identity_api.list_domains(context)
+        refs = self.identity_api.list_domains()
         return DomainV3.wrap_collection(context, refs, filters)
 
     @controller.protected
     def get_domain(self, context, domain_id):
-        ref = self.identity_api.get_domain(context, domain_id)
+        ref = self.identity_api.get_domain(domain_id)
         return DomainV3.wrap_member(context, ref)
 
     @controller.protected
     def update_domain(self, context, domain_id, domain):
         self._require_matching_id(domain_id, domain)
 
-        ref = self.identity_api.update_domain(context, domain_id, domain)
+        ref = self.identity_api.update_domain(domain_id, domain)
 
         # disable owned users & projects when the API user specifically set
         #     enabled=False
         # FIXME(dolph): need a driver call to directly revoke all tokens by
         #               project or domain, regardless of user
         if not domain.get('enabled', True):
-            projects = [x for x in self.identity_api.list_projects(context)
+            projects = [x for x in self.identity_api.list_projects()
                         if x.get('domain_id') == domain_id]
-            for user in self.identity_api.list_users(context):
+            for user in self.identity_api.list_users():
                 # TODO(dolph): disable domain-scoped tokens
                 """
                 self.token_api.revoke_tokens(
-                    context,
                     user_id=user['id'],
                     domain_id=domain_id)
                 """
                 # revoke all tokens for users owned by this domain
                 if user.get('domain_id') == domain_id:
-                    self.token_api.revoke_tokens(
-                        context,
-                        user_id=user['id'])
+                    self._delete_tokens_for_user(user['id'])
                 else:
                     # only revoke tokens on projects owned by this domain
                     for project in projects:
-                        self.token_api.revoke_tokens(
-                            context,
-                            user_id=user['id'],
-                            tenant_id=project['id'])
-
+                        self._delete_tokens_for_user(
+                            user['id'], project_id=project['id'])
         return DomainV3.wrap_member(context, ref)
+
+    def _delete_domain_contents(self, context, domain_id):
+        """Delete the contents of a domain.
+
+        Before we delete a domain, we need to remove all the entities
+        that are owned by it, i.e. Users, Groups & Projects. To do this we
+        call the respective delete functions for these entities, which are
+        themselves responsible for deleting any credentials and role grants
+        associated with them as well as revoking any relevant tokens.
+
+        The order we delete entities is also important since some types
+        of backend may need to maintain referential integrity
+        throughout, and many of the entities have relationship with each
+        other. The following deletion order is therefore used:
+
+        Projects: Reference user and groups for grants
+        Groups: Reference users for membership and domains for grants
+        Users: Reference domains for grants
+
+        """
+        # Start by disabling all the users in this domain, to minimize the
+        # the risk that things are changing under our feet.
+        # TODO(henry-nash): In theory this step should not be necessary, since
+        # users of a disabled domain are prevented from authenticating.
+        # However there are some existing bugs in this area (e.g. 1130236).
+        # Consider removing this code once these have been fixed.
+        user_refs = self.identity_api.list_users()
+        user_refs = [r for r in user_refs if r['domain_id'] == domain_id]
+        for user in user_refs:
+            if user['enabled']:
+                user['enabled'] = False
+                self.identity_api.update_user(user['id'], user)
+                self._delete_tokens_for_user(user['id'])
+
+        # Now, for safety, reload list of users, as well as projects, that are
+        # owned by this domain.
+        user_refs = self.identity_api.list_users()
+        user_ids = [r['id'] for r in user_refs if r['domain_id'] == domain_id]
+
+        proj_refs = self.identity_api.list_projects()
+        proj_ids = [r['id'] for r in proj_refs if r['domain_id'] == domain_id]
+
+        # First delete the projects themselves
+        project_cntl = ProjectV3()
+        for project in proj_ids:
+            project_cntl._delete_project(context, project)
+
+        # Get the list of groups owned by this domain and delete them
+        group_refs = self.identity_api.list_groups()
+        group_ids = ([r['id'] for r in group_refs
+                     if r['domain_id'] == domain_id])
+        group_cntl = GroupV3()
+        for group in group_ids:
+            group_cntl._delete_group(context, group)
+
+        # And finally, delete the users themselves
+        user_cntl = UserV3()
+        for user in user_ids:
+            user_cntl._delete_user(context, user)
 
     @controller.protected
     def delete_domain(self, context, domain_id):
@@ -483,7 +513,18 @@ class DomainV3(controller.V3Controller):
         if domain_id == DEFAULT_DOMAIN_ID:
             raise exception.ForbiddenAction(action='delete the default domain')
 
-        return self.identity_api.delete_domain(context, domain_id)
+        # To help avoid inadvertent deletes, we insist that the domain
+        # has been previously disabled.  This also prevents a user deleting
+        # their own domain since, once it is disabled, they won't be able
+        # to get a valid token to issue this delete.
+        ref = self.identity_api.get_domain(domain_id)
+        if ref['enabled']:
+            raise exception.ForbiddenAction(
+                action='delete a domain that is not disabled')
+
+        # OK, we are go for delete!
+        self._delete_domain_contents(context, domain_id)
+        return self.identity_api.delete_domain(domain_id)
 
     def _get_domain_by_name(self, context, domain_name):
         """Get the domain via its unique name.
@@ -492,8 +533,7 @@ class DomainV3(controller.V3Controller):
         router as a public api.
 
         """
-        ref = self.identity_api.get_domain_by_name(
-            context, domain_name)
+        ref = self.identity_api.get_domain_by_name(domain_name)
         return {'domain': ref}
 
 
@@ -505,34 +545,44 @@ class ProjectV3(controller.V3Controller):
     def create_project(self, context, project):
         ref = self._assign_unique_id(self._normalize_dict(project))
         ref = self._normalize_domain_id(context, ref)
-        ref = self.identity_api.create_project(context, ref['id'], ref)
+        ref = self.identity_api.create_project(ref['id'], ref)
         return ProjectV3.wrap_member(context, ref)
 
     @controller.filterprotected('domain_id', 'enabled', 'name')
     def list_projects(self, context, filters):
-        refs = self.identity_api.list_projects(context)
+        refs = self.identity_api.list_projects()
         return ProjectV3.wrap_collection(context, refs, filters)
 
     @controller.filterprotected('enabled', 'name')
     def list_user_projects(self, context, filters, user_id):
-        refs = self.identity_api.list_user_projects(context, user_id)
+        refs = self.identity_api.list_user_projects(user_id)
         return ProjectV3.wrap_collection(context, refs, filters)
 
     @controller.protected
     def get_project(self, context, project_id):
-        ref = self.identity_api.get_project(context, project_id)
+        ref = self.identity_api.get_project(project_id)
         return ProjectV3.wrap_member(context, ref)
 
     @controller.protected
     def update_project(self, context, project_id, project):
         self._require_matching_id(project_id, project)
 
-        ref = self.identity_api.update_project(context, project_id, project)
+        ref = self.identity_api.update_project(project_id, project)
         return ProjectV3.wrap_member(context, ref)
+
+    def _delete_project(self, context, project_id):
+        # Delete any credentials that reference this project
+        for cred in self.credential_api.list_credentials():
+            if cred['project_id'] == project_id:
+                self.credential_api.delete_credential(cred['id'])
+        # Finally delete the project itself - the backend is
+        # responsible for deleting any role assignments related
+        # to this project
+        return self.identity_api.delete_project(project_id)
 
     @controller.protected
     def delete_project(self, context, project_id):
-        return self.identity_api.delete_project(context, project_id)
+        return self._delete_project(context, project_id)
 
 
 class UserV3(controller.V3Controller):
@@ -543,61 +593,67 @@ class UserV3(controller.V3Controller):
     def create_user(self, context, user):
         ref = self._assign_unique_id(self._normalize_dict(user))
         ref = self._normalize_domain_id(context, ref)
-        ref = self.identity_api.create_user(context, ref['id'], ref)
+        ref = self.identity_api.create_user(ref['id'], ref)
         return UserV3.wrap_member(context, ref)
 
     @controller.filterprotected('domain_id', 'email', 'enabled', 'name')
     def list_users(self, context, filters):
-        refs = self.identity_api.list_users(context)
+        refs = self.identity_api.list_users()
         return UserV3.wrap_collection(context, refs, filters)
 
     @controller.filterprotected('domain_id', 'email', 'enabled', 'name')
     def list_users_in_group(self, context, filters, group_id):
-        refs = self.identity_api.list_users_in_group(context, group_id)
+        refs = self.identity_api.list_users_in_group(group_id)
         return UserV3.wrap_collection(context, refs, filters)
 
     @controller.protected
     def get_user(self, context, user_id):
-        ref = self.identity_api.get_user(context, user_id)
+        ref = self.identity_api.get_user(user_id)
         return UserV3.wrap_member(context, ref)
 
     @controller.protected
     def update_user(self, context, user_id, user):
         self._require_matching_id(user_id, user)
-        ref = self.identity_api.update_user(context, user_id, user)
+        ref = self.identity_api.update_user(user_id, user)
 
         if user.get('password') or not user.get('enabled', True):
             # revoke all tokens owned by this user
-            self.token_api.revoke_tokens(
-                context,
-                user_id=ref['id'])
+            self._delete_tokens_for_user(user_id)
 
         return UserV3.wrap_member(context, ref)
 
     @controller.protected
     def add_user_to_group(self, context, user_id, group_id):
-        self.identity_api.add_user_to_group(
-            context, user_id, group_id)
+        self.identity_api.add_user_to_group(user_id, group_id)
         # Delete any tokens so that group membership can have an
         # immediate effect
-        delete_tokens_for_user(
-            context, self.token_api, self.trust_api, user_id)
+        self._delete_tokens_for_user(user_id)
 
     @controller.protected
     def check_user_in_group(self, context, user_id, group_id):
-        return self.identity_api.check_user_in_group(context,
-                                                     user_id, group_id)
+        return self.identity_api.check_user_in_group(user_id, group_id)
 
     @controller.protected
     def remove_user_from_group(self, context, user_id, group_id):
-        self.identity_api.remove_user_from_group(
-            context, user_id, group_id)
-        delete_tokens_for_user(
-            context, self.token_api, self.trust_api, user_id)
+        self.identity_api.remove_user_from_group(user_id, group_id)
+        self._delete_tokens_for_user(user_id)
+
+    def _delete_user(self, context, user_id):
+        # Delete any credentials that reference this user
+        for cred in self.credential_api.list_credentials():
+            if cred['user_id'] == user_id:
+                self.credential_api.delete_credential(cred['id'])
+
+        # Make sure any tokens are marked as deleted
+        self._delete_tokens_for_user(user_id)
+        # Finally delete the user itself - the backend is
+        # responsible for deleting any role assignments related
+        # to this user
+        return self.identity_api.delete_user(user_id)
 
     @controller.protected
     def delete_user(self, context, user_id):
-        return self.identity_api.delete_user(context, user_id)
+        return self._delete_user(context, user_id)
 
 
 class GroupV3(controller.V3Controller):
@@ -608,79 +664,46 @@ class GroupV3(controller.V3Controller):
     def create_group(self, context, group):
         ref = self._assign_unique_id(self._normalize_dict(group))
         ref = self._normalize_domain_id(context, ref)
-        ref = self.identity_api.create_group(context, ref['id'], ref)
+        ref = self.identity_api.create_group(ref['id'], ref)
         return GroupV3.wrap_member(context, ref)
 
     @controller.filterprotected('domain_id', 'name')
     def list_groups(self, context, filters):
-        refs = self.identity_api.list_groups(context)
+        refs = self.identity_api.list_groups()
         return GroupV3.wrap_collection(context, refs, filters)
 
     @controller.filterprotected('name')
     def list_groups_for_user(self, context, filters, user_id):
-        refs = self.identity_api.list_groups_for_user(context, user_id)
+        refs = self.identity_api.list_groups_for_user(user_id)
         return GroupV3.wrap_collection(context, refs, filters)
 
     @controller.protected
     def get_group(self, context, group_id):
-        ref = self.identity_api.get_group(context, group_id)
+        ref = self.identity_api.get_group(group_id)
         return GroupV3.wrap_member(context, ref)
 
     @controller.protected
     def update_group(self, context, group_id, group):
         self._require_matching_id(group_id, group)
 
-        ref = self.identity_api.update_group(context, group_id, group)
+        ref = self.identity_api.update_group(group_id, group)
         return GroupV3.wrap_member(context, ref)
 
-    @controller.protected
-    def delete_group(self, context, group_id):
+    def _delete_group(self, context, group_id):
         # As well as deleting the group, we need to invalidate
         # any tokens for the users who are members of the group.
         # We get the list of users before we attempt the group
         # deletion, so that we can remove these tokens after we know
         # the group deletion succeeded.
 
-        user_refs = self.identity_api.list_users_in_group(context, group_id)
-        self.identity_api.delete_group(context, group_id)
+        user_refs = self.identity_api.list_users_in_group(group_id)
+        self.identity_api.delete_group(group_id)
         for user in user_refs:
-            delete_tokens_for_user(
-                context, self.token_api, self.trust_api, user['id'])
-
-
-class CredentialV3(controller.V3Controller):
-    collection_name = 'credentials'
-    member_name = 'credential'
+            self._delete_tokens_for_user(user['id'])
 
     @controller.protected
-    def create_credential(self, context, credential):
-        ref = self._assign_unique_id(self._normalize_dict(credential))
-        ref = self.identity_api.create_credential(context, ref['id'], ref)
-        return CredentialV3.wrap_member(context, ref)
-
-    @controller.protected
-    def list_credentials(self, context):
-        refs = self.identity_api.list_credentials(context)
-        return CredentialV3.wrap_collection(context, refs)
-
-    @controller.protected
-    def get_credential(self, context, credential_id):
-        ref = self.identity_api.get_credential(context, credential_id)
-        return CredentialV3.wrap_member(context, ref)
-
-    @controller.protected
-    def update_credential(self, context, credential_id, credential):
-        self._require_matching_id(credential_id, credential)
-
-        ref = self.identity_api.update_credential(
-            context,
-            credential_id,
-            credential)
-        return CredentialV3.wrap_member(context, ref)
-
-    @controller.protected
-    def delete_credential(self, context, credential_id):
-        return self.identity_api.delete_credential(context, credential_id)
+    def delete_group(self, context, group_id):
+        return self._delete_group(context, group_id)
 
 
 class RoleV3(controller.V3Controller):
@@ -690,29 +713,29 @@ class RoleV3(controller.V3Controller):
     @controller.protected
     def create_role(self, context, role):
         ref = self._assign_unique_id(self._normalize_dict(role))
-        ref = self.identity_api.create_role(context, ref['id'], ref)
+        ref = self.identity_api.create_role(ref['id'], ref)
         return RoleV3.wrap_member(context, ref)
 
     @controller.filterprotected('name')
     def list_roles(self, context, filters):
-        refs = self.identity_api.list_roles(context)
+        refs = self.identity_api.list_roles()
         return RoleV3.wrap_collection(context, refs, filters)
 
     @controller.protected
     def get_role(self, context, role_id):
-        ref = self.identity_api.get_role(context, role_id)
+        ref = self.identity_api.get_role(role_id)
         return RoleV3.wrap_member(context, ref)
 
     @controller.protected
     def update_role(self, context, role_id, role):
         self._require_matching_id(role_id, role)
 
-        ref = self.identity_api.update_role(context, role_id, role)
+        ref = self.identity_api.update_role(role_id, role)
         return RoleV3.wrap_member(context, ref)
 
     @controller.protected
     def delete_role(self, context, role_id):
-        return self.identity_api.delete_role(context, role_id)
+        return self.identity_api.delete_role(role_id)
 
     def _require_domain_xor_project(self, domain_id, project_id):
         if (domain_id and project_id) or (not domain_id and not project_id):
@@ -732,18 +755,7 @@ class RoleV3(controller.V3Controller):
         self._require_user_xor_group(user_id, group_id)
 
         self.identity_api.create_grant(
-            context, role_id, user_id, group_id, domain_id, project_id)
-
-        # So that existing tokens don't stop the use of this grant
-        # delete any tokens for this user or, in the case of a group,
-        # tokens from all the uses who are members of this group.
-        if user_id:
-            delete_tokens_for_user(
-                context, self.token_api, self.trust_api, user_id)
-        else:
-            delete_tokens_for_group(
-                context, self.identity_api, self.token_api, self.trust_api,
-                group_id)
+            role_id, user_id, group_id, domain_id, project_id)
 
     @controller.protected
     def list_grants(self, context, user_id=None, group_id=None,
@@ -753,7 +765,7 @@ class RoleV3(controller.V3Controller):
         self._require_user_xor_group(user_id, group_id)
 
         refs = self.identity_api.list_grants(
-            context, user_id, group_id, domain_id, project_id)
+            user_id, group_id, domain_id, project_id)
         return RoleV3.wrap_collection(context, refs)
 
     @controller.protected
@@ -764,7 +776,7 @@ class RoleV3(controller.V3Controller):
         self._require_user_xor_group(user_id, group_id)
 
         self.identity_api.get_grant(
-            context, role_id, user_id, group_id, domain_id, project_id)
+            role_id, user_id, group_id, domain_id, project_id)
 
     @controller.protected
     def revoke_grant(self, context, role_id, user_id=None, group_id=None,
@@ -774,14 +786,11 @@ class RoleV3(controller.V3Controller):
         self._require_user_xor_group(user_id, group_id)
 
         self.identity_api.delete_grant(
-            context, role_id, user_id, group_id, domain_id, project_id)
+            role_id, user_id, group_id, domain_id, project_id)
 
         # Now delete any tokens for this user or, in the case of a group,
         # tokens from all the uses who are members of this group.
         if user_id:
-            delete_tokens_for_user(
-                context, self.token_api, self.trust_api, user_id)
+            self._delete_tokens_for_user(user_id)
         else:
-            delete_tokens_for_group(
-                context, self.identity_api, self.token_api,
-                self.trust_api, group_id)
+            self._delete_tokens_for_group(group_id)

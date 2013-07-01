@@ -89,20 +89,20 @@ class StatsController(wsgi.Application):
                 {
                     'type': 'identity',
                     'api': 'admin',
-                    'extra': self.stats_api.get_stats(context, 'admin'),
+                    'extra': self.stats_api.get_stats('admin'),
                 },
                 {
                     'type': 'identity',
                     'api': 'public',
-                    'extra': self.stats_api.get_stats(context, 'public'),
+                    'extra': self.stats_api.get_stats('public'),
                 },
             ]
         }
 
     def reset_stats(self, context):
         self.assert_admin(context)
-        self.stats_api.set_stats(context, 'public', dict())
-        self.stats_api.set_stats(context, 'admin', dict())
+        self.stats_api.set_stats('public', dict())
+        self.stats_api.set_stats('admin', dict())
 
 
 class StatsMiddleware(wsgi.Middleware):
@@ -121,23 +121,18 @@ class StatsMiddleware(wsgi.Middleware):
         return super(StatsMiddleware, self).__init__(*args, **kwargs)
 
     def _resolve_api(self, host):
-        if str(CONF.admin_port) in host:
+        if host.endswith(':%s' % (CONF.admin_port)):
             return 'admin'
-        elif str(CONF.public_port) in host:
+        elif host.endswith(':%s' % (CONF.public_port)):
             return 'public'
         else:
-            # NOTE(dolph): I don't think this is actually reachable, but hey
-            msg = 'Unable to resolve API as either public or admin: %s' % host
-            LOG.warning(msg)
             return host
 
     def capture_stats(self, host, obj, attributes):
         """Collect each attribute from the given object."""
         for attribute in attributes:
-            self.stats_api.increment_stat(None,
-                                          self._resolve_api(host),
-                                          attribute,
-                                          getattr(obj, attribute))
+            self.stats_api.increment_stat(
+                self._resolve_api(host), attribute, getattr(obj, attribute))
 
     def process_request(self, request):
         """Monitor incoming request attributes."""

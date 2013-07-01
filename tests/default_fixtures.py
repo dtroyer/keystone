@@ -45,6 +45,12 @@ TENANTS = [
         'description': 'description',
         'enabled': True,
         'domain_id': DEFAULT_DOMAIN_ID
+    }, {
+        'id': 'service',
+        'name': 'service',
+        'description': 'description',
+        'enabled': True,
+        'domain_id': DEFAULT_DOMAIN_ID
     }
 ]
 
@@ -115,6 +121,20 @@ ROLES = [
     }, {
         'id': 'writer',
         'name': 'Writer',
+    }, {
+        'id': 'service',
+        'name': 'Service',
     }
 
+
+]
+
+DOMAINS = [
+    {
+        'id': DEFAULT_DOMAIN_ID,
+        'name': 'Default',
+        'enabled': True,
+        'description': 'Owns users and tenants (i.e. projects) available '
+                       'on Identity API v2.'
+    }
 ]

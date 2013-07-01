@@ -26,6 +26,7 @@ Documentation`_.
 
 .. _`GitHub Repository`: http://github.com/openstack/keystone
 .. _`User Documentation`: http://docs.openstack.org/
+.. _developing: developing.rst
 
 Prerequisites
 =============
@@ -65,8 +66,8 @@ Installing dependencies
 
 Keystone maintains two lists of dependencies::
 
-    tools/pip-requires
-    tools/test-requires
+    requirements.txt
+    test-requirements.txt
 
 The first is the list of dependencies needed for running keystone, the second list includes dependencies used for active development and testing of keystone itself.
 
@@ -123,10 +124,10 @@ If you want to run keystone outside of a virtualenv, you can install the
 dependencies directly into your system from the requires files::
 
     # Install the dependencies for running keystone
-    $ pip install -r tools/pip-requires
+    $ pip install -r requirements.txt
 
     # Install the dependencies for developing, testing, and running keystone
-    $ pip install -r tools/test-requires
+    $ pip install -r test-requirements.txt
 
     # Use python setup.py to link Keystone into python's site-packages
     $ python setup.py develop
@@ -149,7 +150,7 @@ without issue::
     >>>
 
 If you can import keystone successfully, you should be ready to move on to
-:doc:`developing`
+developing_.
 
 Troubleshooting
 ===============

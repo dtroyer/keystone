@@ -36,8 +36,10 @@ class Service(sql.ModelBase, sql.DictBase):
 
 class Endpoint(sql.ModelBase, sql.DictBase):
     __tablename__ = 'endpoint'
-    attributes = ['id', 'interface', 'region', 'service_id', 'url']
+    attributes = ['id', 'interface', 'region', 'service_id', 'url',
+                  'legacy_endpoint_id']
     id = sql.Column(sql.String(64), primary_key=True)
+    legacy_endpoint_id = sql.Column(sql.String(64))
     interface = sql.Column(sql.String(8), primary_key=True)
     region = sql.Column('region', sql.String(255))
     service_id = sql.Column(sql.String(64),
@@ -48,8 +50,8 @@ class Endpoint(sql.ModelBase, sql.DictBase):
 
 
 class Catalog(sql.Base, catalog.Driver):
-    def db_sync(self):
-        migration.db_sync()
+    def db_sync(self, version=None):
+        migration.db_sync(version=version)
 
     # Services
     def list_services(self):
@@ -58,10 +60,10 @@ class Catalog(sql.Base, catalog.Driver):
         return [s.to_dict() for s in list(services)]
 
     def _get_service(self, session, service_id):
-        try:
-            return session.query(Service).filter_by(id=service_id).one()
-        except sql.NotFound:
+        ref = session.query(Service).get(service_id)
+        if not ref:
             raise exception.ServiceNotFound(service_id=service_id)
+        return ref
 
     def get_service(self, service_id):
         session = self.get_session()
@@ -110,8 +112,8 @@ class Catalog(sql.Base, catalog.Driver):
     def delete_endpoint(self, endpoint_id):
         session = self.get_session()
         with session.begin():
-            if not session.query(Endpoint).filter_by(id=endpoint_id).delete():
-                raise exception.EndpointNotFound(endpoint_id=endpoint_id)
+            ref = self._get_endpoint(session, endpoint_id)
+            session.delete(ref)
             session.flush()
 
     def _get_endpoint(self, session, endpoint_id):

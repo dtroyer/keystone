@@ -16,6 +16,7 @@
 
 """Main entry point into the Identity service."""
 
+from keystone import clean
 from keystone.common import dependency
 from keystone.common import logging
 from keystone.common import manager
@@ -41,6 +42,7 @@ def filter_user(user_ref):
         user_ref.pop('password', None)
         user_ref.pop('tenants', None)
         user_ref.pop('groups', None)
+        user_ref.pop('domains', None)
         try:
             user_ref['extra'].pop('password', None)
             user_ref['extra'].pop('tenants', None)
@@ -61,45 +63,63 @@ class Manager(manager.Manager):
     def __init__(self):
         super(Manager, self).__init__(CONF.identity.driver)
 
-    def create_user(self, context, user_id, user_ref):
+    def authenticate(self, user_id=None, tenant_id=None, password=None):
+        """Authenticate a given user and password and
+        authorize them for a tenant.
+        :returns: (user_ref, tenant_ref, metadata_ref)
+        :raises: AssertionError
+        """
+        user_ref = self.driver.authenticate_user(user_id, password)
+        return self.driver.authorize_for_project(user_ref, tenant_id)
+
+    def create_user(self, user_id, user_ref):
         user = user_ref.copy()
-        if 'enabled' not in user:
-            user['enabled'] = True
+        user['name'] = clean.user_name(user['name'])
+        user.setdefault('enabled', True)
+        user['enabled'] = clean.user_enabled(user['enabled'])
         return self.driver.create_user(user_id, user)
 
-    def create_group(self, context, group_id, group_ref):
+    def update_user(self, user_id, user_ref):
+        user = user_ref.copy()
+        if 'name' in user:
+            user['name'] = clean.user_name(user['name'])
+        if 'enabled' in user:
+            user['enabled'] = clean.user_enabled(user['enabled'])
+        return self.driver.update_user(user_id, user)
+
+    def create_group(self, group_id, group_ref):
         group = group_ref.copy()
-        if 'description' not in group:
-            group['description'] = ''
+        group.setdefault('description', '')
         return self.driver.create_group(group_id, group)
 
-    def create_project(self, context, tenant_id, tenant_ref):
+    def create_project(self, tenant_id, tenant_ref):
         tenant = tenant_ref.copy()
-        if 'enabled' not in tenant:
-            tenant['enabled'] = True
-        if 'description' not in tenant:
-            tenant['description'] = ''
+        tenant.setdefault('enabled', True)
+        tenant['enabled'] = clean.project_enabled(tenant['enabled'])
+        tenant.setdefault('description', '')
         return self.driver.create_project(tenant_id, tenant)
+
+    def update_project(self, tenant_id, tenant_ref):
+        tenant = tenant_ref.copy()
+        if 'enabled' in tenant:
+            tenant['enabled'] = clean.project_enabled(tenant['enabled'])
+        return self.driver.update_project(tenant_id, tenant)
 
 
 class Driver(object):
     """Interface description for an Identity driver."""
 
-    def authenticate(self, user_id=None, tenant_id=None, password=None):
-        """Authenticate a given user, tenant and password.
-
-        :returns: (user_ref, tenant_ref, metadata_ref)
+    def authenticate_user(self, user_id, password):
+        """Authenticate a given user and password.
+        :returns: user_ref
         :raises: AssertionError
-
         """
         raise exception.NotImplemented()
 
-    def get_project(self, tenant_id):
-        """Get a tenant by id.
-
-        :returns: tenant_ref
-        :raises: keystone.exception.ProjectNotFound
-
+    def authorize_for_project(self, tenant_id, user_ref):
+        """Authenticate a given user for a tenant.
+        :returns: (user_ref, tenant_ref, metadata_ref)
+        :raises: AssertionError
         """
         raise exception.NotImplemented()
 
@@ -230,32 +250,6 @@ class Driver(object):
         """
         raise exception.NotImplemented()
 
-    # tenant crud
-    def create_project(self, tenant_id, tenant):
-        """Creates a new tenant.
-
-        :raises: keystone.exception.Conflict
-
-        """
-        raise exception.NotImplemented()
-
-    def update_project(self, tenant_id, tenant):
-        """Updates an existing tenant.
-
-        :raises: keystone.exception.ProjectNotFound,
-                 keystone.exception.Conflict
-
-        """
-        raise exception.NotImplemented()
-
-    def delete_project(self, tenant_id):
-        """Deletes an existing tenant.
-
-        :raises: keystone.exception.ProjectNotFound
-
-        """
-        raise exception.NotImplemented()
-
     # metadata crud
     def get_metadata(self, user_id=None, tenant_id=None,
                      domain_id=None, group_id=None):
@@ -362,10 +356,10 @@ class Driver(object):
         """
         raise exception.NotImplemented()
 
-    def get_project(self):
+    def get_project(self, project_id):
         """Get a project by ID.
 
-        :returns: user_ref
+        :returns: project_ref
         :raises: keystone.exception.ProjectNotFound
 
         """
@@ -462,50 +456,6 @@ class Driver(object):
         """Deletes an existing user.
 
         :raises: keystone.exception.UserNotFound
-
-        """
-        raise exception.NotImplemented()
-
-    # credential crud
-
-    def create_credential(self, credential_id, credential):
-        """Creates a new credential.
-
-        :raises: keystone.exception.Conflict
-
-        """
-        raise exception.NotImplemented()
-
-    def list_credentials(self):
-        """List all credentials in the system.
-
-        :returns: a list of credential_refs or an empty list.
-
-        """
-        raise exception.NotImplemented()
-
-    def get_credential(self, credential_id):
-        """Get a credential by ID.
-
-        :returns: credential_ref
-        :raises: keystone.exception.CredentialNotFound
-
-        """
-        raise exception.NotImplemented()
-
-    def update_credential(self, credential_id, credential):
-        """Updates an existing credential.
-
-        :raises: keystone.exception.CredentialNotFound,
-                 keystone.exception.Conflict
-
-        """
-        raise exception.NotImplemented()
-
-    def delete_credential(self, credential_id):
-        """Deletes an existing credential.
-
-        :raises: keystone.exception.CredentialNotFound
 
         """
         raise exception.NotImplemented()

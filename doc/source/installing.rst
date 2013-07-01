@@ -21,7 +21,7 @@ Installing Keystone
 
 This document describes how to install Keystone in order to use it. If you are
 intending to develop on or with Keystone, please read :doc:`developing` and
-:doc:`setup`
+:doc:`setup`.
 
 Installing from Source
 ----------------------
@@ -32,7 +32,7 @@ packages, instead using the source for the code and the Python Package Index
 
 .. _PyPi: http://pypi.python.org/pypi
 
-Its expected that your system already has python_, pip_, and git_ available.
+It's expected that your system already has python_, pip_, and git_ available.
 
 .. _python: http://www.python.org
 .. _pip: http://www.pip-installer.org/en/latest/installing.html
@@ -45,7 +45,7 @@ Clone the keystone repository::
 
 Install the dependencies to run keystone::
 
-    sudo pip install -r tools/pip-requires
+    sudo pip install -r requirements.txt
 
 And at this point, you should have all the pieces you need to run keystone
 installed on your system. The following commands should be available on the
@@ -58,6 +58,7 @@ commandline path:
 You will find sample configuration files in ``etc/``
 
 * keystone.conf
+* keystone-paste.ini
 * logging.conf
 * policy.json
 * default_catalog.templates

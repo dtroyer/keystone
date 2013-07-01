@@ -14,43 +14,26 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import re
+import copy
 
 from keystone.common import serializer
 from keystone import test
 
 
 class XmlSerializerTestCase(test.TestCase):
-    def assertEqualIgnoreWhitespace(self, a, b):
-        """Splits two strings into lists and compares them.
-
-        This provides easy-to-read failures from nose.
-
-        """
-        try:
-            self.assertEqual(a, b)
-        except AssertionError:
-            a = re.sub('[ \n]+', ' ', a).strip().split()
-            b = re.sub('[ \n]+', ' ', b).strip().split()
-            self.assertEqual(a, b)
-
     def assertSerializeDeserialize(self, d, xml, xmlns=None):
-        self.assertEqualIgnoreWhitespace(serializer.to_xml(d, xmlns), xml)
+        self.assertEqualXML(
+            serializer.to_xml(copy.deepcopy(d), xmlns),
+            xml)
         self.assertEqual(serializer.from_xml(xml), d)
 
-        # operations should be invertable
+        # operations should be invertible
         self.assertEqual(
-            serializer.from_xml(serializer.to_xml(d, xmlns)),
+            serializer.from_xml(serializer.to_xml(copy.deepcopy(d), xmlns)),
             d)
-        self.assertEqualIgnoreWhitespace(
+        self.assertEqualXML(
             serializer.to_xml(serializer.from_xml(xml), xmlns),
             xml)
-
-    def test_none(self):
-        d = None
-        xml = None
-
-        self.assertSerializeDeserialize(d, xml)
 
     def test_auth_request(self):
         d = {
@@ -145,6 +128,29 @@ class XmlSerializerTestCase(test.TestCase):
 
         self.assertSerializeDeserialize(d, xml)
 
+    def test_tenant_crud_no_description(self):
+        d = {
+            "tenant": {
+                "id": "1234",
+                "name": "ACME corp",
+                "description": "",
+                "enabled": True
+            }
+        }
+
+        xml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <tenant
+                    xmlns="http://docs.openstack.org/identity/api/v2.0"
+                    enabled="true"
+                    id="1234"
+                    name="ACME corp">
+                <description></description>
+            </tenant>
+        """
+
+        self.assertSerializeDeserialize(d, xml)
+
     def test_policy_list(self):
         d = {"policies": [{"id": "ab12cd"}]}
 
@@ -154,7 +160,7 @@ class XmlSerializerTestCase(test.TestCase):
                 <policy id="ab12cd"/>
             </policies>
         """
-        self.assertEqualIgnoreWhitespace(serializer.to_xml(d), xml)
+        self.assertEqualXML(serializer.to_xml(d), xml)
 
     def test_values_list(self):
         d = {
@@ -175,4 +181,117 @@ class XmlSerializerTestCase(test.TestCase):
             </objects>
         """
 
-        self.assertEqualIgnoreWhitespace(serializer.to_xml(d), xml)
+        self.assertEqualXML(serializer.to_xml(d), xml)
+
+    def test_collection_list(self):
+        d = {
+            "links": {
+                "next": "http://localhost:5000/v3/objects?page=3",
+                "previous": None,
+                "self": "http://localhost:5000/v3/objects"
+            },
+            "objects": [{
+                "attribute": "value1",
+                "links": {
+                    "self": "http://localhost:5000/v3/objects/abc123def",
+                    "anotherobj": "http://localhost:5000/v3/anotherobjs/123"
+                }
+            }, {
+                "attribute": "value2",
+                "links": {
+                    "self": "http://localhost:5000/v3/objects/abc456"
+                }
+            }]}
+        xml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <objects xmlns="http://docs.openstack.org/identity/api/v2.0">
+                <object attribute="value1">
+                    <links>
+                        <link rel="self"
+                            href="http://localhost:5000/v3/objects/abc123def"/>
+                        <link rel="anotherobj"
+                            href="http://localhost:5000/v3/anotherobjs/123"/>
+                    </links>
+                </object>
+                <object attribute="value2">
+                     <links>
+                         <link rel="self"
+                             href="http://localhost:5000/v3/objects/abc456"/>
+                     </links>
+                </object>
+                <links>
+                    <link rel="self"
+                        href="http://localhost:5000/v3/objects"/>
+                    <link rel="next"
+                        href="http://localhost:5000/v3/objects?page=3"/>
+                </links>
+            </objects>
+        """
+        self.assertSerializeDeserialize(d, xml)
+
+    def test_collection_member(self):
+        d = {
+            "object": {
+                "attribute": "value",
+                "links": {
+                    "self": "http://localhost:5000/v3/objects/abc123def",
+                    "anotherobj": "http://localhost:5000/v3/anotherobjs/123"}}}
+
+        xml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <object xmlns="http://docs.openstack.org/identity/api/v2.0"
+                attribute="value">
+                    <links>
+                        <link rel="self"
+                            href="http://localhost:5000/v3/objects/abc123def"/>
+                        <link rel="anotherobj"
+                            href="http://localhost:5000/v3/anotherobjs/123"/>
+                    </links>
+            </object>
+        """
+        self.assertSerializeDeserialize(d, xml)
+
+    def test_v2_links_special_case(self):
+        # There's special-case code (for backward compatibility) where if the
+        # data is the v2 version data, the link elements are also added to the
+        # main element.
+
+        d = {
+            "object": {
+                "id": "v2.0",
+                "status": "stable",
+                "updated": "2013-03-06T00:00:00Z",
+                "links": [{"href": "http://localhost:5000/v2.0/",
+                           "rel": "self"},
+                          {"href": "http://docs.openstack.org/api/openstack-"
+                                   "identity-service/2.0/content/",
+                           "type": "text/html", "rel": "describedby"},
+                          {"href": "http://docs.openstack.org/api/openstack-"
+                                   "identity-service/2.0/"
+                                   "identity-dev-guide-2.0.pdf",
+                           "type": "application/pdf", "rel": "describedby"}]
+            }}
+
+        xml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <object xmlns="http://docs.openstack.org/identity/api/v2.0"
+                id="v2.0" status="stable" updated="2013-03-06T00:00:00Z">
+                    <links>
+                        <link rel="self" href="http://localhost:5000/v2.0/"/>
+                        <link rel="describedby"
+                              href="http://docs.openstack.org/api/openstack-\
+identity-service/2.0/content/" type="text/html"/>
+                        <link rel="describedby"
+                              href="http://docs.openstack.org/api/openstack-\
+identity-service/2.0/identity-dev-guide-2.0.pdf" type="application/pdf"/>
+                    </links>
+                    <link rel="self" href="http://localhost:5000/v2.0/"/>
+                    <link rel="describedby"
+                          href="http://docs.openstack.org/api/openstack-\
+identity-service/2.0/content/" type="text/html"/>
+                    <link rel="describedby"
+                          href="http://docs.openstack.org/api/openstack-\
+identity-service/2.0/identity-dev-guide-2.0.pdf" type="application/pdf"/>
+            </object>
+        """
+        self.assertEqualXML(serializer.to_xml(d), xml)

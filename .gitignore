@@ -3,6 +3,7 @@
 vendor
 .ksl-venv
 .venv
+.update-venv/
 .tox
 keystone.egg-info/
 *.log
@@ -18,7 +19,6 @@ doc/build
 doc/source/modules.rst
 doc/source/keystone.*
 ChangeLog
-requirements.txt
 AUTHORS
 build/
 dist/

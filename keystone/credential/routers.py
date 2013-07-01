@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 OpenStack LLC
+# Copyright 2013 OpenStack LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -14,4 +14,13 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from keystone.identity.backends.ldap.core import *
+"""WSGI Routers for the Credentials service."""
+
+from keystone.common import router
+from keystone.credential import controllers
+
+
+def append_v3_routers(mapper, routers):
+    routers.append(
+        router.Router(controllers.CredentialV3(),
+                      'credentials', 'credential'))

@@ -17,21 +17,22 @@
 """Token Factory"""
 
 import json
-import subprocess
+import sys
 import uuid
 import webob
 
+from keystone import catalog
 from keystone.common import cms
+from keystone.common import environment
 from keystone.common import logging
 from keystone.common import utils
-from keystone import catalog
 from keystone import config
 from keystone import exception
 from keystone import identity
-from keystone import token as token_module
-from keystone import trust
 from keystone.openstack.common import jsonutils
 from keystone.openstack.common import timeutils
+from keystone import token as token_module
+from keystone import trust
 
 
 CONF = config.CONF
@@ -41,23 +42,23 @@ LOG = logging.getLogger(__name__)
 
 class TokenDataHelper(object):
     """Token data helper."""
-    def __init__(self, context):
+    def __init__(self):
         self.identity_api = identity.Manager()
         self.catalog_api = catalog.Manager()
         self.trust_api = trust.Manager()
-        self.context = context
 
     def _get_filtered_domain(self, domain_id):
-        domain_ref = self.identity_api.get_domain(self.context,
-                                                  domain_id)
+        domain_ref = self.identity_api.get_domain(domain_id)
         return {'id': domain_ref['id'], 'name': domain_ref['name']}
 
     def _populate_scope(self, token_data, domain_id, project_id):
+        if 'domain' in token_data or 'project' in token_data:
+            return
+
         if domain_id:
             token_data['domain'] = self._get_filtered_domain(domain_id)
         if project_id:
-            project_ref = self.identity_api.get_project(
-                self.context, project_id)
+            project_ref = self.identity_api.get_project(project_id)
             filtered_project = {
                 'id': project_ref['id'],
                 'name': project_ref['name']}
@@ -67,10 +68,10 @@ class TokenDataHelper(object):
 
     def _get_project_roles_for_user(self, user_id, project_id):
         roles = self.identity_api.get_roles_for_user_and_project(
-            self.context, user_id, project_id)
+            user_id, project_id)
         roles_ref = []
         for role_id in roles:
-            role_ref = self.identity_api.get_role(self.context, role_id)
+            role_ref = self.identity_api.get_role(role_id)
             role_ref.setdefault('project_id', project_id)
             roles_ref.append(role_ref)
         # user have no project roles, therefore access denied
@@ -82,10 +83,10 @@ class TokenDataHelper(object):
 
     def _get_domain_roles_for_user(self, user_id, domain_id):
         roles = self.identity_api.get_roles_for_user_and_domain(
-            self.context, user_id, domain_id)
+            user_id, domain_id)
         roles_ref = []
         for role_id in roles:
-            role_ref = self.identity_api.get_role(self.context, role_id)
+            role_ref = self.identity_api.get_role(role_id)
             role_ref.setdefault('domain_id', domain_id)
             roles_ref.append(role_ref)
         # user have no domain roles, therefore access denied
@@ -105,16 +106,18 @@ class TokenDataHelper(object):
 
     def _populate_user(self, token_data, user_id, domain_id, project_id,
                        trust):
-        user_ref = self.identity_api.get_user(self.context,
-                                              user_id)
-        if trust:
-            trustor_user_ref = (self.identity_api.get_user(self.context,
-                                trust['trustor_user_id']))
+        if 'user' in token_data:
+            return
+
+        user_ref = self.identity_api.get_user(user_id)
+        if CONF.trust.enabled and trust:
+            trustor_user_ref = self.identity_api.get_user(
+                trust['trustor_user_id'])
             if not trustor_user_ref['enabled']:
                 raise exception.Forbidden()
             if trust['impersonation']:
                 user_ref = trustor_user_ref
-            token_data['trust'] = (
+            token_data['OS-TRUST:trust'] = (
                 {
                     'id': trust['id'],
                     'trustor_user': {'id': trust['trustor_user_id']},
@@ -129,7 +132,10 @@ class TokenDataHelper(object):
 
     def _populate_roles(self, token_data, user_id, domain_id, project_id,
                         trust):
-        if trust:
+        if 'roles' in token_data:
+            return
+
+        if CONF.trust.enabled and trust:
             token_user_id = trust['trustor_user_id']
             token_project_id = trust['project_id']
             #trusts do not support domains yet
@@ -144,7 +150,7 @@ class TokenDataHelper(object):
                                              token_domain_id,
                                              token_project_id)
             filtered_roles = []
-            if trust:
+            if CONF.trust.enabled and trust:
                 for trust_role in trust['roles']:
                     match_roles = [x for x in roles
                                    if x['id'] == trust_role['id']]
@@ -160,17 +166,20 @@ class TokenDataHelper(object):
 
     def _populate_service_catalog(self, token_data, user_id,
                                   domain_id, project_id, trust):
-        if trust:
+        if 'catalog' in token_data:
+            return
+
+        if CONF.trust.enabled and trust:
             user_id = trust['trustor_user_id']
         if project_id or domain_id:
             try:
                 service_catalog = self.catalog_api.get_v3_catalog(
-                    self.context, user_id, project_id)
-            #TODO KVS backend needs a sample implementation
+                    user_id, project_id)
+            # TODO(ayoung): KVS backend needs a sample implementation
             except exception.NotImplemented:
                 service_catalog = {}
             # TODO(gyee): v3 service catalog is not quite completed yet
-            #TODO Enforce Endpoints for trust
+            # TODO(ayoung): Enforce Endpoints for trust
             token_data['catalog'] = service_catalog
 
     def _populate_token(self, token_data, expires=None, trust=None):
@@ -183,10 +192,16 @@ class TokenDataHelper(object):
 
     def get_token_data(self, user_id, method_names, extras,
                        domain_id=None, project_id=None, expires=None,
-                       trust=None):
+                       trust=None, token=None):
         token_data = {'methods': method_names,
                       'extras': extras}
-        if trust:
+
+        # We've probably already written these to the token
+        for x in ('roles', 'user', 'catalog', 'project', 'domain'):
+            if token and x in token:
+                token_data[x] = token[x]
+
+        if CONF.trust.enabled and trust:
             if user_id != trust['trustee_user_id']:
                 raise exception.Forbidden()
 
@@ -199,9 +214,9 @@ class TokenDataHelper(object):
         return {'token': token_data}
 
 
-def recreate_token_data(context, token_data=None, expires=None,
+def recreate_token_data(token_data=None, expires=None,
                         user_ref=None, project_ref=None):
-    """ Recreate token from an existing token.
+    """Recreate token from an existing token.
 
     Repopulate the ephemeral data and return the new token data.
 
@@ -212,35 +227,67 @@ def recreate_token_data(context, token_data=None, expires=None,
     domain_id = None
     methods = ['password', 'token']
     extras = {}
+
+    # NOTE(termie): Let's get some things straight here, because this code
+    #               is wrong but tested as such:
+    # token_data, if it exists, is going to look like:
+    #   {'token': ... the actual token data + a superfluous extras field ...}
+    # this data is actually stored in the database in the 'extras' column and
+    # then deserialized and added to the token_ref, that already has the
+    # the 'expires', 'user_id', and 'id' columns from the db.
+    # the 'user' and 'tenant' fields are being added to the
+    # token_ref due to being deserialized from the 'extras' column
+    #
+    # So, how this all looks in the db:
+    #   id = some_id
+    #   user_id = some_user_id
+    #   expires = some_expiration
+    #   extras = {'user': {'id': some_used_id},
+    #             'tenant': {'id': some_tenant_id},
+    #             'token_data': 'token': {'domain': {'id': some_domain_id},
+    #                                     'project': {'id': some_project_id},
+    #                                     'domain': {'id': some_domain_id},
+    #                                     'user': {'id': some_user_id},
+    #                                     'roles': [{'id': some_role_id}, ...],
+    #                                     'catalog': ...,
+    #                                     'expires_at': some_expiry_time,
+    #                                     'issued_at': now(),
+    #                                     'methods': ['password', 'token'],
+    #                                     'extras': { ... empty? ...}
+    #
+    # TODO(termie): reduce stored token complexity, bug filed at:
+    #               https://bugs.launchpad.net/keystone/+bug/1159990
     if token_data:
         # peel the outer layer so its easier to operate
-        token_data = token_data['token']
-        domain_id = (token_data['domain']['id'] if 'domain' in token_data
+        token = token_data['token']
+        domain_id = (token['domain']['id'] if 'domain' in token
                      else None)
-        project_id = (token_data['project']['id'] if 'project' in token_data
+        project_id = (token['project']['id'] if 'project' in token
                       else None)
         if not new_expires:
             # support Grizzly-3 to Grizzly-RC1 transition
             # tokens issued in G3 has 'expires' instead of 'expires_at'
-            new_expires = token_data.get('expires_at',
-                                         token_data.get('expires'))
-        user_id = token_data['user']['id']
-        methods = token_data['methods']
-        extras = token_data['extras']
+            new_expires = token.get('expires_at',
+                                    token.get('expires'))
+        user_id = token['user']['id']
+        methods = token['methods']
+        extras = token['extras']
     else:
-        project_id = project_ref['id']
+        token = None
+        project_id = project_ref['id'] if project_ref else None
         user_id = user_ref['id']
-    token_data_helper = TokenDataHelper(context)
+    token_data_helper = TokenDataHelper()
     return token_data_helper.get_token_data(user_id,
                                             methods,
                                             extras,
                                             domain_id,
                                             project_id,
-                                            new_expires)
+                                            new_expires,
+                                            token=token)
 
 
-def create_token(context, auth_context, auth_info):
-    token_data_helper = TokenDataHelper(context)
+def create_token(auth_context, auth_info):
+    token_data_helper = TokenDataHelper()
     (domain_id, project_id, trust) = auth_info.get_scope()
     method_names = list(set(auth_info.get_method_names() +
                             auth_context.get('method_names', [])))
@@ -260,7 +307,7 @@ def create_token(context, auth_context, auth_info):
             token_id = cms.cms_sign_token(json.dumps(token_data),
                                           CONF.signing.certfile,
                                           CONF.signing.keyfile)
-        except subprocess.CalledProcessError:
+        except environment.subprocess.CalledProcessError:
             raise exception.UnexpectedError(_(
                 'Unable to sign token.'))
     else:
@@ -285,22 +332,23 @@ def create_token(context, auth_context, auth_info):
                     user=token_data['token']['user'],
                     tenant=token_data['token'].get('project'),
                     metadata=metadata_ref,
-                    token_data=token_data)
-        token_api.create_token(context, token_id, data)
-    except Exception as e:
+                    token_data=token_data,
+                    trust_id=trust['id'] if trust else None)
+        token_api.create_token(token_id, data)
+    except Exception:
+        exc_info = sys.exc_info()
         # an identical token may have been created already.
         # if so, return the token_data as it is also identical
         try:
-            token_api.get_token(context=context,
-                                token_id=token_id)
+            token_api.get_token(token_id)
         except exception.TokenNotFound:
-            raise e
+            raise exc_info[0], exc_info[1], exc_info[2]
 
     return (token_id, token_data)
 
 
 def render_token_data_response(token_id, token_data, created=False):
-    """ Render token data HTTP response.
+    """Render token data HTTP response.
 
     Stash token ID into the X-Auth-Token header.
 

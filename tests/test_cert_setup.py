@@ -18,10 +18,14 @@
 import os
 import shutil
 
+from keystone import test
+
 from keystone.common import openssl
 from keystone import exception
-from keystone import test
 from keystone import token
+
+import default_fixtures
+
 
 ROOTDIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SSLDIR = "%s/tests/ssl/" % ROOTDIR
@@ -43,9 +47,17 @@ class CertSetupTestCase(test.TestCase):
         super(CertSetupTestCase, self).setUp()
         CONF.signing.certfile = os.path.join(CERTDIR, 'signing_cert.pem')
         CONF.signing.ca_certs = os.path.join(CERTDIR, "ca.pem")
+        CONF.signing.ca_key = os.path.join(CERTDIR, "cakey.pem")
         CONF.signing.keyfile = os.path.join(KEYDIR, "signing_key.pem")
 
+        CONF.ssl.ca_certs = CONF.signing.ca_certs
+        CONF.ssl.ca_key = CONF.signing.ca_key
+
+        CONF.ssl.certfile = os.path.join(CERTDIR, 'keystone.pem')
+        CONF.ssl.keyfile = os.path.join(KEYDIR, 'keystonekey.pem')
+
         self.load_backends()
+        self.load_fixtures(default_fixtures)
         self.controller = token.controllers.Auth()
 
     def test_can_handle_missing_certs(self):
@@ -68,12 +80,19 @@ class CertSetupTestCase(test.TestCase):
                           self.controller.authenticate,
                           {}, body_dict)
 
-    def test_create_certs(self):
-        ssl = openssl.ConfigurePKI(None, None)
-        ssl.run()
+    def test_create_pki_certs(self):
+        pki = openssl.ConfigurePKI(None, None)
+        pki.run()
         self.assertTrue(os.path.exists(CONF.signing.certfile))
         self.assertTrue(os.path.exists(CONF.signing.ca_certs))
         self.assertTrue(os.path.exists(CONF.signing.keyfile))
+
+    def test_create_ssl_certs(self):
+        ssl = openssl.ConfigureSSL(None, None)
+        ssl.run()
+        self.assertTrue(os.path.exists(CONF.ssl.ca_certs))
+        self.assertTrue(os.path.exists(CONF.ssl.certfile))
+        self.assertTrue(os.path.exists(CONF.ssl.keyfile))
 
     def tearDown(self):
         try:

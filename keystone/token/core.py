@@ -57,7 +57,7 @@ def default_expire_time():
     return timeutils.utcnow() + expire_delta
 
 
-def validate_auth_info(self, context, user_ref, tenant_ref):
+def validate_auth_info(self, user_ref, tenant_ref):
     """Validate user and tenant auth info.
 
     Validate the user and tenant auth into in order to ensure that user and
@@ -66,7 +66,6 @@ def validate_auth_info(self, context, user_ref, tenant_ref):
     Consolidate the checks here to ensure consistency between token auth and
     ec2 auth.
 
-    :params context: keystone's request context
     :params user_ref: the authenticating user
     :params tenant_ref: the scope of authorization, if any
     :raises Unauthorized: if any of the user, user's domain, tenant or
@@ -79,15 +78,12 @@ def validate_auth_info(self, context, user_ref, tenant_ref):
         raise exception.Unauthorized(msg)
 
     # If the user's domain is disabled don't allow them to authenticate
-    # TODO(dolph): remove this check after default-domain migration
-    if user_ref.get('domain_id') is not None:
-        user_domain_ref = self.identity_api.get_domain(
-            context,
-            user_ref['domain_id'])
-        if user_domain_ref and not user_domain_ref.get('enabled', True):
-            msg = 'Domain is disabled: %s' % user_domain_ref['id']
-            LOG.warning(msg)
-            raise exception.Unauthorized(msg)
+    user_domain_ref = self.identity_api.get_domain(
+        user_ref['domain_id'])
+    if user_domain_ref and not user_domain_ref.get('enabled', True):
+        msg = 'Domain is disabled: %s' % user_domain_ref['id']
+        LOG.warning(msg)
+        raise exception.Unauthorized(msg)
 
     if tenant_ref:
         # If the project is disabled don't allow them to authenticate
@@ -97,16 +93,13 @@ def validate_auth_info(self, context, user_ref, tenant_ref):
             raise exception.Unauthorized(msg)
 
         # If the project's domain is disabled don't allow them to authenticate
-        # TODO(dolph): remove this check after default-domain migration
-        if tenant_ref.get('domain_id') is not None:
-            project_domain_ref = self.identity_api.get_domain(
-                context,
-                tenant_ref['domain_id'])
-            if (project_domain_ref and
-                    not project_domain_ref.get('enabled', True)):
-                msg = 'Domain is disabled: %s' % project_domain_ref['id']
-                LOG.warning(msg)
-                raise exception.Unauthorized(msg)
+        project_domain_ref = self.identity_api.get_domain(
+            tenant_ref['domain_id'])
+        if (project_domain_ref and
+                not project_domain_ref.get('enabled', True)):
+            msg = 'Domain is disabled: %s' % project_domain_ref['id']
+            LOG.warning(msg)
+            raise exception.Unauthorized(msg)
 
 
 @dependency.provider('token_api')
@@ -120,15 +113,6 @@ class Manager(manager.Manager):
 
     def __init__(self):
         super(Manager, self).__init__(CONF.token.driver)
-
-    def revoke_tokens(self, context, user_id, tenant_id=None):
-        """Invalidates all tokens held by a user (optionally for a tenant).
-
-        If a specific tenant ID is not provided, *all* tokens held by user will
-        be revoked.
-        """
-        for token_id in self.list_tokens(context, user_id, tenant_id):
-            self.delete_token(context, token_id)
 
 
 class Driver(object):
@@ -179,6 +163,32 @@ class Driver(object):
         """
         raise exception.NotImplemented()
 
+    def delete_tokens(self, user_id, tenant_id=None, trust_id=None):
+        """Deletes tokens by user.
+        If the tenant_id is not None, only delete the tokens by user id under
+        the specified tenant.
+        If the trust_id is not None, it will be used to query tokens and the
+        user_id will be ignored.
+
+        :param user_id: identity of user
+        :type user_id: string
+        :param tenant_id: identity of the tenant
+        :type tenant_id: string
+        :param trust_id: identified of the trust
+        :type trust_id: string
+        :returns: None.
+        :raises: keystone.exception.TokenNotFound
+
+        """
+        token_list = self.list_tokens(user_id,
+                                      tenant_id=tenant_id,
+                                      trust_id=trust_id)
+        for token in token_list:
+            try:
+                self.delete_token(token)
+            except exception.NotFound:
+                pass
+
     def list_tokens(self, user_id, tenant_id=None, trust_id=None):
         """Returns a list of current token_id's for a user
 
@@ -201,10 +211,7 @@ class Driver(object):
         """
         raise exception.NotImplemented()
 
-    def revoke_tokens(self, user_id, tenant_id=None):
-        """Invalidates all tokens held by a user (optionally for a tenant).
-
-        :raises: keystone.exception.UserNotFound,
-                 keystone.exception.ProjectNotFound
+    def flush_expired_tokens(self):
+        """Archive or delete tokens that have expired.
         """
         raise exception.NotImplemented()

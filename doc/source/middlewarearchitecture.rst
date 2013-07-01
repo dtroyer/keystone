@@ -33,8 +33,8 @@ OpenStack projects based on the WSGI standard.
 
 For the architecture of keystone and its services, please see
 :doc:`architecture`. This documentation primarily describes the implementation
-in ``keystone/middleware/auth_token.py``
-(:py:class:`keystone.middleware.auth_token.AuthProtocol`)
+in ``keystoneclient/middleware/auth_token.py``
+(:py:class:`keystoneclient.middleware.auth_token.AuthProtocol`)
 
 Specification Overview
 ======================
@@ -77,7 +77,7 @@ Figure 1. Authentication Component
 
 The middleware may also be configured to operated in a 'delegated mode'.
 In this mode, the decision reject an unauthenticated client is delegated to
-the OpenStack service, as illustrated in :ref:`authComponentDelegated`.
+the OpenStack service, as illustrated below.
 
 Here, requests are forwarded to the OpenStack service with an identity status
 message that indicates whether the client's identity has been confirmed or is
@@ -102,7 +102,7 @@ Deployment Strategy
 ===================
 
 The middleware is intended to be used inline with OpenStack wsgi components,
-based on the openstack-common WSGI middleware class. It is typically deployed
+based on the oslo WSGI middleware class. It is typically deployed
 as a configuration element in a paste configuration pipeline of other
 middleware components, with the pipeline terminating in the service
 application. The middleware conforms to the python WSGI standard [PEP-333]_.
@@ -122,7 +122,7 @@ a WSGI component. Example for the auth_token middleware::
     pipeline = tokenauth myService
 
     [filter:tokenauth]
-    paste.filter_factory = keystone.middleware.auth_token:filter_factory
+    paste.filter_factory = keystoneclient.middleware.auth_token:filter_factory
     auth_host = 127.0.0.1
     auth_port = 35357
     auth_protocol = http
@@ -143,7 +143,7 @@ config file. For example in Nova, all middleware parameters can be removed
 from api-paste.ini::
 
     [filter:authtoken]
-    paste.filter_factory = keystone.middleware.auth_token:filter_factory
+    paste.filter_factory = keystoneclient.middleware.auth_token:filter_factory
 
 and set in nova.conf::
 
@@ -219,7 +219,7 @@ unsuccessful.
 Extended the request with additional User Information
 -----------------------------------------------------
 
-:py:class:`keystone.middleware.auth_token.AuthProtocol` extends the request
+The keystone client auth_token middleware extends the request
 with additional information if the user has been authenticated.
 
 

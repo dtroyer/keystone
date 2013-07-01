@@ -18,9 +18,10 @@ import uuid
 
 import nose.exc
 
+from keystone import test
+
 from keystone.common import sql
 from keystone import config
-from keystone import test
 
 import test_keystoneclient
 
@@ -28,14 +29,20 @@ import test_keystoneclient
 CONF = config.CONF
 
 
-class KcMasterSqlTestCase(test_keystoneclient.KcMasterTestCase):
+class KcMasterSqlTestCase(test_keystoneclient.KcMasterTestCase, sql.Base):
     def config(self, config_files):
         super(KcMasterSqlTestCase, self).config([
             test.etcdir('keystone.conf.sample'),
             test.testsdir('test_overrides.conf'),
             test.testsdir('backend_sql.conf')])
 
+        self.load_backends()
+        self.engine = self.get_engine()
+        sql.ModelBase.metadata.create_all(bind=self.engine)
+
     def tearDown(self):
+        sql.ModelBase.metadata.drop_all(bind=self.engine)
+        self.engine.dispose()
         sql.set_global_engine(None)
         super(KcMasterSqlTestCase, self).tearDown()
 

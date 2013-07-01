@@ -17,7 +17,7 @@ def downgrade_with_rename(meta, migrate_engine):
 
 
 def upgrade_with_copy(meta, migrate_engine):
-    legacy_table = sql.Table('user', meta, autoload=True)
+    sql.Table('user', meta, autoload=True)
     project_table = sql.Table(
         'project',
         meta,
@@ -58,8 +58,8 @@ def upgrade_with_copy(meta, migrate_engine):
                                              meta,
                                              autoload=True)
     insert = user_project_membership_table.insert()
-    for membership in session.query(user_tenant_membership_table):
-        insert.execute(membership)
+    for user_id, tenant_id in session.query(user_tenant_membership_table):
+        insert.execute({'user_id': user_id, 'tenant_id': tenant_id})
 
     session.commit()
     session.close()
@@ -69,7 +69,7 @@ def upgrade_with_copy(meta, migrate_engine):
 
 
 def downgrade_with_copy(meta, migrate_engine):
-    legacy_table = sql.Table('user', meta, autoload=True)
+    sql.Table('user', meta, autoload=True)
     tenant_table = sql.Table(
         'tenant',
         meta,

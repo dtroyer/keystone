@@ -73,6 +73,9 @@ class XmlDeserializer(object):
         dom = etree.fromstring(xml_str.strip(), PARSER)
         return self.walk_element(dom, True)
 
+    def _deserialize_links(self, links):
+        return dict((x.attrib['rel'], x.attrib['href']) for x in links)
+
     @staticmethod
     def _tag_name(tag, namespace):
         """Returns a tag name.
@@ -133,17 +136,35 @@ class XmlDeserializer(object):
             else:
                 list_item_tag = decoded_tag[:-1]
 
+        if decoded_tag == 'links':
+            return {'links': self._deserialize_links(element)}
+
+        links = None
         for child in [self.walk_element(x) for x in element
                       if not isinstance(x, ENTITY_TYPE)]:
             if list_item_tag:
-                # FIXME(gyee): special-case lists for now unti we
+                # FIXME(gyee): special-case lists for now until we
                 # figure out how to properly handle them.
                 # If any key ends with an 's', we are assuming it is a list.
-                values.append(child[list_item_tag])
+                if list_item_tag in child:
+                    values.append(child[list_item_tag])
+                else:
+                    links = child['links']
             else:
                 values = dict(values.items() + child.items())
 
-        return {XmlDeserializer._tag_name(element.tag, namespace): values}
+        # set empty and none-list element to None to align with JSON
+        if not values:
+            values = ""
+
+        d = {XmlDeserializer._tag_name(element.tag, namespace): values}
+
+        if links:
+            d['links'] = links
+            d['links'].setdefault('next')
+            d['links'].setdefault('previous')
+
+        return d
 
 
 class XmlSerializer(object):
@@ -153,10 +174,17 @@ class XmlSerializer(object):
         Optionally, namespace the etree by specifying an ``xmlns``.
 
         """
+        links = None
         # FIXME(dolph): skipping links for now
         for key in d.keys():
             if '_links' in key:
                 d.pop(key)
+            # FIXME(gyee): special-case links in collections
+            if 'links' == key:
+                if links:
+                    # we have multiple links
+                    raise Exception('Multiple links found')
+                links = d.pop(key)
 
         assert len(d.keys()) == 1, ('Cannot encode more than one root '
                                     'element: %s' % d.keys())
@@ -175,8 +203,22 @@ class XmlSerializer(object):
 
         self.populate_element(root, d[name])
 
+        # FIXME(gyee): special-case links for now
+        if links:
+            self._populate_links(root, links)
+
         # TODO(dolph): you can get a doctype from lxml, using ElementTrees
         return '%s\n%s' % (DOCTYPE, etree.tostring(root, pretty_print=True))
+
+    def _populate_links(self, element, links_json):
+        links = etree.Element('links')
+        for k, v in links_json.iteritems():
+            if v:
+                link = etree.Element('link')
+                link.set('rel', unicode(k))
+                link.set('href', unicode(v))
+                links.append(link)
+        element.append(links)
 
     def _populate_list(self, element, k, v):
         """Populates an element with a key & list value."""
@@ -196,6 +238,10 @@ class XmlSerializer(object):
             container = etree.Element(k)
             element.append(container)
             name = 'service'
+        elif k == 'roles' and element.tag == 'user':
+            name = 'role'
+        elif k == 'endpoints' and element.tag == 'service':
+            name = 'endpoint'
         elif k == 'values' and element.tag[-1] == 's':
             # OS convention is to contain lists in a 'values' element,
             # so the list itself can have attributes, which is
@@ -219,9 +265,13 @@ class XmlSerializer(object):
 
     def _populate_dict(self, element, k, v):
         """Populates an element with a key & dictionary value."""
-        child = etree.Element(k)
-        self.populate_element(child, v)
-        element.append(child)
+        if k == 'links':
+            # links is a special dict
+            self._populate_links(element, v)
+        else:
+            child = etree.Element(k)
+            self.populate_element(child, v)
+            element.append(child)
 
     def _populate_bool(self, element, k, v):
         """Populates an element with a key & boolean value."""
@@ -250,6 +300,18 @@ class XmlSerializer(object):
             self._populate_sequence(element, value)
         elif isinstance(value, dict):
             self._populate_tree(element, value)
+
+            # NOTE(blk-u): For compatibility with Folsom, when serializing the
+            # v2.0 version element also add the links to the base element.
+            if (value.get('id') == 'v2.0' and
+                    value.get('status') == 'stable' and
+                    value.get('updated') == '2013-03-06T00:00:00Z'):
+
+                for item in value['links']:
+                    child = etree.Element('link')
+                    self.populate_element(child, item)
+                    element.append(child)
+
         elif isinstance(value, basestring):
             element.text = unicode(value)
 

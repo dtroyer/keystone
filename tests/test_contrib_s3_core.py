@@ -16,11 +16,12 @@
 
 import uuid
 
-from keystone.contrib.s3.core import S3Controller
+from keystone import test
+
 from keystone.contrib import ec2
+from keystone.contrib import s3
 
 from keystone import exception
-from keystone import test
 
 
 class S3ContribCore(test.TestCase):
@@ -30,7 +31,7 @@ class S3ContribCore(test.TestCase):
         self.load_backends()
 
         self.ec2_api = ec2.Manager()
-        self.controller = S3Controller()
+        self.controller = s3.S3Controller()
 
     def test_good_signature(self):
         creds_ref = {'secret':

@@ -22,15 +22,14 @@ import sqlalchemy.engine.url
 from sqlalchemy.exc import DisconnectionError
 from sqlalchemy.ext import declarative
 import sqlalchemy.orm
+from sqlalchemy.orm.attributes import InstrumentedAttribute
 import sqlalchemy.pool
 from sqlalchemy import types as sql_types
-from sqlalchemy.orm.attributes import InstrumentedAttribute
 
 from keystone.common import logging
 from keystone import config
 from keystone import exception
 from keystone.openstack.common import jsonutils
-from keystone import exception
 
 
 CONF = config.CONF
@@ -48,6 +47,7 @@ String = sql.String
 ForeignKey = sql.ForeignKey
 DateTime = sql.DateTime
 IntegrityError = sql.exc.IntegrityError
+OperationalError = sql.exc.OperationalError
 NotFound = sql.orm.exc.NoResultFound
 Boolean = sql.Boolean
 Text = sql.Text
@@ -74,8 +74,10 @@ def initialize_decorator(init):
                 if isinstance(attr, InstrumentedAttribute):
                     column = attr.property.columns[0]
                     if isinstance(column.type, String):
+                        if not isinstance(v, unicode):
+                            v = str(v)
                         if column.type.length and \
-                                column.type.length < len(str(v)):
+                                column.type.length < len(v):
                             #if signing.token_format == 'PKI', the id will
                             #store it's public key which is very long.
                             if config.CONF.signing.token_format == 'PKI' and \
@@ -95,11 +97,6 @@ ModelBase.__init__ = initialize_decorator(ModelBase.__init__)
 def set_global_engine(engine):
     global GLOBAL_ENGINE
     GLOBAL_ENGINE = engine
-
-
-def get_global_engine():
-    global GLOBAL_ENGINE
-    return GLOBAL_ENGINE
 
 
 # Special Fields
@@ -181,9 +178,7 @@ class DictBase(object):
 
 class MySQLPingListener(object):
 
-    """
-    Ensures that MySQL connections checked out of the
-    pool are alive.
+    """Ensures that MySQL connections checked out of the pool are alive.
 
     Borrowed from:
     http://groups.google.com/group/sqlalchemy/msg/a4ce563d802c929f
@@ -245,12 +240,19 @@ class Base(object):
 
             return sql.create_engine(CONF.sql.connection, **engine_config)
 
-        engine = get_global_engine() or new_engine()
+        if not allow_global_engine:
+            return new_engine()
+
+        if GLOBAL_ENGINE:
+            return GLOBAL_ENGINE
+
+        engine = new_engine()
 
         # auto-build the db to support wsgi server w/ in-memory backend
-        if allow_global_engine and CONF.sql.connection == 'sqlite://':
+        if CONF.sql.connection == 'sqlite://':
             ModelBase.metadata.create_all(bind=engine)
-            set_global_engine(engine)
+
+        set_global_engine(engine)
 
         return engine
 
@@ -270,7 +272,7 @@ def handle_conflicts(type='object'):
         def wrapper(*args, **kwargs):
             try:
                 return method(*args, **kwargs)
-            except IntegrityError as e:
+            except (IntegrityError, OperationalError) as e:
                 raise exception.Conflict(type=type, details=str(e.orig))
         return wrapper
     return decorator

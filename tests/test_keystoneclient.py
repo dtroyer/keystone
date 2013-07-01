@@ -14,16 +14,16 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import time
 import uuid
 import webob
 
 import nose.exc
 
+from keystone import test
+
+from keystone import config
 from keystone.openstack.common import jsonutils
 from keystone.openstack.common import timeutils
-from keystone import config
-from keystone import test
 
 import default_fixtures
 
@@ -396,11 +396,36 @@ class KeystoneClientTests(object):
                           self.get_client,
                           self.user_foo)
 
+    def test_delete_user_invalidates_token(self):
+        from keystoneclient import exceptions as client_exceptions
+
+        admin_client = self.get_client(admin=True)
+        client = self.get_client(admin=False)
+
+        username = uuid.uuid4().hex
+        password = uuid.uuid4().hex
+        user_id = admin_client.users.create(
+            name=username, password=password, email=uuid.uuid4().hex).id
+
+        token_id = client.tokens.authenticate(
+            username=username, password=password).id
+
+        # token should be usable before the user is deleted
+        client.tokens.authenticate(token=token_id)
+
+        admin_client.users.delete(user=user_id)
+
+        # authenticate with a token should not work after the user is deleted
+        self.assertRaises(client_exceptions.Unauthorized,
+                          client.tokens.authenticate,
+                          token=token_id)
+
     def test_token_expiry_maintained(self):
+        timeutils.set_time_override()
         foo_client = self.get_client(self.user_foo)
 
         orig_token = foo_client.service_catalog.catalog['token']
-        time.sleep(.5)
+        timeutils.advance_time_seconds(1)
         reauthenticated_token = foo_client.tokens.authenticate(
             token=foo_client.auth_token)
 
@@ -457,6 +482,19 @@ class KeystoneClientTests(object):
                                     email='user1@test.com',
                                     tenant_id='bar')
         self.assertEquals(user2.name, test_username)
+
+    def test_update_default_tenant_to_existing_value(self):
+        client = self.get_client(admin=True)
+
+        user = client.users.create(
+            name=uuid.uuid4().hex,
+            password=uuid.uuid4().hex,
+            email=uuid.uuid4().hex,
+            tenant_id=self.tenant_bar['id'])
+
+        # attempting to update the tenant with the existing value should work
+        user = client.users.update_tenant(
+            user=user, tenant=self.tenant_bar['id'])
 
     def test_user_create_no_name(self):
         from keystoneclient import exceptions as client_exceptions
@@ -929,7 +967,7 @@ class KcMasterTestCase(CompatTestCase, KeystoneClientTests):
         token_id = client.auth_token
         new_password = uuid.uuid4().hex
 
-        # TODO(derekh) : Update to use keystoneclient when available
+        # TODO(derekh): Update to use keystoneclient when available
         class FakeResponse(object):
             def start_fake_response(self, status, headers):
                 self.response_status = int(status.split(' ', 1)[0])
@@ -956,7 +994,7 @@ class KcMasterTestCase(CompatTestCase, KeystoneClientTests):
         token_id = client.auth_token
         new_password = uuid.uuid4().hex
 
-        # TODO(derekh) : Update to use keystoneclient when available
+        # TODO(derekh): Update to use keystoneclient when available
         class FakeResponse(object):
             def start_fake_response(self, status, headers):
                 self.response_status = int(status.split(' ', 1)[0])
@@ -985,7 +1023,7 @@ class KcMasterTestCase(CompatTestCase, KeystoneClientTests):
         token_id = client.auth_token
         new_password = uuid.uuid4().hex
 
-        # TODO(derekh) : Update to use keystoneclient when available
+        # TODO(derekh): Update to use keystoneclient when available
         class FakeResponse(object):
             def start_fake_response(self, status, headers):
                 self.response_status = int(status.split(' ', 1)[0])
@@ -1104,8 +1142,7 @@ class KcEssex3TestCase(CompatTestCase, KeystoneClientTests):
         raise nose.exc.SkipTest('N/A')
 
     def test_policy_crud(self):
-        """Due to lack of endpoint CRUD"""
-        raise nose.exc.SkipTest('N/A')
+        raise nose.exc.SkipTest('N/A due to lack of endpoint CRUD')
 
 
 class Kc11TestCase(CompatTestCase, KeystoneClientTests):

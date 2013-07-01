@@ -21,12 +21,14 @@ try:
 except ImportError:
     from pysqlite2 import dbapi2 as dbapi
 
+from keystone import test
+
 from keystone.catalog.backends import templated as catalog_templated
 from keystone.common.sql import legacy
 from keystone.common.sql import util as sql_util
 from keystone import config
+from keystone import identity
 from keystone.identity.backends import sql as identity_sql
-from keystone import test
 
 
 CONF = config.CONF
@@ -40,6 +42,7 @@ class ImportLegacy(test.TestCase):
                      test.testsdir('backend_sql.conf'),
                      test.testsdir('backend_sql_disk.conf')])
         sql_util.setup_test_database()
+        self.identity_man = identity.Manager()
         self.identity_api = identity_sql.Identity()
 
     def tearDown(self):
@@ -70,7 +73,7 @@ class ImportLegacy(test.TestCase):
         self.assertEquals(user_ref['enabled'], True)
 
         # check password hashing
-        user_ref, tenant_ref, metadata_ref = self.identity_api.authenticate(
+        user_ref, tenant_ref, metadata_ref = self.identity_man.authenticate(
             user_id=admin_id, password='secrete')
 
         # check catalog
@@ -87,7 +90,7 @@ class ImportLegacy(test.TestCase):
         self.assertEquals(user_ref['enabled'], True)
 
         # check password hashing
-        user_ref, tenant_ref, metadata_ref = self.identity_api.authenticate(
+        user_ref, tenant_ref, metadata_ref = self.identity_man.authenticate(
             user_id=admin_id, password='secrete')
 
         # check catalog
@@ -104,7 +107,7 @@ class ImportLegacy(test.TestCase):
         self.assertEquals(user_ref['enabled'], True)
 
         # check password hashing
-        user_ref, tenant_ref, metadata_ref = self.identity_api.authenticate(
+        user_ref, tenant_ref, metadata_ref = self.identity_man.authenticate(
             user_id=admin_id, password='secrete')
 
         # check catalog

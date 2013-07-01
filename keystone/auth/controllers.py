@@ -17,15 +17,15 @@
 import json
 
 from keystone.auth import token_factory
-from keystone.common import controller
 from keystone.common import cms
+from keystone.common import controller
 from keystone.common import logging
 from keystone import config
 from keystone import exception
 from keystone import identity
+from keystone.openstack.common import importutils
 from keystone import token
 from keystone import trust
-from keystone.openstack.common import importutils
 
 
 LOG = logging.getLogger(__name__)
@@ -34,15 +34,6 @@ CONF = config.CONF
 
 # registry of authentication methods
 AUTH_METHODS = {}
-
-
-# register method drivers
-for method_name in CONF.auth.methods:
-    try:
-        config.register_str(method_name, group='auth')
-    except Exception as e:
-        # don't care about duplicate error
-        LOG.warn(e)
 
 
 def load_auth_method(method_name):
@@ -60,7 +51,7 @@ def get_auth_method(method_name):
 
 
 class AuthInfo(object):
-    """ Encapsulation of "auth" request. """
+    """Encapsulation of "auth" request."""
 
     def __init__(self, context, auth=None):
         self.identity_api = identity.Manager()
@@ -103,11 +94,9 @@ class AuthInfo(object):
                                             target='domain')
         try:
             if domain_name:
-                domain_ref = self.identity_api.get_domain_by_name(
-                    context=self.context, domain_name=domain_name)
+                domain_ref = self.identity_api.get_domain_by_name(domain_name)
             else:
-                domain_ref = self.identity_api.get_domain(
-                    context=self.context, domain_id=domain_id)
+                domain_ref = self.identity_api.get_domain(domain_id)
         except exception.DomainNotFound as e:
             LOG.exception(e)
             raise exception.Unauthorized(e)
@@ -128,11 +117,9 @@ class AuthInfo(object):
                                                     target='project')
                 domain_ref = self._lookup_domain(project_info['domain'])
                 project_ref = self.identity_api.get_project_by_name(
-                    context=self.context, tenant_name=project_name,
-                    domain_id=domain_ref['id'])
+                    project_name, domain_ref['id'])
             else:
-                project_ref = self.identity_api.get_project(
-                    context=self.context, tenant_id=project_id)
+                project_ref = self.identity_api.get_project(project_id)
         except exception.ProjectNotFound as e:
             LOG.exception(e)
             raise exception.Unauthorized(e)
@@ -144,7 +131,7 @@ class AuthInfo(object):
         if not trust_id:
             raise exception.ValidationError(attribute='trust_id',
                                             target='trust')
-        trust = self.trust_api.get_trust(self.context, trust_id)
+        trust = self.trust_api.get_trust(trust_id)
         if not trust:
             raise exception.TrustNotFound(trust_id=trust_id)
         return trust
@@ -163,11 +150,9 @@ class AuthInfo(object):
                                                     target='user')
                 domain_ref = self._lookup_domain(user_info['domain'])
                 user_ref = self.identity_api.get_user_by_name(
-                    context=self.context, user_name=user_name,
-                    domain_id=domain_ref['id'])
+                    user_name, domain_ref['id'])
             else:
-                user_ref = self.identity_api.get_user(
-                    context=self.context, user_id=user_id)
+                user_ref = self.identity_api.get_user(user_id)
         except exception.UserNotFound as e:
             LOG.exception(e)
             raise exception.Unauthorized(e)
@@ -175,14 +160,14 @@ class AuthInfo(object):
         return user_ref
 
     def _validate_and_normalize_scope_data(self):
-        """ Validate and normalize scope data """
+        """Validate and normalize scope data."""
         if 'scope' not in self.auth:
             return
         if sum(['project' in self.auth['scope'],
                 'domain' in self.auth['scope'],
-                'trust' in self.auth['scope']]) != 1:
+                'OS-TRUST:trust' in self.auth['scope']]) != 1:
             raise exception.ValidationError(
-                attribute='project, domain, or trust',
+                attribute='project, domain, or OS-TRUST:trust',
                 target='scope')
 
         if 'project' in self.auth['scope']:
@@ -191,9 +176,12 @@ class AuthInfo(object):
         elif 'domain' in self.auth['scope']:
             domain_ref = self._lookup_domain(self.auth['scope']['domain'])
             self._scope_data = (domain_ref['id'], None, None)
-        elif 'trust' in self.auth['scope']:
-            trust_ref = self._lookup_trust(self.auth['scope']['trust'])
-            #TODO ayoung when trusts support domain, Fill in domain data here
+        elif 'OS-TRUST:trust' in self.auth['scope']:
+            if not CONF.trust.enabled:
+                raise exception.Forbidden('Trusts are disabled.')
+            trust_ref = self._lookup_trust(
+                self.auth['scope']['OS-TRUST:trust'])
+            # TODO(ayoung): when trusts support domains, fill in domain data
             if 'project_id' in trust_ref:
                 project_ref = self._lookup_project(
                     {'id': trust_ref['project_id']})
@@ -219,7 +207,7 @@ class AuthInfo(object):
                 raise exception.AuthMethodNotSupported()
 
     def _validate_and_normalize_auth_data(self):
-        """ Make sure "auth" is valid. """
+        """Make sure "auth" is valid."""
         # make sure "auth" exist
         if not self.auth:
             raise exception.ValidationError(attribute='auth',
@@ -229,7 +217,7 @@ class AuthInfo(object):
         self._validate_and_normalize_scope_data()
 
     def get_method_names(self):
-        """ Returns the identity method names.
+        """Returns the identity method names.
 
         :returns: list of auth method names
 
@@ -237,18 +225,18 @@ class AuthInfo(object):
         return self.auth['identity']['methods']
 
     def get_method_data(self, method):
-        """ Get the auth method payload.
+        """Get the auth method payload.
 
         :returns: auth method payload
 
         """
         if method not in self.auth['identity']['methods']:
-            raise exception.ValidationError(attribute=method_name,
+            raise exception.ValidationError(attribute=method,
                                             target='identity')
         return self.auth['identity'][method]
 
     def get_scope(self):
-        """ Get scope information.
+        """Get scope information.
 
         Verify and return the scoping information.
 
@@ -266,7 +254,7 @@ class AuthInfo(object):
         return self._scope_data
 
     def set_scope(self, domain_id=None, project_id=None, trust=None):
-        """ Set scope information. """
+        """Set scope information."""
         if domain_id and project_id:
             msg = _('Scoping to both domain and project is not allowed')
             raise ValueError(msg)
@@ -283,28 +271,26 @@ class Auth(controller.V3Controller):
     def __init__(self, *args, **kw):
         super(Auth, self).__init__(*args, **kw)
         self.token_controllers_ref = token.controllers.Auth()
+        config.setup_authentication()
 
     def authenticate_for_token(self, context, auth=None):
-        """ Authenticate user and issue a token. """
+        """Authenticate user and issue a token."""
         try:
             auth_info = AuthInfo(context, auth=auth)
             auth_context = {'extras': {}, 'method_names': []}
             self.authenticate(context, auth_info, auth_context)
-            self._check_and_set_default_scoping(context, auth_info,
-                                                auth_context)
+            self._check_and_set_default_scoping(auth_info, auth_context)
             (token_id, token_data) = token_factory.create_token(
-                context, auth_context, auth_info)
+                auth_context, auth_info)
             return token_factory.render_token_data_response(
                 token_id, token_data, created=True)
-        except (exception.Unauthorized,
-                exception.AuthMethodNotSupported,
-                exception.AdditionalAuthRequired) as e:
-            raise e
+        except exception.SecurityError:
+            raise
         except Exception as e:
             LOG.exception(e)
             raise exception.Unauthorized(e)
 
-    def _check_and_set_default_scoping(self, context, auth_info, auth_context):
+    def _check_and_set_default_scoping(self, auth_info, auth_context):
         (domain_id, project_id, trust) = auth_info.get_scope()
         if trust:
             project_id = trust['project_id']
@@ -314,8 +300,7 @@ class Auth(controller.V3Controller):
 
         # fill in default_project_id if it is available
         try:
-            user_ref = self.identity_api.get_user(
-                context=context, user_id=auth_context['user_id'])
+            user_ref = self.identity_api.get_user(auth_context['user_id'])
             default_project_id = user_ref.get('default_project_id')
             if default_project_id:
                 auth_info.set_scope(domain_id=None,
@@ -341,7 +326,7 @@ class Auth(controller.V3Controller):
             raise exception.Unauthorized(msg)
 
     def authenticate(self, context, auth_info, auth_context):
-        """ Authenticate user. """
+        """Authenticate user."""
 
         # user have been authenticated externally
         if 'REMOTE_USER' in context:
@@ -371,8 +356,7 @@ class Auth(controller.V3Controller):
             raise exception.Unauthorized(msg)
 
     def _get_token_ref(self, context, token_id, belongs_to=None):
-        token_ref = self.token_api.get_token(context=context,
-                                             token_id=token_id)
+        token_ref = self.token_api.get_token(token_id)
         if cms.is_ans1_token(token_id):
             verified_token = cms.cms_verify(cms.token_to_cms(token_id),
                                             CONF.signing.certfile,
@@ -401,9 +385,8 @@ class Auth(controller.V3Controller):
     def validate_token(self, context):
         token_id = context.get('subject_token_id')
         self.check_token(context)
-        token_ref = self.token_api.get_token(context, token_id)
+        token_ref = self.token_api.get_token(token_id)
         token_data = token_factory.recreate_token_data(
-            context,
             token_ref.get('token_data'),
             token_ref['expires'],
             token_ref.get('user'),

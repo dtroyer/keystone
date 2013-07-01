@@ -2,6 +2,9 @@ import datetime
 import uuid
 
 from lxml import etree
+import webtest
+
+from keystone import test
 
 from keystone import auth
 from keystone.common import serializer
@@ -9,12 +12,12 @@ from keystone.common.sql import util as sql_util
 from keystone import config
 from keystone.openstack.common import timeutils
 from keystone.policy.backends import rules
-from keystone import test
 
 import test_content_types
 
 
 CONF = config.CONF
+DEFAULT_DOMAIN_ID = CONF.identity.default_domain_id
 
 TIME_FORMAT = '%Y-%m-%dT%H:%M:%S.%fZ'
 
@@ -37,6 +40,11 @@ class RestfulTestCase(test_content_types.RestfulTestCase):
         sql_util.setup_test_database()
         self.load_backends()
 
+        self.public_app = webtest.TestApp(
+            self.loadapp('keystone', name='main'))
+        self.admin_app = webtest.TestApp(
+            self.loadapp('keystone', name='admin'))
+
         if load_sample_data:
             self.domain_id = uuid.uuid4().hex
             self.domain = self.new_domain_ref()
@@ -56,6 +64,21 @@ class RestfulTestCase(test_content_types.RestfulTestCase):
             self.user['id'] = self.user_id
             self.identity_api.create_user(self.user_id, self.user)
 
+            self.default_domain_project_id = uuid.uuid4().hex
+            self.default_domain_project = self.new_project_ref(
+                domain_id=DEFAULT_DOMAIN_ID)
+            self.default_domain_project['id'] = self.default_domain_project_id
+            self.identity_api.create_project(self.default_domain_project_id,
+                                             self.default_domain_project)
+
+            self.default_domain_user_id = uuid.uuid4().hex
+            self.default_domain_user = self.new_user_ref(
+                domain_id=DEFAULT_DOMAIN_ID,
+                project_id=self.default_domain_project_id)
+            self.default_domain_user['id'] = self.default_domain_user_id
+            self.identity_api.create_user(self.default_domain_user_id,
+                                          self.default_domain_user)
+
             # create & grant policy.json's default role for admin_required
             self.role_id = uuid.uuid4().hex
             self.role = self.new_role_ref()
@@ -64,6 +87,12 @@ class RestfulTestCase(test_content_types.RestfulTestCase):
             self.identity_api.create_role(self.role_id, self.role)
             self.identity_api.add_role_to_user_and_project(
                 self.user_id, self.project_id, self.role_id)
+            self.identity_api.add_role_to_user_and_project(
+                self.default_domain_user_id, self.default_domain_project_id,
+                self.role_id)
+            self.identity_api.add_role_to_user_and_project(
+                self.default_domain_user_id, self.project_id,
+                self.role_id)
 
         self.public_server = self.serveapp('keystone', name='main')
         self.admin_server = self.serveapp('keystone', name='admin')
@@ -98,6 +127,7 @@ class RestfulTestCase(test_content_types.RestfulTestCase):
         ref['interface'] = uuid.uuid4().hex[:8]
         ref['service_id'] = service_id
         ref['url'] = uuid.uuid4().hex
+        ref['region'] = uuid.uuid4().hex
         return ref
 
     def new_domain_ref(self):
@@ -174,6 +204,17 @@ class RestfulTestCase(test_content_types.RestfulTestCase):
 
         return ref
 
+    def admin_request(self, *args, **kwargs):
+        """Translates XML responses to dicts.
+
+        This implies that we only have to write assertions for JSON.
+
+        """
+        r = super(RestfulTestCase, self).admin_request(*args, **kwargs)
+        if r.headers.get('Content-Type') == 'application/xml':
+            r.result = serializer.from_xml(etree.tostring(r.result))
+        return r
+
     def get_scoped_token(self):
         """Convenience method so that we can test authenticated requests."""
         r = self.admin_request(
@@ -200,7 +241,7 @@ class RestfulTestCase(test_content_types.RestfulTestCase):
                     }
                 }
             })
-        return r.getheader('X-Subject-Token')
+        return r.headers.get('X-Subject-Token')
 
     def get_requested_token(self, auth):
         """Request the specific token we want."""
@@ -209,22 +250,21 @@ class RestfulTestCase(test_content_types.RestfulTestCase):
             method='POST',
             path='/v3/auth/tokens',
             body=auth)
-        return r.getheader('X-Subject-Token')
+        return r.headers.get('X-Subject-Token')
 
     def v3_request(self, path, **kwargs):
         # Check if the caller has passed in auth details for
         # use in requesting the token
-        auth = kwargs.get('auth', None)
+        auth = kwargs.pop('auth', None)
         if auth:
-            kwargs.pop('auth')
             token = self.get_requested_token(auth)
         else:
-            token = self.get_scoped_token()
+            token = kwargs.pop('token', None)
+            if not token:
+                token = self.get_scoped_token()
         path = '/v3' + path
-        return self.admin_request(
-            path=path,
-            token=token,
-            **kwargs)
+
+        return self.admin_request(path=path, token=token, **kwargs)
 
     def get(self, path, **kwargs):
         r = self.v3_request(method='GET', path=path, **kwargs)
@@ -263,15 +303,15 @@ class RestfulTestCase(test_content_types.RestfulTestCase):
         return r
 
     def assertValidErrorResponse(self, r):
-        if r.getheader('Content-Type') == 'application/xml':
-            resp = serializer.from_xml(etree.tostring(r.body))
+        if r.headers.get('Content-Type') == 'application/xml':
+            resp = serializer.from_xml(etree.tostring(r.result))
         else:
-            resp = r.body
+            resp = r.result
         self.assertIsNotNone(resp.get('error'))
         self.assertIsNotNone(resp['error'].get('code'))
         self.assertIsNotNone(resp['error'].get('title'))
         self.assertIsNotNone(resp['error'].get('message'))
-        self.assertEqual(int(resp['error']['code']), r.status)
+        self.assertEqual(int(resp['error']['code']), r.status_code)
 
     def assertValidListLinks(self, links):
         self.assertIsNotNone(links)
@@ -298,17 +338,17 @@ class RestfulTestCase(test_content_types.RestfulTestCase):
         response, and asserted to be equal.
 
         """
-        entities = resp.body.get(key)
+        entities = resp.result.get(key)
         self.assertIsNotNone(entities)
 
         if expected_length is not None:
             self.assertEqual(len(entities), expected_length)
         elif ref is not None:
             # we're at least expecting the ref
-            self.assertTrue(len(entities))
+            self.assertNotEmpty(entities)
 
         # collections should have relational links
-        self.assertValidListLinks(resp.body.get('links'))
+        self.assertValidListLinks(resp.result.get('links'))
 
         for entity in entities:
             self.assertIsNotNone(entity)
@@ -323,7 +363,7 @@ class RestfulTestCase(test_content_types.RestfulTestCase):
     def assertValidResponse(self, resp, key, entity_validator, *args,
                             **kwargs):
         """Make assertions common to all API responses."""
-        entity = resp.body.get(key)
+        entity = resp.result.get(key)
         self.assertIsNotNone(entity)
         self.assertValidEntity(entity, *args, **kwargs)
         entity_validator(entity, *args, **kwargs)
@@ -364,12 +404,8 @@ class RestfulTestCase(test_content_types.RestfulTestCase):
         self.assertTrue(isinstance(dt, datetime.datetime))
 
     def assertValidTokenResponse(self, r, user=None):
-        self.assertTrue(r.getheader('X-Subject-Token'))
-        token = r.body
-        if r.getheader('Content-Type') == 'application/xml':
-            token = serializer.from_xml(etree.tostring(r.body))['token']
-        else:
-            token = r.body['token']
+        self.assertTrue(r.headers.get('X-Subject-Token'))
+        token = r.result['token']
 
         self.assertIsNotNone(token.get('expires_at'))
         expires_at = self.assertValidISO8601ExtendedFormatDatetime(
@@ -431,13 +467,14 @@ class RestfulTestCase(test_content_types.RestfulTestCase):
     def assertValidProjectTrustScopedTokenResponse(self, r, *args, **kwargs):
         token = self.assertValidProjectScopedTokenResponse(r, *args, **kwargs)
 
-        self.assertIsNotNone(token.get('trust'))
-        self.assertIsNotNone(token['trust'].get('id'))
-        self.assertTrue(isinstance(token['trust'].get('impersonation'), bool))
-        self.assertIsNotNone(token['trust'].get('trustor_user'))
-        self.assertIsNotNone(token['trust'].get('trustee_user'))
-        self.assertIsNotNone(token['trust']['trustor_user'].get('id'))
-        self.assertIsNotNone(token['trust']['trustee_user'].get('id'))
+        trust = token.get('OS-TRUST:trust')
+        self.assertIsNotNone(trust)
+        self.assertIsNotNone(trust.get('id'))
+        self.assertTrue(isinstance(trust.get('impersonation'), bool))
+        self.assertIsNotNone(trust.get('trustor_user'))
+        self.assertIsNotNone(trust.get('trustee_user'))
+        self.assertIsNotNone(trust['trustor_user'].get('id'))
+        self.assertIsNotNone(trust['trustee_user'].get('id'))
 
     def assertValidDomainScopedTokenResponse(self, r, *args, **kwargs):
         token = self.assertValidScopedTokenResponse(r, *args, **kwargs)
@@ -786,8 +823,8 @@ class RestfulTestCase(test_content_types.RestfulTestCase):
             else:
                 scope_data['domain']['name'] = domain_name
         if trust_id:
-            scope_data['trust'] = {}
-            scope_data['trust']['id'] = trust_id
+            scope_data['OS-TRUST:trust'] = {}
+            scope_data['OS-TRUST:trust']['id'] = trust_id
         return scope_data
 
     def build_password_auth(self, user_id=None, username=None,

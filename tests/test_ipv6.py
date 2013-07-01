@@ -15,12 +15,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import httplib
-import os
-import ssl
-
-from keystone import config
 from keystone import test
+
+from keystone.common import environment
+from keystone import config
 
 
 CONF = config.CONF
@@ -36,20 +34,18 @@ class IPv6TestCase(test.TestCase):
         self.load_backends()
 
     def test_ipv6_ok(self):
-        """
-        Make sure both public and admin API work with ipv6.
-        """
+        """Make sure both public and admin API work with ipv6."""
         self.public_server = self.serveapp('keystone', name='main',
                                            host="::1", port=0)
         self.admin_server = self.serveapp('keystone', name='admin',
                                           host="::1", port=0)
         # Verify Admin
-        conn = httplib.HTTPConnection('::1', CONF.admin_port)
+        conn = environment.httplib.HTTPConnection('::1', CONF.admin_port)
         conn.request('GET', '/')
         resp = conn.getresponse()
         self.assertEqual(resp.status, 300)
         # Verify Public
-        conn = httplib.HTTPConnection('::1', CONF.public_port)
+        conn = environment.httplib.HTTPConnection('::1', CONF.public_port)
         conn.request('GET', '/')
         resp = conn.getresponse()
         self.assertEqual(resp.status, 300)

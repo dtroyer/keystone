@@ -32,10 +32,11 @@ import uuid
 from migrate.versioning import api as versioning_api
 import sqlalchemy
 
+from keystone import test
+
 from keystone.common import sql
 from keystone.common.sql import migration
 from keystone import config
-from keystone import test
 
 import default_fixtures
 
@@ -50,11 +51,18 @@ class SqlUpgradeTests(test.TestCase):
         self.metadata = sqlalchemy.MetaData()
         self.metadata.bind = self.engine
 
+    _config_file_list = [test.etcdir('keystone.conf.sample'),
+                         test.testsdir('test_overrides.conf'),
+                         test.testsdir('backend_sql.conf')]
+
+    #override this to sepcify the complete list of configuration files
+    def config_files(self):
+        return self._config_file_list
+
     def setUp(self):
         super(SqlUpgradeTests, self).setUp()
-        self.config([test.etcdir('keystone.conf.sample'),
-                     test.testsdir('test_overrides.conf'),
-                     test.testsdir('backend_sql.conf')])
+
+        self.config(self.config_files())
         self.base = sql.Base()
 
         # create and share a single sqlalchemy engine for testing
@@ -72,6 +80,7 @@ class SqlUpgradeTests(test.TestCase):
         self.max_version = self.schema.repository.version().version
 
     def tearDown(self):
+        sqlalchemy.orm.session.Session.close_all()
         table = sqlalchemy.Table("migrate_version", self.metadata,
                                  autoload=True)
         self.downgrade(0)
@@ -154,6 +163,85 @@ class SqlUpgradeTests(test.TestCase):
         self.assertEqual(a_tenant.description, 'description')
         session.commit()
         session.close()
+
+    def test_normalized_enabled_states(self):
+        self.upgrade(8)
+
+        users = {
+            'bool_enabled_user': {
+                'id': uuid.uuid4().hex,
+                'name': uuid.uuid4().hex,
+                'password': uuid.uuid4().hex,
+                'extra': json.dumps({'enabled': True})},
+            'bool_disabled_user': {
+                'id': uuid.uuid4().hex,
+                'name': uuid.uuid4().hex,
+                'password': uuid.uuid4().hex,
+                'extra': json.dumps({'enabled': False})},
+            'str_enabled_user': {
+                'id': uuid.uuid4().hex,
+                'name': uuid.uuid4().hex,
+                'password': uuid.uuid4().hex,
+                'extra': json.dumps({'enabled': 'True'})},
+            'str_disabled_user': {
+                'id': uuid.uuid4().hex,
+                'name': uuid.uuid4().hex,
+                'password': uuid.uuid4().hex,
+                'extra': json.dumps({'enabled': 'False'})},
+            'int_enabled_user': {
+                'id': uuid.uuid4().hex,
+                'name': uuid.uuid4().hex,
+                'password': uuid.uuid4().hex,
+                'extra': json.dumps({'enabled': 1})},
+            'int_disabled_user': {
+                'id': uuid.uuid4().hex,
+                'name': uuid.uuid4().hex,
+                'password': uuid.uuid4().hex,
+                'extra': json.dumps({'enabled': 0})},
+            'null_enabled_user': {
+                'id': uuid.uuid4().hex,
+                'name': uuid.uuid4().hex,
+                'password': uuid.uuid4().hex,
+                'extra': json.dumps({'enabled': None})},
+            'unset_enabled_user': {
+                'id': uuid.uuid4().hex,
+                'name': uuid.uuid4().hex,
+                'password': uuid.uuid4().hex,
+                'extra': json.dumps({})}}
+
+        session = self.Session()
+        for user in users.values():
+            self.insert_dict(session, 'user', user)
+        session.commit()
+
+        self.upgrade(10)
+
+        user_table = sqlalchemy.Table('user', self.metadata, autoload=True)
+        q = session.query(user_table, 'enabled')
+
+        user = q.filter_by(id=users['bool_enabled_user']['id']).one()
+        self.assertTrue(user.enabled)
+
+        user = q.filter_by(id=users['bool_disabled_user']['id']).one()
+        self.assertFalse(user.enabled)
+
+        user = q.filter_by(id=users['str_enabled_user']['id']).one()
+        self.assertTrue(user.enabled)
+
+        user = q.filter_by(id=users['str_disabled_user']['id']).one()
+        self.assertFalse(user.enabled)
+
+        user = q.filter_by(id=users['int_enabled_user']['id']).one()
+        self.assertTrue(user.enabled)
+
+        user = q.filter_by(id=users['int_disabled_user']['id']).one()
+        self.assertFalse(user.enabled)
+
+        user = q.filter_by(id=users['null_enabled_user']['id']).one()
+        self.assertTrue(user.enabled)
+
+        user = q.filter_by(id=users['unset_enabled_user']['id']).one()
+        self.assertTrue(user.enabled)
 
     def test_downgrade_10_to_8(self):
         self.upgrade(10)
@@ -456,21 +544,21 @@ class SqlUpgradeTests(test.TestCase):
         domain = {'id': uuid.uuid4().hex,
                   'name': uuid.uuid4().hex,
                   'enabled': True}
-        self.engine.execute(domain_table.insert().values(domain))
+        session.execute(domain_table.insert().values(domain))
 
         # Create a Project
         project = {'id': uuid.uuid4().hex,
                    'name': uuid.uuid4().hex,
                    'domain_id': domain['id'],
                    'extra': "{}"}
-        self.engine.execute(project_table.insert().values(project))
+        session.execute(project_table.insert().values(project))
 
         # Create another Project
         project2 = {'id': uuid.uuid4().hex,
                     'name': uuid.uuid4().hex,
                     'domain_id': domain['id'],
                     'extra': "{}"}
-        self.engine.execute(project_table.insert().values(project2))
+        session.execute(project_table.insert().values(project2))
 
         # Create a User
         user = {'id': uuid.uuid4().hex,
@@ -479,28 +567,28 @@ class SqlUpgradeTests(test.TestCase):
                 'password': uuid.uuid4().hex,
                 'enabled': True,
                 'extra': json.dumps({})}
-        self.engine.execute(user_table.insert().values(user))
+        session.execute(user_table.insert().values(user))
 
         # Create a Role
         role = {'id': uuid.uuid4().hex,
                 'name': uuid.uuid4().hex}
-        self.engine.execute(role_table.insert().values(role))
+        session.execute(role_table.insert().values(role))
 
         # And another role
         role2 = {'id': uuid.uuid4().hex,
                  'name': uuid.uuid4().hex}
-        self.engine.execute(role_table.insert().values(role2))
+        session.execute(role_table.insert().values(role2))
 
         # Grant Role to User
         role_grant = {'user_id': user['id'],
                       'tenant_id': project['id'],
                       'data': json.dumps({"roles": [role['id']]})}
-        self.engine.execute(metadata_table.insert().values(role_grant))
+        session.execute(metadata_table.insert().values(role_grant))
 
         role_grant = {'user_id': user['id'],
                       'tenant_id': project2['id'],
                       'data': json.dumps({"roles": [role2['id']]})}
-        self.engine.execute(metadata_table.insert().values(role_grant))
+        session.execute(metadata_table.insert().values(role_grant))
 
         session.commit()
 
@@ -509,18 +597,17 @@ class SqlUpgradeTests(test.TestCase):
         user_project_metadata_table = sqlalchemy.Table(
             'user_project_metadata', self.metadata, autoload=True)
 
-        # Test user in project has role
-        r = session.execute('select data from metadata where user_id="%s"'
-                            'and tenant_id="%s"' %
-                            (user['id'], project['id']))
+        r = session.execute('select data from metadata where '
+                            'user_id=:user and tenant_id=:tenant',
+                            {'user': user['id'], 'tenant': project['id']})
         test_project1 = json.loads(r.fetchone()['data'])
         self.assertEqual(len(test_project1['roles']), 1)
         self.assertIn(role['id'], test_project1['roles'])
 
         # Test user in project2 has role2
-        r = session.execute('select data from metadata where user_id="%s"'
-                            ' and tenant_id="%s"' %
-                            (user['id'], project2['id']))
+        r = session.execute('select data from metadata where '
+                            'user_id=:user and tenant_id=:tenant',
+                            {'user': user['id'], 'tenant': project2['id']})
         test_project2 = json.loads(r.fetchone()['data'])
         self.assertEqual(len(test_project2['roles']), 1)
         self.assertIn(role2['id'], test_project2['roles'])
@@ -529,8 +616,8 @@ class SqlUpgradeTests(test.TestCase):
         # Migration 17 does not properly migrate this data, so this should
         # be None.
         r = session.execute('select data from user_project_metadata where '
-                            'user_id="%s" and project_id="%s"' %
-                            (user['id'], project['id']))
+                            'user_id=:user and project_id=:project',
+                            {'user': user['id'], 'project': project['id']})
         self.assertIsNone(r.fetchone())
 
         # Create a conflicting user-project in user_project_metadata with
@@ -543,15 +630,17 @@ class SqlUpgradeTests(test.TestCase):
         self.engine.execute(cmd)
         # End Scaffolding
 
+        session.commit()
+
         # Migrate to 20
         self.upgrade(20)
 
         # The user-project pairs should have all roles from the previous
         # metadata table in addition to any roles currently in
         # user_project_metadata
-        r = session.execute('select data from user_project_metadata '
-                            'where user_id="%s" and project_id="%s"' %
-                            (user['id'], project['id']))
+        r = session.execute('select data from user_project_metadata where '
+                            'user_id=:user and project_id=:project',
+                            {'user': user['id'], 'project': project['id']})
         role_ids = json.loads(r.fetchone()['data'])['roles']
         self.assertEqual(len(role_ids), 3)
         self.assertIn(CONF.member_role_id, role_ids)
@@ -561,8 +650,8 @@ class SqlUpgradeTests(test.TestCase):
         # pairs that only existed in old metadata table should be in
         # user_project_metadata
         r = session.execute('select data from user_project_metadata where '
-                            'user_id="%s" and project_id="%s"' %
-                            (user['id'], project2['id']))
+                            'user_id=:user and project_id=:project',
+                            {'user': user['id'], 'project': project2['id']})
         role_ids = json.loads(r.fetchone()['data'])['roles']
         self.assertEqual(len(role_ids), 2)
         self.assertIn(CONF.member_role_id, role_ids)
@@ -622,12 +711,11 @@ class SqlUpgradeTests(test.TestCase):
         user['domain_id'] = domain2['id']
         cmd = this_table.insert().values(user)
         self.engine.execute(cmd)
-        # TODO(henry-nash).  For now, as part of clean-up we
-        # delete one of these users.  Although not part of this test,
-        # unless we do so the downgrade(16->15) that is part of
-        # teardown with fail due to having two uses with clashing
-        # name as we try to revert to a single global name space.  This
-        # limitation is raised as Bug #1125046 and the delete
+        # TODO(henry-nash): For now, as part of clean-up we delete one of these
+        # users.  Although not part of this test, unless we do so the
+        # downgrade(16->15) that is part of teardown with fail due to having
+        # two uses with clashing name as we try to revert to a single global
+        # name space.  This limitation is raised as Bug #1125046 and the delete
         # could be removed depending on how that bug is resolved.
         cmd = this_table.delete(id=user['id'])
         self.engine.execute(cmd)
@@ -650,15 +738,18 @@ class SqlUpgradeTests(test.TestCase):
         project['domain_id'] = domain2['id']
         cmd = this_table.insert().values(project)
         self.engine.execute(cmd)
-        # TODO(henry-nash) For now, we delete one of the projects for
-        # the same reason as we delete one of the users (Bug #1125046).
-        # This delete could be removed depending on that bug resolution.
+        # TODO(henry-nash): For now, we delete one of the projects for the same
+        # reason as we delete one of the users (Bug #1125046). This delete
+        # could be removed depending on that bug resolution.
         cmd = this_table.delete(id=project['id'])
         self.engine.execute(cmd)
 
     def test_upgrade_trusts(self):
         self.assertEqual(self.schema.version, 0, "DB is at version 0")
-        self.upgrade(18)
+        self.upgrade(20)
+        self.assertTableColumns("token",
+                                ["id", "expires", "extra", "valid"])
+        self.upgrade(21)
         self.assertTableColumns("trust",
                                 ["id", "trustor_user_id",
                                  "trustee_user_id",
@@ -667,6 +758,9 @@ class SqlUpgradeTests(test.TestCase):
                                  "expires_at", "extra"])
         self.assertTableColumns("trust_role",
                                 ["trust_id", "role_id"])
+        self.assertTableColumns("token",
+                                ["id", "expires", "extra", "valid",
+                                 "trust_id", "user_id"])
 
     def test_fixup_role(self):
         session = self.Session()
@@ -680,10 +774,46 @@ class SqlUpgradeTests(test.TestCase):
         r = session.execute('select count(*) as c from role '
                             'where extra is null')
         self.assertEqual(r.fetchone()['c'], 2)
+        session.commit()
         self.upgrade(19)
         r = session.execute('select count(*) as c from role '
                             'where extra is null')
         self.assertEqual(r.fetchone()['c'], 0)
+
+    def test_legacy_endpoint_id(self):
+        session = self.Session()
+        self.upgrade(21)
+
+        service = {
+            'id': uuid.uuid4().hex,
+            'name': 'keystone',
+            'type': 'identity'}
+        self.insert_dict(session, 'service', service)
+
+        legacy_endpoint_id = uuid.uuid4().hex
+        endpoint = {
+            'id': uuid.uuid4().hex,
+            'service_id': service['id'],
+            'interface': uuid.uuid4().hex[:8],
+            'url': uuid.uuid4().hex,
+            'extra': json.dumps({
+                'legacy_endpoint_id': legacy_endpoint_id})}
+        self.insert_dict(session, 'endpoint', endpoint)
+
+        session.commit()
+        self.upgrade(22)
+
+        endpoint_table = sqlalchemy.Table(
+            'endpoint', self.metadata, autoload=True)
+
+        self.assertEqual(session.query(endpoint_table).count(), 1)
+        ref = session.query(endpoint_table).one()
+        self.assertEqual(ref.id, endpoint['id'], ref)
+        self.assertEqual(ref.service_id, endpoint['service_id'])
+        self.assertEqual(ref.interface, endpoint['interface'])
+        self.assertEqual(ref.url, endpoint['url'])
+        self.assertEqual(ref.legacy_endpoint_id, legacy_endpoint_id)
+        self.assertEqual(ref.extra, '{}')
 
     def populate_user_table(self, with_pass_enab=False,
                             with_pass_enab_domain=False):
