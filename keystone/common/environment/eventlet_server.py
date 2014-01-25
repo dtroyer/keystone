@@ -1,9 +1,9 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 OpenStack LLC
+# Copyright 2012 OpenStack Foundation
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
-# Copyright 2010 OpenStack LLC.
+# Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -26,11 +26,10 @@ import eventlet
 import eventlet.wsgi
 import greenlet
 
-from keystone.common import logging
-from keystone.common import wsgi
+from keystone.openstack.common import log
 
 
-LOG = logging.getLogger(__name__)
+LOG = log.getLogger(__name__)
 
 
 class Server(object):
@@ -48,10 +47,10 @@ class Server(object):
 
     def start(self, key=None, backlog=128):
         """Run a WSGI server with the given application."""
-        LOG.debug(_('Starting %(arg0)s on %(host)s:%(port)s') %
-                  {'arg0': sys.argv[0],
-                   'host': self.host,
-                   'port': self.port})
+        LOG.info(_('Starting %(arg0)s on %(host)s:%(port)s'),
+                 {'arg0': sys.argv[0],
+                  'host': self.host,
+                  'port': self.port})
 
         # TODO(dims): eventlet's green dns/socket module does not actually
         # support IPv6 in getaddrinfo(). We need to get around this in the
@@ -91,7 +90,7 @@ class Server(object):
         self.do_ssl = True
 
     def kill(self):
-        if self.greenthread:
+        if self.greenthread is not None:
             self.greenthread.kill()
 
     def wait(self):
@@ -105,10 +104,10 @@ class Server(object):
 
     def _run(self, application, socket):
         """Start a WSGI server in a new green thread."""
-        log = logging.getLogger('eventlet.wsgi.server')
+        logger = log.getLogger('eventlet.wsgi.server')
         try:
             eventlet.wsgi.server(socket, application, custom_pool=self.pool,
-                                 log=wsgi.WritableLogger(log))
+                                 log=log.WritableLogger(logger))
         except Exception:
             LOG.exception(_('Server error'))
             raise

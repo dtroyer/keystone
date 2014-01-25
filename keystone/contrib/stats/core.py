@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 OpenStack LLC
+# Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -14,18 +14,36 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from keystone.common import logging
+from keystone.common import extension
 from keystone.common import manager
 from keystone.common import wsgi
 from keystone import config
 from keystone import exception
 from keystone import identity
+from keystone.openstack.common import log
 from keystone import policy
 from keystone import token
 
 
 CONF = config.CONF
-LOG = logging.getLogger(__name__)
+LOG = log.getLogger(__name__)
+
+extension_data = {
+    'name': 'Openstack Keystone Stats API',
+    'namespace': 'http://docs.openstack.org/identity/api/ext/'
+                 'OS-STATS/v1.0',
+    'alias': 'OS-STATS',
+    'updated': '2013-07-07T12:00:0-00:00',
+    'description': 'Openstack Keystone Stats API.',
+    'links': [
+        {
+            'rel': 'describedby',
+            # TODO(ayoung): needs a description
+            'type': 'text/html',
+            'href': 'https://github.com/openstack/identity-api',
+        }
+    ]}
+extension.register_admin_extension(extension_data['alias'], extension_data)
 
 
 class Manager(manager.Manager):

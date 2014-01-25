@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2013 OpenStack LLC
+# Copyright 2013 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -39,18 +39,20 @@ class Credential(sql.Base, credential.Driver):
 
     # credential crud
 
-    @sql.handle_conflicts(type='credential')
+    @sql.handle_conflicts(conflict_type='credential')
     def create_credential(self, credential_id, credential):
         session = self.get_session()
         with session.begin():
             ref = CredentialModel.from_dict(credential)
             session.add(ref)
-            session.flush()
         return ref.to_dict()
 
-    def list_credentials(self):
+    def list_credentials(self, **filters):
         session = self.get_session()
-        refs = session.query(CredentialModel).all()
+        query = session.query(CredentialModel)
+        if 'user_id' in filters:
+            query = query.filter_by(user_id=filters.get('user_id'))
+        refs = query.all()
         return [ref.to_dict() for ref in refs]
 
     def _get_credential(self, session, credential_id):
@@ -63,7 +65,7 @@ class Credential(sql.Base, credential.Driver):
         session = self.get_session()
         return self._get_credential(session, credential_id).to_dict()
 
-    @sql.handle_conflicts(type='credential')
+    @sql.handle_conflicts(conflict_type='credential')
     def update_credential(self, credential_id, credential):
         session = self.get_session()
         with session.begin():
@@ -76,7 +78,6 @@ class Credential(sql.Base, credential.Driver):
                 if attr != 'id':
                     setattr(ref, attr, getattr(new_credential, attr))
             ref.extra = new_credential.extra
-            session.flush()
         return ref.to_dict()
 
     def delete_credential(self, credential_id):
@@ -85,4 +86,19 @@ class Credential(sql.Base, credential.Driver):
         with session.begin():
             ref = self._get_credential(session, credential_id)
             session.delete(ref)
-            session.flush()
+
+    def delete_credentials_for_project(self, project_id):
+        session = self.get_session()
+
+        with session.begin():
+            query = session.query(CredentialModel)
+            query = query.filter_by(project_id=project_id)
+            query.delete()
+
+    def delete_credentials_for_user(self, user_id):
+        session = self.get_session()
+
+        with session.begin():
+            query = session.query(CredentialModel)
+            query = query.filter_by(user_id=user_id)
+            query.delete()

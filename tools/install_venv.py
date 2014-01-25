@@ -1,7 +1,7 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 # Copyright 2013 IBM Corp.
-# Copyright 2012 OpenStack LLC
+# Copyright 2012 OpenStack Foundation
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -67,7 +67,6 @@ def main(argv):
     install.install_dependencies()
     install.run_command([os.path.join(venv, 'bin/python'),
                         'setup.py', 'develop'])
-    install.post_process()
     print_help()
 
 

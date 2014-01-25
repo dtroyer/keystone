@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 OpenStack LLC
+# Copyright 2012 OpenStack Foundationc
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -16,18 +16,18 @@
 
 import os.path
 
+import six
+
 from keystone.catalog.backends import kvs
 from keystone.catalog import core
-from keystone.common import logging
 from keystone import config
+from keystone import exception
+from keystone.openstack.common import log
 
 
-LOG = logging.getLogger(__name__)
+LOG = log.getLogger(__name__)
 
 CONF = config.CONF
-config.register_str('template_file',
-                    default='default_catalog.templates',
-                    group='catalog')
 
 
 def parse_templates(template_lines):
@@ -69,7 +69,7 @@ class TemplatedCatalog(kvs.Catalog):
 
     and is stored in a similar looking hierarchy. Where a value can contain
     values to be interpolated by standard python string interpolation that look
-    like (the % is replaced by a $ due to paste attmepting to interpolate on
+    like (the % is replaced by a $ due to paste attempting to interpolate on
     its own:
 
       http://localhost:$(public_port)s/
@@ -106,20 +106,23 @@ class TemplatedCatalog(kvs.Catalog):
         try:
             self.templates = parse_templates(open(template_file))
         except IOError:
-            LOG.critical(_('Unable to open template file %s') % template_file)
+            LOG.critical(_('Unable to open template file %s'), template_file)
             raise
 
     def get_catalog(self, user_id, tenant_id, metadata=None):
-        d = dict(CONF.iteritems())
+        d = dict(six.iteritems(CONF))
         d.update({'tenant_id': tenant_id,
                   'user_id': user_id})
 
         o = {}
-        for region, region_ref in self.templates.iteritems():
+        for region, region_ref in six.iteritems(self.templates):
             o[region] = {}
-            for service, service_ref in region_ref.iteritems():
+            for service, service_ref in six.iteritems(region_ref):
                 o[region][service] = {}
-                for k, v in service_ref.iteritems():
+                for k, v in six.iteritems(service_ref):
                     o[region][service][k] = core.format_url(v, d)
 
         return o
+
+    def get_v3_catalog(self, user_id, tenant_id, metadata=None):
+        raise exception.NotImplemented()

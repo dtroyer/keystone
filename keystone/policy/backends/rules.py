@@ -19,18 +19,19 @@
 
 import os.path
 
-from keystone.common import logging
 from keystone.common import utils
 from keystone import config
 from keystone import exception
+from keystone.openstack.common import log
 from keystone.openstack.common import policy as common_policy
 from keystone import policy
 
 
 CONF = config.CONF
-LOG = logging.getLogger(__name__)
+LOG = log.getLogger(__name__)
 
 
+_ENFORCER = None
 _POLICY_PATH = None
 _POLICY_CACHE = {}
 
@@ -38,26 +39,31 @@ _POLICY_CACHE = {}
 def reset():
     global _POLICY_PATH
     global _POLICY_CACHE
+    global _ENFORCER
     _POLICY_PATH = None
     _POLICY_CACHE = {}
-    common_policy.reset()
+    _ENFORCER = None
 
 
 def init():
     global _POLICY_PATH
     global _POLICY_CACHE
+    global _ENFORCER
     if not _POLICY_PATH:
         _POLICY_PATH = CONF.policy_file
         if not os.path.exists(_POLICY_PATH):
             _POLICY_PATH = CONF.find_file(_POLICY_PATH)
+    if not _ENFORCER:
+        _ENFORCER = common_policy.Enforcer(policy_file=_POLICY_PATH)
     utils.read_cached_file(_POLICY_PATH,
                            _POLICY_CACHE,
                            reload_func=_set_rules)
 
 
 def _set_rules(data):
+    global _ENFORCER
     default_rule = CONF.policy_default_rule
-    common_policy.set_rules(common_policy.Rules.load_json(
+    _ENFORCER.set_rules(common_policy.Rules.load_json(
         data, default_rule))
 
 
@@ -83,14 +89,30 @@ def enforce(credentials, action, target, do_raise=True):
     # Add the exception arguments if asked to do a raise
     extra = {}
     if do_raise:
-        extra.update(exc=exception.ForbiddenAction, action=action)
+        extra.update(exc=exception.ForbiddenAction, action=action,
+                     do_raise=do_raise)
 
-    return common_policy.check(action, target, credentials, **extra)
+    return _ENFORCER.enforce(action, target, credentials, **extra)
 
 
 class Policy(policy.Driver):
     def enforce(self, credentials, action, target):
-        LOG.debug(_('enforce %(action)s: %(credentials)s') % {
+        LOG.debug(_('enforce %(action)s: %(credentials)s'), {
             'action': action,
             'credentials': credentials})
         enforce(credentials, action, target)
+
+    def create_policy(self, policy_id, policy):
+        raise exception.NotImplemented()
+
+    def list_policies(self):
+        raise exception.NotImplemented()
+
+    def get_policy(self, policy_id):
+        raise exception.NotImplemented()
+
+    def update_policy(self, policy_id, policy):
+        raise exception.NotImplemented()
+
+    def delete_policy(self, policy_id):
+        raise exception.NotImplemented()

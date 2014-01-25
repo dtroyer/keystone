@@ -1,11 +1,27 @@
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+
+# Copyright 2013 OpenStack Foundation
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
 import functools
 import os
 
 from keystone.common import config
-from keystone.common import logging
+from keystone.openstack.common import log
 
 CONF = config.CONF
-LOG = logging.getLogger(__name__)
+LOG = log.getLogger(__name__)
 
 
 __all__ = ['Server', 'httplib', 'subprocess']
@@ -59,8 +75,17 @@ def use_eventlet(monkeypatch_thread=None):
     if monkeypatch_thread is None:
         monkeypatch_thread = not os.getenv('STANDARD_THREADS')
 
-    eventlet.patcher.monkey_patch(all=False, socket=True, time=True,
-                                  thread=monkeypatch_thread)
+    # Raise the default from 8192 to accommodate large tokens
+    eventlet.wsgi.MAX_HEADER_LINE = 16384
+
+    # NOTE(ldbragst): Explicitly declare what should be monkey patched and
+    # what shouldn't. Doing this allows for more readable code when
+    # understanding Eventlet in Keystone. The following is a complete list
+    # of what is monkey patched instead of passing all=False and then passing
+    # module=True to monkey patch a specific module.
+    eventlet.patcher.monkey_patch(os=False, select=True, socket=True,
+                                  thread=monkeypatch_thread, time=True,
+                                  psycopg=False, MySQLdb=False)
 
     Server = eventlet_server.Server
     httplib = _httplib

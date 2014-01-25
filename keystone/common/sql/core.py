@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 OpenStack LLC
+# Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -14,28 +14,27 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-"""SQL backends for the various services."""
+"""SQL backends for the various services.
+
+Before using this module, call initialize(). This has to be done before
+CONF() because it sets up configuration options.
+
+"""
+import contextlib
 import functools
 
+import six
 import sqlalchemy as sql
-import sqlalchemy.engine.url
-from sqlalchemy.exc import DisconnectionError
 from sqlalchemy.ext import declarative
-import sqlalchemy.orm
-from sqlalchemy.orm.attributes import InstrumentedAttribute
-import sqlalchemy.pool
+from sqlalchemy.orm.attributes import flag_modified, InstrumentedAttribute
 from sqlalchemy import types as sql_types
 
-from keystone.common import logging
-from keystone import config
+from keystone.common import utils
 from keystone import exception
+from keystone.openstack.common.db import exception as db_exception
+from keystone.openstack.common.db.sqlalchemy import models
+from keystone.openstack.common.db.sqlalchemy import session
 from keystone.openstack.common import jsonutils
-
-
-CONF = config.CONF
-
-# maintain a single engine reference for sqlite in-memory
-GLOBAL_ENGINE = None
 
 
 ModelBase = declarative.declarative_base()
@@ -43,6 +42,7 @@ ModelBase = declarative.declarative_base()
 
 # For exporting to other modules
 Column = sql.Column
+Index = sql.Index
 String = sql.String
 ForeignKey = sql.ForeignKey
 DateTime = sql.DateTime
@@ -52,6 +52,18 @@ NotFound = sql.orm.exc.NoResultFound
 Boolean = sql.Boolean
 Text = sql.Text
 UniqueConstraint = sql.UniqueConstraint
+relationship = sql.orm.relationship
+joinedload = sql.orm.joinedload
+# Suppress flake8's unused import warning for flag_modified:
+flag_modified = flag_modified
+
+
+def initialize():
+    """Initialize the module."""
+
+    session.set_defaults(
+        sql_connection="sqlite:///keystone.db",
+        sqlite_db="keystone.db")
 
 
 def initialize_decorator(init):
@@ -78,13 +90,6 @@ def initialize_decorator(init):
                             v = str(v)
                         if column.type.length and \
                                 column.type.length < len(v):
-                            #if signing.token_format == 'PKI', the id will
-                            #store it's public key which is very long.
-                            if config.CONF.signing.token_format == 'PKI' and \
-                                    self.__tablename__ == 'token' and \
-                                    k == 'id':
-                                continue
-
                             raise exception.StringLengthExceeded(
                                 string=v, type=k, length=column.type.length)
 
@@ -92,11 +97,6 @@ def initialize_decorator(init):
     return initialize
 
 ModelBase.__init__ = initialize_decorator(ModelBase.__init__)
-
-
-def set_global_engine(engine):
-    global GLOBAL_ENGINE
-    GLOBAL_ENGINE = engine
 
 
 # Special Fields
@@ -111,14 +111,14 @@ class JsonBlob(sql_types.TypeDecorator):
         return jsonutils.loads(value)
 
 
-class DictBase(object):
+class DictBase(models.ModelBase):
     attributes = []
 
     @classmethod
     def from_dict(cls, d):
         new_d = d.copy()
 
-        new_d['extra'] = dict((k, new_d.pop(k)) for k in d.iterkeys()
+        new_d['extra'] = dict((k, new_d.pop(k)) for k in six.iterkeys(d)
                               if k not in cls.attributes and k != 'extra')
 
         return cls(**new_d)
@@ -140,139 +140,146 @@ class DictBase(object):
 
         return d
 
-    def __setitem__(self, key, value):
-        setattr(self, key, value)
-
     def __getitem__(self, key):
+        if key in self.extra:
+            return self.extra[key]
         return getattr(self, key)
-
-    def get(self, key, default=None):
-        return getattr(self, key, default)
-
-    def __iter__(self):
-        self._i = iter(sqlalchemy.orm.object_mapper(self).columns)
-        return self
-
-    def next(self):
-        n = self._i.next().name
-        return n
-
-    def update(self, values):
-        """Make the model object behave like a dict."""
-        for k, v in values.iteritems():
-            setattr(self, k, v)
-
-    def iteritems(self):
-        """Make the model object behave like a dict.
-
-        Includes attributes from joins.
-
-        """
-        return dict([(k, getattr(self, k)) for k in self])
-        #local = dict(self)
-        #joined = dict([(k, v) for k, v in self.__dict__.iteritems()
-        #               if not k[0] == '_'])
-        #local.update(joined)
-        #return local.iteritems()
-
-
-class MySQLPingListener(object):
-
-    """Ensures that MySQL connections checked out of the pool are alive.
-
-    Borrowed from:
-    http://groups.google.com/group/sqlalchemy/msg/a4ce563d802c929f
-
-    Error codes caught:
-    * 2006 MySQL server has gone away
-    * 2013 Lost connection to MySQL server during query
-    * 2014 Commands out of sync; you can't run this command now
-    * 2045 Can't open shared memory; no answer from server (%lu)
-    * 2055 Lost connection to MySQL server at '%s', system error: %d
-
-    from http://dev.mysql.com/doc/refman/5.6/en/error-messages-client.html
-    """
-
-    def checkout(self, dbapi_con, con_record, con_proxy):
-        try:
-            dbapi_con.cursor().execute('select 1')
-        except dbapi_con.OperationalError as e:
-            if e.args[0] in (2006, 2013, 2014, 2045, 2055):
-                logging.warn(_('Got mysql server has gone away: %s'), e)
-                raise DisconnectionError("Database server went away")
-            else:
-                raise
 
 
 # Backends
 class Base(object):
-    _engine = None
-    _sessionmaker = None
+    get_session = session.get_session
 
-    def get_session(self, autocommit=True, expire_on_commit=False):
-        """Return a SQLAlchemy session."""
-        self._engine = self._engine or self.get_engine()
-        self._sessionmaker = self._sessionmaker or self.get_sessionmaker(
-            self._engine)
-        return self._sessionmaker()
+    @contextlib.contextmanager
+    def transaction(self, expire_on_commit=False):
+        """Return a SQLAlchemy session in a scoped transaction."""
+        session = self.get_session(expire_on_commit=expire_on_commit)
+        with session.begin():
+            yield session
 
-    def get_engine(self, allow_global_engine=True):
-        """Return a SQLAlchemy engine.
+    def _filter(self, model, query, hints):
+        """Applies filtering to a query.
 
-        If allow_global_engine is True and an in-memory sqlite connection
-        string is provided by CONF, all backends will share a global sqlalchemy
-        engine.
+        :param model: the table model in question
+        :param query: query to apply filters to
+        :param hints: contains the list of filters yet to be satisfied.
+                      Any filters satisfied here will be removed so that
+                      the caller will know if any filters remain.
+
+        :returns query: query, updated with any filters satisfied
 
         """
-        def new_engine():
-            connection_dict = sql.engine.url.make_url(CONF.sql.connection)
+        def inexact_filter(model, query, filter, hints):
+            """Applies an inexact filter to a query.
 
-            engine_config = {
-                'convert_unicode': True,
-                'echo': CONF.debug and CONF.verbose,
-                'pool_recycle': CONF.sql.idle_timeout,
-            }
+            :param model: the table model in question
+            :param query: query to apply filters to
+            :param filter: the dict that describes this filter
+            :param hints: contains the list of filters yet to be satisfied.
+                          Any filters satisfied here will be removed so that
+                          the caller will know if any filters remain.
 
-            if 'sqlite' in connection_dict.drivername:
-                engine_config['poolclass'] = sqlalchemy.pool.StaticPool
-            elif 'mysql' in connection_dict.drivername:
-                engine_config['listeners'] = [MySQLPingListener()]
+            :returns query: query updated to add any inexact filters we could
+                            satisfy
 
-            return sql.create_engine(CONF.sql.connection, **engine_config)
+            """
+            column_attr = getattr(model, filter['name'])
 
-        if not allow_global_engine:
-            return new_engine()
+            # TODO(henry-nash): Sqlalchemy 0.7 defaults to case insensitivity
+            # so once we find a way of changing that (maybe on a call-by-call
+            # basis), we can add support for the case sensitive versions of
+            # the filters below.  For now, these case sensitive versions will
+            # be handled at the controller level.
 
-        if GLOBAL_ENGINE:
-            return GLOBAL_ENGINE
+            if filter['case_sensitive']:
+                return query
 
-        engine = new_engine()
+            if filter['comparator'] == 'contains':
+                query_term = column_attr.ilike('%%%s%%' % filter['value'])
+            elif filter['comparator'] == 'startswith':
+                query_term = column_attr.ilike('%s%%' % filter['value'])
+            elif filter['comparator'] == 'endswith':
+                query_term = column_attr.ilike('%%%s' % filter['value'])
+            else:
+                # It's a filter we don't understand, so let the caller
+                # work out if they need to do something with it.
+                return query
 
-        # auto-build the db to support wsgi server w/ in-memory backend
-        if CONF.sql.connection == 'sqlite://':
-            ModelBase.metadata.create_all(bind=engine)
+            hints.remove(filter)
+            return query.filter(query_term)
 
-        set_global_engine(engine)
+        def exact_filter(model, filter, cumlative_filter_dict, hints):
+            """Applies an exact filter to a query.
 
-        return engine
+            :param model: the table model in question
+            :param filter: the dict that describes this filter
+            :param cumlative_filter_dict: a dict that describes the set of
+                                          exact filters built up so far
+            :param hints: contains the list of filters yet to be satisfied.
+                          Any filters satisfied here will be removed so that
+                          the caller will know if any filters remain.
 
-    def get_sessionmaker(self, engine, autocommit=True,
-                         expire_on_commit=False):
-        """Return a SQLAlchemy sessionmaker using the given engine."""
-        return sqlalchemy.orm.sessionmaker(
-            bind=engine,
-            autocommit=autocommit,
-            expire_on_commit=expire_on_commit)
+            :returns cumlative_filter_dict: updated cumulative dict
+
+            """
+            key = filter['name']
+            if isinstance(getattr(model, key).property.columns[0].type,
+                          sql.types.Boolean):
+                filter_dict[key] = utils.attr_as_boolean(filter['value'])
+            else:
+                filter_dict[key] = filter['value']
+            hints.remove(filter)
+            return filter_dict
+
+        filter_dict = {}
+
+        for filter in hints.filters():
+            # TODO(henry-nash): Check if name is valid column, if not skip
+            if filter['comparator'] == 'equals':
+                filter_dict = exact_filter(model, filter, filter_dict, hints)
+            else:
+                query = inexact_filter(model, query, filter, hints)
+
+        # Apply any exact filters we built up
+        if filter_dict:
+            query = query.filter_by(**filter_dict)
+
+        return query
+
+    def filter(self, model, query, hints):
+        """Applies filtering to a query.
+
+        :param model: table model
+        :param query: query to apply filters to
+        :param hints: contains the list of filters yet to be satisfied.
+                      Any filters satisfied here will be removed so that
+                      the caller will know if any filters remain.
+
+        :returns updated query
+
+        """
+        if hints is not None:
+            query = self._filter(model, query, hints)
+
+        return query
 
 
-def handle_conflicts(type='object'):
-    """Converts IntegrityError into HTTP 409 Conflict."""
+def handle_conflicts(conflict_type='object'):
+    """Converts select sqlalchemy exceptions into HTTP 409 Conflict."""
     def decorator(method):
         @functools.wraps(method)
         def wrapper(*args, **kwargs):
             try:
                 return method(*args, **kwargs)
-            except (IntegrityError, OperationalError) as e:
-                raise exception.Conflict(type=type, details=str(e.orig))
+            except db_exception.DBDuplicateEntry as e:
+                raise exception.Conflict(type=conflict_type, details=str(e))
+            except db_exception.DBError as e:
+                # TODO(blk-u): inspecting inner_exception breaks encapsulation;
+                # oslo.db should provide exception we need.
+                if isinstance(e.inner_exception, IntegrityError):
+                    raise exception.Conflict(type=conflict_type,
+                                             details=str(e))
+                raise
+
         return wrapper
     return decorator

@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 OpenStack LLC
+# Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -58,20 +58,15 @@ class PamIdentity(identity.Driver):
     Tenant is always the same as User, root user has admin role.
     """
 
-    def authenticate_user(self, user_id=None, password=None):
+    def is_domain_aware(self):
+        return False
+
+    def authenticate(self, user_id, password):
         auth = pam.authenticate if pam else PAM_authenticate
         if not auth(user_id, password):
             raise AssertionError('Invalid user / password')
         user = {'id': user_id, 'name': user_id}
         return user
-
-    def authorize_for_project(self, user_ref, tenant_id=None):
-        user_id = user_ref['id']
-        metadata = {}
-        if user_id == 'root':
-            metadata['is_admin'] = True
-        tenant = {'id': user_id, 'name': user_id}
-        return (user_ref, tenant, metadata)
 
     def get_project(self, tenant_id):
         return {'id': tenant_id, 'name': tenant_id}
@@ -92,10 +87,10 @@ class PamIdentity(identity.Driver):
     def get_role(self, role_id):
         raise NotImplementedError()
 
-    def list_users(self):
+    def list_users(self, hints):
         raise NotImplementedError()
 
-    def list_roles(self):
+    def list_roles(self, hints):
         raise NotImplementedError()
 
     def add_user_to_project(self, tenant_id, user_id):
@@ -104,17 +99,8 @@ class PamIdentity(identity.Driver):
     def remove_user_from_project(self, tenant_id, user_id):
         pass
 
-    def get_projects_for_user(self, user_id):
-        return [user_id]
-
-    def get_roles_for_user_and_project(self, user_id, tenant_id):
-        raise NotImplementedError()
-
-    def add_role_to_user_and_project(self, user_id, tenant_id, role_id):
-        raise NotImplementedError()
-
-    def remove_role_from_user_and_project(self, user_id, tenant_id, role_id):
-        raise NotImplementedError()
+    def list_projects_for_user(self, user_id):
+        return [{'id': user_id, 'name': user_id}]
 
     def create_user(self, user_id, user):
         raise NotImplementedError()
@@ -125,32 +111,44 @@ class PamIdentity(identity.Driver):
     def delete_user(self, user_id):
         raise NotImplementedError()
 
-    def create_project(self, tenant_id, tenant):
-        raise NotImplementedError()
-
-    def update_project(self, tenant_id, tenant):
-        raise NotImplementedError()
-
-    def delete_project(self, tenant_id, tenant):
-        raise NotImplementedError()
-
-    def get_metadata(self, user_id, tenant_id):
+    def _get_metadata(self, user_id, tenant_id):
         metadata = {}
         if user_id == 'root':
             metadata['is_admin'] = True
         return metadata
 
-    def create_metadata(self, user_id, tenant_id, metadata):
+    def _create_metadata(self, user_id, tenant_id, metadata):
         raise NotImplementedError()
 
-    def update_metadata(self, user_id, tenant_id, metadata):
+    def _update_metadata(self, user_id, tenant_id, metadata):
         raise NotImplementedError()
 
-    def create_role(self, role_id, role):
+    def add_user_to_group(self, user_id, group_id):
         raise NotImplementedError()
 
-    def update_role(self, role_id, role):
+    def check_user_in_group(self, user_id, group_id):
         raise NotImplementedError()
 
-    def delete_role(self, role_id):
+    def remove_user_from_group(self, user_id, group_id):
+        raise NotImplementedError()
+
+    def create_group(self, group_id, group):
+        raise NotImplementedError()
+
+    def list_groups(self):
+        raise NotImplementedError()
+
+    def list_groups_for_user(self, user_id):
+        raise NotImplementedError()
+
+    def list_users_in_group(self, group_id):
+        raise NotImplementedError()
+
+    def get_group(self, group_id):
+        raise NotImplementedError()
+
+    def update_group(self, group_id, group):
+        raise NotImplementedError()
+
+    def delete_group(self, group_id):
         raise NotImplementedError()

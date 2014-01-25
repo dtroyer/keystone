@@ -1,37 +1,40 @@
-# Install bounded pep8/pyflakes first, then let flake8 install
-pep8==1.4.5
-pyflakes==0.7.2
-flake8==2.0
-hacking>=0.5.3,<0.6
+hacking>=0.8.0,<0.9
 
 # Optional backend: SQL
 pysqlite
 
 # Optional backend: Memcache
-python-memcached
+python-memcached>=1.48
 
 # Optional backend: LDAP
-python-ldap==2.3.13 # authenticate against an existing LDAP server
+# authenticate against an existing LDAP server
+python-ldap==2.3.13
 
 # Testing
-coverage # computes code coverage percentages
-mox # mock object framework
-nose # for test discovery and console feedback
-nosexcover
-openstack.nose_plugin
-nosehtmloutput
-Sphinx>=1.1.2 # required to build documentation
-unittest2 # backport of unittest lib in python 2.7
-webtest # test wsgi apps without starting an http server
+# computes code coverage percentages
+coverage>=3.6
+# fixture stubbing
+fixtures>=0.3.14
+# mock object framework
+mock>=1.0
+mox>=0.5.3
+# required to build documentation
+sphinx>=1.1.2,<1.2
+# test wsgi apps without starting an http server
+WebTest>=2.0
+
+extras
+discover
+python-subunit
+testrepository>=0.0.17
+testtools>=0.9.32
 
 # for python-keystoneclient
-httplib2 # keystoneclient <0.2.1
-requests>=1.0.0 # replaces httplib2 in keystoneclient >=0.2.1
-keyring
+# keystoneclient <0.2.1
+httplib2
+# replaces httplib2 in keystoneclient >=0.2.1
+requests>=1.1
+keyring>=1.6.1,<2.0,>=2.1
 
-# swift_auth test dependencies
-http://tarballs.openstack.org/swift/swift-master.tar.gz#egg=swift
-netifaces
-
-# For translations processing
-Babel
+# For documentation
+oslo.sphinx

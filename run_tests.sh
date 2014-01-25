@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2012 OpenStack LLC
+# Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -22,18 +22,14 @@ function usage {
   echo ""
   echo "  -V, --virtual-env        Always use virtualenv.  Install automatically if not present"
   echo "  -N, --no-virtual-env     Don't use virtualenv.  Run tests in local environment"
-  echo "  -r, --recreate-db        Recreate the test database (deprecated, as this is now the default)."
-  echo "  -n, --no-recreate-db     Don't recreate the test database."
   echo "  -x, --stop               Stop running tests after the first error or failure."
   echo "  -f, --force              Force a clean re-build of the virtual environment. Useful when dependencies have been added."
   echo "  -u, --update             Update the virtual environment with any newer package versions"
-  echo "  -p, --pep8               Just run pep8"
-  echo "  -P, --no-pep8            Don't run pep8"
+  echo "  -p, --pep8               Just run flake8"
+  echo "  -8, --8                  Just run flake8, don't show PEP8 text for each error"
+  echo "  -P, --no-pep8            Don't run flake8"
   echo "  -c, --coverage           Generate coverage report"
   echo "  -h, --help               Print this usage message"
-  echo "  -xintegration            Ignore all keystoneclient test cases (integration tests)"
-  echo "  --hide-elapsed           Don't print the elapsed time for each test along with slow test list"
-  echo "  --standard-threads       Don't do the eventlet threading monkeypatch."
   echo ""
   echo "Note: with no options specified, the script will try to run the tests in a virtual environment,"
   echo "      If no virtualenv is found, the script will ask if you would like to create one.  If you "
@@ -46,20 +42,15 @@ function process_option {
     -h|--help) usage;;
     -V|--virtual-env) always_venv=1; never_venv=0;;
     -N|--no-virtual-env) always_venv=0; never_venv=1;;
-    -r|--recreate-db) recreate_db=1;;
-    -n|--no-recreate-db) recreate_db=0;;
+    -x|--stop) failfast=1;;
     -f|--force) force=1;;
     -u|--update) update=1;;
     -p|--pep8) just_flake8=1;;
     -8|--8) short_flake8=1;;
     -P|--no-pep8) no_flake8=1;;
     -c|--coverage) coverage=1;;
-    -xintegration) nokeystoneclient=1;;
-    --standard-threads)
-        export STANDARD_THREADS=1
-        ;;
-    -*) noseopts="$noseopts $1";;
-    *) noseargs="$noseargs $1"
+    -*) testropts="$testropts $1";;
+    *) testrargs="$testrargs $1"
   esac
 }
 
@@ -68,53 +59,36 @@ with_venv=tools/with_venv.sh
 always_venv=0
 never_venv=0
 force=0
-noseargs=
-noseopts="--with-openstack --openstack-color"
+failfast=0
+testrargs=
+testropts=--subunit
 wrapper=""
 just_flake8=0
 short_flake8=0
 no_flake8=0
 coverage=0
-nokeystoneclient=0
-recreate_db=1
 update=0
 
 for arg in "$@"; do
   process_option $arg
 done
 
+TESTRTESTS="python setup.py testr"
+
 # If enabled, tell nose to collect coverage data
 if [ $coverage -eq 1 ]; then
-    noseopts="$noseopts --with-coverage --cover-package=keystone"
+    TESTRTESTS="$TESTRTESTS --coverage"
 fi
-
-if [ $nokeystoneclient -eq 1 ]; then
-    # disable the integration tests
-    noseopts="$noseopts -I test_keystoneclient* -I _test_import_auth_token.py"
-fi
-
-function cleanup_test_db {
-  # Default test settings will leave around some test*.db files
-  # TODO(termie): this could probably be moved into tests/__init__.py
-  #               but there have been some issues with creating that
-  #               file for some users
-  rm -f tests/test*.db
-}
 
 function run_tests {
-  # Just run the test suites in current environment
-  ${wrapper} $NOSETESTS
-  # If we get some short import error right away, print the error log directly
-  RESULT=$?
-  if [ "$RESULT" -ne "0" ];
-  then
-    ERRSIZE=`wc -l run_tests.log | awk '{print \$1}'`
-    if [ "$ERRSIZE" -lt "40" ];
-    then
-        cat run_tests.log
-    fi
+  set -e
+  echo ${wrapper}
+  if [ $failfast -eq 1 ]; then
+      testrargs="$testrargs -- --failfast"
   fi
-  return $RESULT
+  ${wrapper} $TESTRTESTS --testr-args="$testropts $testrargs" | \
+      ${wrapper} subunit-2to1 | \
+      ${wrapper} tools/colorizer.py
 }
 
 function run_flake8 {
@@ -124,22 +98,11 @@ function run_flake8 {
       FLAGS=''
   fi
 
-
   echo "Running flake8 ..."
-  # Opt-out files from flake8
-  ignore_scripts="*.pyc,*.pyo,*.sh,*.swp,*.rst"
-  ignore_files="*.txt"
-  ignore_dirs=".venv,.tox,dist,doc,openstack,vendor,*egg"
-  ignore="$ignore_scripts,$ignore_files,$ignore_dirs"
-  srcfiles="."
   # Just run flake8 in current environment
-  echo ${wrapper} flake8 $FLAGS --show-source \
-    --exclude=${ignore} ${srcfiles} | tee pep8.txt
-  ${wrapper} flake8 $FLAGS --show-source \
-    --exclude=${ignore} ${srcfiles} | tee pep8.txt
+  echo ${wrapper} flake8 $FLAGS | tee pep8.txt
+  ${wrapper} flake8 $FLAGS | tee pep8.txt
 }
-
-NOSETESTS="nosetests $noseopts $noseargs"
 
 if [ $never_venv -eq 0 ]
 then
@@ -187,23 +150,14 @@ if [ $short_flake8 -eq 1 ]; then
 fi
 
 
-if [ $recreate_db -eq 1 ]; then
-    cleanup_test_db
-fi
-
 run_tests
 
 # NOTE(sirp): we only want to run flake8 when we're running the full-test
 # suite, not when we're running tests individually. To handle this, we need to
-# distinguish between options (noseopts), which begin with a '-', and arguments
-# (noseargs).
-if [ -z "$noseargs" ]; then
+# distinguish between options (testropts), which begin with a '-', and arguments
+# (testrargs).
+if [ -z "$testrargs" ]; then
   if [ $no_flake8 -eq 0 ]; then
     run_flake8
   fi
-fi
-
-if [ $coverage -eq 1 ]; then
-    echo "Generating coverage report in covhtml/"
-    ${wrapper} coverage html -d covhtml -i
 fi

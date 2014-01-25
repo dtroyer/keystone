@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 OpenStack LLC
+# Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -26,11 +26,11 @@ class TrustModel(sql.ModelBase, sql.DictBase):
                   'project_id', 'impersonation', 'expires_at']
     id = sql.Column(sql.String(64), primary_key=True)
     #user id Of owner
-    trustor_user_id = sql.Column(sql.String(64), unique=False, nullable=False,)
+    trustor_user_id = sql.Column(sql.String(64), nullable=False,)
     #user_id of user allowed to consume this preauth
-    trustee_user_id = sql.Column(sql.String(64), unique=False, nullable=False)
-    project_id = sql.Column(sql.String(64), unique=False, nullable=True)
-    impersonation = sql.Column(sql.Boolean)
+    trustee_user_id = sql.Column(sql.String(64), nullable=False)
+    project_id = sql.Column(sql.String(64))
+    impersonation = sql.Column(sql.Boolean, nullable=False)
     deleted_at = sql.Column(sql.DateTime)
     expires_at = sql.Column(sql.DateTime)
     extra = sql.Column(sql.JsonBlob())
@@ -44,7 +44,7 @@ class TrustRole(sql.ModelBase):
 
 
 class Trust(sql.Base, trust.Driver):
-    @sql.handle_conflicts(type='trust')
+    @sql.handle_conflicts(conflict_type='trust')
     def create_trust(self, trust_id, trust, roles):
         session = self.get_session()
         with session.begin():
@@ -60,7 +60,6 @@ class Trust(sql.Base, trust.Driver):
                 trust_role.role_id = role['id']
                 added_roles.append({'id': role['id']})
                 session.add(trust_role)
-            session.flush()
         trust_dict = ref.to_dict()
         trust_dict['roles'] = added_roles
         return trust_dict
@@ -71,7 +70,7 @@ class Trust(sql.Base, trust.Driver):
             roles.append({'id': role.role_id})
         trust_dict['roles'] = roles
 
-    @sql.handle_conflicts(type='trust')
+    @sql.handle_conflicts(conflict_type='trust')
     def get_trust(self, trust_id):
         session = self.get_session()
         ref = (session.query(TrustModel).
@@ -88,13 +87,13 @@ class Trust(sql.Base, trust.Driver):
         self._add_roles(trust_id, session, trust_dict)
         return trust_dict
 
-    @sql.handle_conflicts(type='trust')
+    @sql.handle_conflicts(conflict_type='trust')
     def list_trusts(self):
         session = self.get_session()
         trusts = session.query(TrustModel).filter_by(deleted_at=None)
         return [trust_ref.to_dict() for trust_ref in trusts]
 
-    @sql.handle_conflicts(type='trust')
+    @sql.handle_conflicts(conflict_type='trust')
     def list_trusts_for_trustee(self, trustee_user_id):
         session = self.get_session()
         trusts = (session.query(TrustModel).
@@ -102,7 +101,7 @@ class Trust(sql.Base, trust.Driver):
                   filter_by(trustee_user_id=trustee_user_id))
         return [trust_ref.to_dict() for trust_ref in trusts]
 
-    @sql.handle_conflicts(type='trust')
+    @sql.handle_conflicts(conflict_type='trust')
     def list_trusts_for_trustor(self, trustor_user_id):
         session = self.get_session()
         trusts = (session.query(TrustModel).
@@ -110,7 +109,7 @@ class Trust(sql.Base, trust.Driver):
                   filter_by(trustor_user_id=trustor_user_id))
         return [trust_ref.to_dict() for trust_ref in trusts]
 
-    @sql.handle_conflicts(type='trust')
+    @sql.handle_conflicts(conflict_type='trust')
     def delete_trust(self, trust_id):
         session = self.get_session()
         with session.begin():
@@ -118,4 +117,3 @@ class Trust(sql.Base, trust.Driver):
             if not trust_ref:
                 raise exception.TrustNotFound(trust_id=trust_id)
             trust_ref.deleted_at = timeutils.utcnow()
-            session.flush()

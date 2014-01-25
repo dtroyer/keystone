@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2013 OpenStack LLC
+# Copyright 2013 OpenStack Foundation
 # Copyright 2013 Red Hat, Inc.
 # All Rights Reserved.
 #
@@ -52,7 +52,44 @@ def remove_constraints(constraints):
 
 def add_constraints(constraints):
     for constraint_def in constraints:
+
+        if constraint_def['table'].kwargs.get('mysql_engine') == 'MyISAM':
+            # Don't try to create constraint when using MyISAM because it's
+            # not supported.
+            continue
+
+        ref_col = constraint_def['ref_column']
+        ref_engine = ref_col.table.kwargs.get('mysql_engine')
+        if ref_engine == 'MyISAM':
+            # Don't try to create constraint when using MyISAM because it's
+            # not supported.
+            continue
+
         migrate.ForeignKeyConstraint(
             columns=[getattr(constraint_def['table'].c,
                              constraint_def['fk_column'])],
             refcolumns=[constraint_def['ref_column']]).create()
+
+
+def rename_tables_with_constraints(renames, constraints, engine):
+    """Renames tables with foreign key constraints.
+
+    Tables are renamed after first removing constraints. The constraints are
+    replaced after the rename is complete.
+
+    This works on databases that don't support renaming tables that have
+    constraints on them (DB2).
+
+    `renames` is a dict, mapping {'to_table_name': from_table, ...}
+    """
+
+    if engine.name != 'sqlite':
+        # Sqlite doesn't support constraints, so nothing to remove.
+        remove_constraints(constraints)
+
+    for to_table_name in renames:
+        from_table = renames[to_table_name]
+        from_table.rename(to_table_name)
+
+    if engine != 'sqlite':
+        add_constraints(constraints)

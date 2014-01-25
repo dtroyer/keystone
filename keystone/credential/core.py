@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2013 OpenStack LLC
+# Copyright 2013 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -16,16 +16,20 @@
 
 """Main entry point into the Credentials service."""
 
+import abc
+
+import six
+
 from keystone.common import dependency
-from keystone.common import logging
 from keystone.common import manager
 from keystone import config
 from keystone import exception
+from keystone.openstack.common import log
 
 
 CONF = config.CONF
 
-LOG = logging.getLogger(__name__)
+LOG = log.getLogger(__name__)
 
 
 @dependency.provider('credential_api')
@@ -41,9 +45,11 @@ class Manager(manager.Manager):
         super(Manager, self).__init__(CONF.credential.driver)
 
 
+@six.add_metaclass(abc.ABCMeta)
 class Driver(object):
     # credential crud
 
+    @abc.abstractmethod
     def create_credential(self, credential_id, credential):
         """Creates a new credential.
 
@@ -52,14 +58,16 @@ class Driver(object):
         """
         raise exception.NotImplemented()
 
-    def list_credentials(self):
-        """List all credentials in the system.
+    @abc.abstractmethod
+    def list_credentials(self, **filters):
+        """List all credentials in the system applying filters.
 
         :returns: a list of credential_refs or an empty list.
 
         """
         raise exception.NotImplemented()
 
+    @abc.abstractmethod
     def get_credential(self, credential_id):
         """Get a credential by ID.
 
@@ -69,6 +77,7 @@ class Driver(object):
         """
         raise exception.NotImplemented()
 
+    @abc.abstractmethod
     def update_credential(self, credential_id, credential):
         """Updates an existing credential.
 
@@ -78,6 +87,7 @@ class Driver(object):
         """
         raise exception.NotImplemented()
 
+    @abc.abstractmethod
     def delete_credential(self, credential_id):
         """Deletes an existing credential.
 
@@ -85,3 +95,28 @@ class Driver(object):
 
         """
         raise exception.NotImplemented()
+
+    @abc.abstractmethod
+    def delete_credentials_for_project(self, project_id):
+        """Deletes all credentials for a project."""
+        self._delete_credentials(lambda cr: cr['project_id'] == project_id)
+
+    @abc.abstractmethod
+    def delete_credentials_for_user(self, user_id):
+        """Deletes all credentials for a user."""
+        self._delete_credentials(lambda cr: cr['user_id'] == user_id)
+
+    def _delete_credentials(self, match_fn):
+        """Do the actual credential deletion work (default implementation).
+
+        :param match_fn: function that takes a credential dict as the
+                         parameter and returns true or false if the
+                         identifier matches the credential dict.
+        """
+        for cr in self.list_credentials():
+            if match_fn(cr):
+                try:
+                    self.credential_api.delete_credential(cr['id'])
+                except exception.CredentialNotFound:
+                    LOG.debug(_('Deletion of credential is not required: %s'),
+                              cr['id'])

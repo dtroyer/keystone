@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 OpenStack LLC
+# Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -27,13 +27,31 @@ import base64
 import hashlib
 import hmac
 
+from keystone.common import extension
 from keystone.common import utils
 from keystone.common import wsgi
 from keystone import config
-from keystone.contrib import ec2
+from keystone.contrib.ec2 import controllers
 from keystone import exception
 
 CONF = config.CONF
+
+EXTENSION_DATA = {
+    'name': 'OpenStack S3 API',
+    'namespace': 'http://docs.openstack.org/identity/api/ext/'
+                 's3tokens/v1.0',
+    'alias': 's3tokens',
+    'updated': '2013-07-07T12:00:0-00:00',
+    'description': 'OpenStack S3 API.',
+    'links': [
+        {
+            'rel': 'describedby',
+            # TODO(ayoung): needs a description
+            'type': 'text/html',
+            'href': 'https://github.com/openstack/identity-api',
+        }
+    ]}
+extension.register_admin_extension(EXTENSION_DATA['alias'], EXTENSION_DATA)
 
 
 class S3Extension(wsgi.ExtensionRouter):
@@ -46,7 +64,7 @@ class S3Extension(wsgi.ExtensionRouter):
                        conditions=dict(method=['POST']))
 
 
-class S3Controller(ec2.Ec2Controller):
+class S3Controller(controllers.Ec2Controller):
     def check_signature(self, creds_ref, credentials):
         msg = base64.urlsafe_b64decode(str(credentials['token']))
         key = str(creds_ref['secret'])

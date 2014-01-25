@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 OpenStack LLC
+# Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -14,19 +14,19 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+import six
 import webob.dec
 
 from keystone.common import config
-from keystone.common import logging
 from keystone.common import serializer
 from keystone.common import utils
 from keystone.common import wsgi
 from keystone import exception
 from keystone.openstack.common import jsonutils
-
+from keystone.openstack.common import log
 
 CONF = config.CONF
-LOG = logging.getLogger(__name__)
+LOG = log.getLogger(__name__)
 
 
 # Header used to transmit the auth token
@@ -82,7 +82,7 @@ class PostParamsMiddleware(wsgi.Middleware):
     def process_request(self, request):
         params_parsed = request.params
         params = {}
-        for k, v in params_parsed.iteritems():
+        for k, v in six.iteritems(params_parsed):
             if k in ('self', 'context'):
                 continue
             if k.startswith('_'):
@@ -131,7 +131,7 @@ class JsonBodyMiddleware(wsgi.Middleware):
                 params_parsed = {}
 
         params = {}
-        for k, v in params_parsed.iteritems():
+        for k, v in six.iteritems(params_parsed):
             if k in ('self', 'context'):
                 continue
             if k.startswith('_'):

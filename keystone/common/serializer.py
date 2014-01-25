@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 OpenStack LLC
+# Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -24,6 +24,8 @@ by convention, with a few hardcoded exceptions.
 
 from lxml import etree
 import re
+
+import six
 
 
 DOCTYPE = '<?xml version="1.0" encoding="UTF-8"?>'
@@ -77,8 +79,8 @@ class XmlDeserializer(object):
         return dict((x.attrib['rel'], x.attrib['href']) for x in links)
 
     @staticmethod
-    def _tag_name(tag, namespace):
-        """Returns a tag name.
+    def _qualified_name(tag, namespace):
+        """Returns a qualified tag name.
 
         The tag name may contain the namespace prefix or not, which can
         be determined by specifying the parameter namespace.
@@ -107,7 +109,7 @@ class XmlDeserializer(object):
     def walk_element(self, element, namespace=False):
         """Populates a dictionary by walking an etree element."""
         values = {}
-        for k, v in element.attrib.iteritems():
+        for k, v in six.iteritems(element.attrib):
             # boolean-looking attributes become booleans in JSON
             if k in ['enabled']:
                 if v in ['true']:
@@ -115,7 +117,7 @@ class XmlDeserializer(object):
                 elif v in ['false']:
                     v = False
 
-            values[k] = v
+            values[self._qualified_name(k, namespace)] = v
 
         text = None
         if element.text is not None:
@@ -123,9 +125,10 @@ class XmlDeserializer(object):
 
         # current spec does not have attributes on an element with text
         values = values or text or {}
-        decoded_tag = XmlDeserializer._tag_name(element.tag, namespace)
+        decoded_tag = XmlDeserializer._qualified_name(element.tag, namespace)
         list_item_tag = None
-        if decoded_tag[-1] == 's' and len(values) == 0:
+        if (decoded_tag[-1] == 's' and not values and
+                decoded_tag != 'access'):
             # FIXME(gyee): special-case lists for now unti we
             # figure out how to properly handle them.
             # If any key ends with an 's', we are assuming it is a list.
@@ -157,7 +160,7 @@ class XmlDeserializer(object):
         if not values:
             values = ""
 
-        d = {XmlDeserializer._tag_name(element.tag, namespace): values}
+        d = {XmlDeserializer._qualified_name(element.tag, namespace): values}
 
         if links:
             d['links'] = links
@@ -212,7 +215,7 @@ class XmlSerializer(object):
 
     def _populate_links(self, element, links_json):
         links = etree.Element('links')
-        for k, v in links_json.iteritems():
+        for k, v in six.iteritems(links_json):
             if v:
                 link = etree.Element('link')
                 link.set('rel', unicode(k))
@@ -312,7 +315,7 @@ class XmlSerializer(object):
                     self.populate_element(child, item)
                     element.append(child)
 
-        elif isinstance(value, basestring):
+        elif isinstance(value, six.string_types):
             element.text = unicode(value)
 
     def _populate_sequence(self, element, l):
@@ -331,14 +334,14 @@ class XmlSerializer(object):
 
     def _populate_tree(self, element, d):
         """Populates an etree with attributes & elements, given a dict."""
-        for k, v in d.iteritems():
+        for k, v in six.iteritems(d):
             if isinstance(v, dict):
                 self._populate_dict(element, k, v)
             elif isinstance(v, list):
                 self._populate_list(element, k, v)
             elif isinstance(v, bool):
                 self._populate_bool(element, k, v)
-            elif isinstance(v, basestring):
+            elif isinstance(v, six.string_types):
                 self._populate_str(element, k, v)
             elif type(v) in [int, float, long, complex]:
                 self._populate_number(element, k, v)

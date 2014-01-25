@@ -18,7 +18,11 @@ import os
 # If extensions (or modules to document with autodoc) are in another directory,
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
-sys.path.insert(0, os.path.abspath('../..'))
+sys.path.insert(0, os.path.abspath('..'))  # NOTE(dstanek): path for our
+                                           # Sphinx extension
+
+# NOTE(dstanek): adds _ to the builtins so keystone modules can be imported
+__builtins__['_'] = str
 
 # -- General configuration ----------------------------------------------------
 
@@ -28,21 +32,24 @@ sys.path.insert(0, os.path.abspath('../..'))
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
-#extensions = ['sphinx.ext.autodoc', 'sphinx.ext.intersphinx',
-#              'sphinx.ext.todo', 'sphinx.ext.coverage']
 extensions = ['sphinx.ext.autodoc',
               'sphinx.ext.todo',
-              # 'sphinx.ect.intersphinx',
-              'sphinx.ext.coverage']
+              'sphinx.ext.coverage',
+              'sphinx.ext.viewcode',
+              'oslo.sphinx',
+              # NOTE(dstanek): Uncomment the [pbr] section in setup.cfg and
+              # remove this Sphinx extension when
+              # https://launchpad.net/bugs/1260495 is fixed.
+              'ext.apidoc',
+              ]
 
 todo_include_todos = True
 
 # Add any paths that contain templates here, relative to this directory.
-templates_path = []
-if os.getenv('HUDSON_PUBLISH_DOCS'):
-    templates_path = ['_ga', '_templates']
-else:
-    templates_path = ['_templates']
+# if os.getenv('HUDSON_PUBLISH_DOCS'):
+#     templates_path = ['_ga', '_templates']
+# else:
+#     templates_path = ['_templates']
 
 # The suffix of source filenames.
 source_suffix = '.rst'
@@ -109,8 +116,8 @@ man_pages = [
 
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
-html_theme_path = ["."]
-html_theme = '_theme'
+# html_theme_path = ["."]
+# html_theme = '_theme'
 
 # Theme options are theme-specific and customize the look and feel of a theme
 # further.  For a list of options available for each theme, see the

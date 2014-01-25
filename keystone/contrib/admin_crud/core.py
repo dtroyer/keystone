@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 OpenStack LLC
+# Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -13,9 +13,32 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations
 # under the License.
+
+from keystone import assignment
 from keystone import catalog
+from keystone.common import extension
 from keystone.common import wsgi
 from keystone import identity
+
+
+extension.register_admin_extension(
+    'OS-KSADM', {
+        'name': 'OpenStack Keystone Admin',
+        'namespace': 'http://docs.openstack.org/identity/api/ext/'
+                     'OS-KSADM/v1.0',
+        'alias': 'OS-KSADM',
+        'updated': '2013-07-11T17:14:00-00:00',
+        'description': 'OpenStack extensions to Keystone v2.0 API '
+                       'enabling Administrative Operations.',
+        'links': [
+            {
+                'rel': 'describedby',
+                # TODO(dolph): link needs to be revised after
+                #              bug 928059 merges
+                'type': 'text/html',
+                'href': 'https://github.com/openstack/identity-api',
+            }
+        ]})
 
 
 class CrudExtension(wsgi.ExtensionRouter):
@@ -26,9 +49,9 @@ class CrudExtension(wsgi.ExtensionRouter):
     """
 
     def add_routes(self, mapper):
-        tenant_controller = identity.controllers.Tenant()
+        tenant_controller = assignment.controllers.Tenant()
         user_controller = identity.controllers.User()
-        role_controller = identity.controllers.Role()
+        role_controller = assignment.controllers.Role()
         service_controller = catalog.controllers.Service()
         endpoint_controller = catalog.controllers.Endpoint()
 
@@ -93,12 +116,12 @@ class CrudExtension(wsgi.ExtensionRouter):
         mapper.connect(
             '/users/{user_id}/tenant',
             controller=user_controller,
-            action='update_user_project',
+            action='update_user',
             conditions=dict(method=['PUT']))
         mapper.connect(
             '/users/{user_id}/OS-KSADM/tenant',
             controller=user_controller,
-            action='update_user_project',
+            action='update_user',
             conditions=dict(method=['PUT']))
 
         # COMPAT(diablo): the copy with no OS-KSADM is from diablo

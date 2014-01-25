@@ -1,9 +1,9 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 OpenStack LLC
+# Copyright 2012 OpenStack Foundation
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
-# Copyright 2010 OpenStack LLC.
+# Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -23,19 +23,22 @@
 import re
 
 import routes.middleware
+import six
 import webob.dec
 import webob.exc
 
 from keystone.common import config
-from keystone.common import logging
+from keystone.common import dependency
 from keystone.common import utils
 from keystone import exception
+from keystone.openstack.common import gettextutils
 from keystone.openstack.common import importutils
 from keystone.openstack.common import jsonutils
+from keystone.openstack.common import log
 
 
 CONF = config.CONF
-LOG = logging.getLogger(__name__)
+LOG = log.getLogger(__name__)
 
 # Environment variable used to pass the request context
 CONTEXT_ENV = 'openstack.context'
@@ -49,43 +52,66 @@ _RE_PASS = re.compile(r'([\'"].*?password[\'"]\s*:\s*u?[\'"]).*?([\'"])',
                       re.DOTALL)
 
 
-def mask_password(message, is_unicode=False, secret="***"):
-    """Replace password with 'secret' in message.
+def validate_token_bind(context, token_ref):
+    bind_mode = CONF.token.enforce_token_bind
 
-    :param message: The string which include security information.
-    :param is_unicode: Is unicode string ?
-    :param secret: substitution string default to "***".
-    :returns: The string
+    if bind_mode == 'disabled':
+        return
 
-    For example:
-       >>> mask_password('"password" : "aaaaa"')
-       '"password" : "***"'
-       >>> mask_password("'original_password' : 'aaaaa'")
-       "'original_password' : '***'"
-       >>> mask_password("u'original_password' :   u'aaaaa'")
-       "u'original_password' :   u'***'"
-    """
-    if is_unicode:
-        message = unicode(message)
-    # Match the group 1,2 and replace all others with 'secret'
-    secret = r"\g<1>" + secret + r"\g<2>"
-    result = _RE_PASS.sub(secret, message)
-    return result
+    bind = token_ref.get('bind', {})
 
+    # permissive and strict modes don't require there to be a bind
+    permissive = bind_mode in ('permissive', 'strict')
 
-class WritableLogger(object):
-    """A thin wrapper that responds to `write` and logs."""
+    # get the named mode if bind_mode is not one of the known
+    name = None if permissive or bind_mode == 'required' else bind_mode
 
-    def __init__(self, logger, level=logging.DEBUG):
-        self.logger = logger
-        self.level = level
+    if not bind:
+        if permissive:
+            # no bind provided and none required
+            return
+        else:
+            LOG.info(_("No bind information present in token"))
+            raise exception.Unauthorized()
 
-    def write(self, msg):
-        self.logger.log(self.level, msg)
+    if name and name not in bind:
+        LOG.info(_("Named bind mode %s not in bind information"), name)
+        raise exception.Unauthorized()
+
+    for bind_type, identifier in six.iteritems(bind):
+        if bind_type == 'kerberos':
+            if not (context['environment'].get('AUTH_TYPE', '').lower()
+                    == 'negotiate'):
+                LOG.info(_("Kerberos credentials required and not present"))
+                raise exception.Unauthorized()
+
+            if not context['environment'].get('REMOTE_USER') == identifier:
+                LOG.info(_("Kerberos credentials do not match those in bind"))
+                raise exception.Unauthorized()
+
+            LOG.info(_("Kerberos bind authentication successful"))
+
+        elif bind_mode == 'permissive':
+            LOG.debug(_("Ignoring unknown bind for permissive mode: "
+                        "{%(bind_type)s: %(identifier)s}"),
+                      {'bind_type': bind_type, 'identifier': identifier})
+        else:
+            LOG.info(_("Couldn't verify unknown bind: "
+                       "{%(bind_type)s: %(identifier)s}"),
+                     {'bind_type': bind_type, 'identifier': identifier})
+            raise exception.Unauthorized()
 
 
 class Request(webob.Request):
-    pass
+    def best_match_language(self):
+        """Determines the best available locale from the Accept-Language
+        HTTP header passed in the request.
+        """
+
+        if not self.accept_language:
+            return None
+        return self.accept_language.best_match(
+            gettextutils.get_available_languages('keystone'))
 
 
 class BaseApplication(object):
@@ -103,18 +129,18 @@ class BaseApplication(object):
 
             [app:wadl]
             latest_version = 1.3
-            paste.app_factory = nova.api.fancy_api:Wadl.factory
+            paste.app_factory = keystone.fancy_api:Wadl.factory
 
         which would result in a call to the `Wadl` class as
 
-            import nova.api.fancy_api
-            fancy_api.Wadl(latest_version='1.3')
+            import keystone.fancy_api
+            keystone.fancy_api.Wadl(latest_version='1.3')
 
         You could of course re-implement the `factory` method in subclasses,
         but using the kwarg passing it shouldn't be necessary.
 
         """
-        return cls()
+        return cls(**local_config)
 
     def __call__(self, environ, start_response):
         r"""Subclasses will probably want to implement __call__ like this:
@@ -153,8 +179,9 @@ class BaseApplication(object):
         raise NotImplementedError('You must implement __call__')
 
 
+@dependency.requires('assignment_api', 'policy_api', 'token_api')
 class Application(BaseApplication):
-    @webob.dec.wsgify
+    @webob.dec.wsgify(RequestClass=Request)
     def __call__(self, req):
         arg_dict = req.environ['wsgiorg.routing_args'][1]
         action = arg_dict.pop('action')
@@ -163,15 +190,19 @@ class Application(BaseApplication):
 
         # allow middleware up the stack to provide context, params and headers.
         context = req.environ.get(CONTEXT_ENV, {})
-        context['query_string'] = dict(req.params.iteritems())
-        context['headers'] = dict(req.headers.iteritems())
+        context['query_string'] = dict(six.iteritems(req.params))
+        context['headers'] = dict(six.iteritems(req.headers))
         context['path'] = req.environ['PATH_INFO']
         params = req.environ.get(PARAMS_ENV, {})
-        if 'REMOTE_USER' in req.environ:
-            context['REMOTE_USER'] = req.environ['REMOTE_USER']
-        elif context.get('REMOTE_USER', None) is not None:
-            del context['REMOTE_USER']
+        #authentication and authorization attributes are set as environment
+        #values by the container and processed by the pipeline.  the complete
+        #set is not yet know.
+        context['environment'] = req.environ
+        req.environ = None
+
         params.update(arg_dict)
+
+        context.setdefault('is_admin', False)
 
         # TODO(termie): do some basic normalization on methods
         method = getattr(self, action)
@@ -183,22 +214,24 @@ class Application(BaseApplication):
             result = method(context, **params)
         except exception.Unauthorized as e:
             LOG.warning(
-                _('Authorization failed. %(exception)s from %(remote_addr)s') %
+                _('Authorization failed. %(exception)s from %(remote_addr)s'),
                 {'exception': e, 'remote_addr': req.environ['REMOTE_ADDR']})
-            return render_exception(e)
+            return render_exception(e, user_locale=req.best_match_language())
         except exception.Error as e:
             LOG.warning(e)
-            return render_exception(e)
+            return render_exception(e, user_locale=req.best_match_language())
         except TypeError as e:
             LOG.exception(e)
-            return render_exception(exception.ValidationError(e))
+            return render_exception(exception.ValidationError(e),
+                                    user_locale=req.best_match_language())
         except Exception as e:
             LOG.exception(e)
-            return render_exception(exception.UnexpectedError(exception=e))
+            return render_exception(exception.UnexpectedError(exception=e),
+                                    user_locale=req.best_match_language())
 
         if result is None:
             return render_response(status=(204, 'No Content'))
-        elif isinstance(result, basestring):
+        elif isinstance(result, six.string_types):
             return result
         elif isinstance(result, webob.Response):
             return result
@@ -221,16 +254,16 @@ class Application(BaseApplication):
 
     def _normalize_dict(self, d):
         return dict([(self._normalize_arg(k), v)
-                     for (k, v) in d.iteritems()])
+                     for (k, v) in six.iteritems(d)])
 
     def assert_admin(self, context):
         if not context['is_admin']:
             try:
-                user_token_ref = self.token_api.get_token(
-                    token_id=context['token_id'])
+                user_token_ref = self.token_api.get_token(context['token_id'])
             except exception.TokenNotFound as e:
                 raise exception.Unauthorized(e)
 
+            validate_token_bind(context, user_token_ref)
             creds = user_token_ref['metadata'].copy()
 
             try:
@@ -246,10 +279,30 @@ class Application(BaseApplication):
                 raise exception.Unauthorized()
 
             # NOTE(vish): this is pretty inefficient
-            creds['roles'] = [self.identity_api.get_role(role)['name']
+            creds['roles'] = [self.assignment_api.get_role(role)['name']
                               for role in creds.get('roles', [])]
             # Accept either is_admin or the admin role
             self.policy_api.enforce(creds, 'admin_required', {})
+
+    def _require_attribute(self, ref, attr):
+        """Ensures the reference contains the specified attribute."""
+        if ref.get(attr) is None or ref.get(attr) == '':
+            msg = '%s field is required and cannot be empty' % attr
+            raise exception.ValidationError(message=msg)
+
+    def _get_trust_id_for_request(self, context):
+        """Get the trust_id for a call.
+
+        Retrieve the trust_id from the token
+        Returns None if token is is not trust scoped
+        """
+        try:
+            token_ref = self.token_api.get_token(context['token_id'])
+        except exception.TokenNotFound:
+            LOG.warning(_('Invalid token in _get_trust_id_for_request'))
+            raise exception.Unauthorized()
+
+        return token_ref.get('trust_id')
 
 
 class Middleware(Application):
@@ -274,12 +327,12 @@ class Middleware(Application):
 
             [filter:analytics]
             redis_host = 127.0.0.1
-            paste.filter_factory = nova.api.analytics:Analytics.factory
+            paste.filter_factory = keystone.analytics:Analytics.factory
 
         which would result in a call to the `Analytics` class as
 
-            import nova.api.analytics
-            analytics.Analytics(app_from_paste, redis_host='127.0.0.1')
+            import keystone.analytics
+            keystone.analytics.Analytics(app, redis_host='127.0.0.1')
 
         You could of course re-implement the `factory` method in subclasses,
         but using the kwarg passing it shouldn't be necessary.
@@ -318,13 +371,16 @@ class Middleware(Application):
             return self.process_response(request, response)
         except exception.Error as e:
             LOG.warning(e)
-            return render_exception(e)
+            return render_exception(e,
+                                    user_locale=request.best_match_language())
         except TypeError as e:
             LOG.exception(e)
-            return render_exception(exception.ValidationError(e))
+            return render_exception(exception.ValidationError(e),
+                                    user_locale=request.best_match_language())
         except Exception as e:
             LOG.exception(e)
-            return render_exception(exception.UnexpectedError(exception=e))
+            return render_exception(exception.UnexpectedError(exception=e),
+                                    user_locale=request.best_match_language())
 
 
 class Debug(Middleware):
@@ -337,21 +393,21 @@ class Debug(Middleware):
 
     @webob.dec.wsgify(RequestClass=Request)
     def __call__(self, req):
-        if LOG.isEnabledFor(logging.DEBUG):
+        if not hasattr(LOG, 'isEnabledFor') or LOG.isEnabledFor(LOG.debug):
             LOG.debug('%s %s %s', ('*' * 20), 'REQUEST ENVIRON', ('*' * 20))
             for key, value in req.environ.items():
-                LOG.debug('%s = %s', key, mask_password(value,
-                                                        is_unicode=True))
+                LOG.debug('%s = %s', key,
+                          log.mask_password(value))
             LOG.debug('')
             LOG.debug('%s %s %s', ('*' * 20), 'REQUEST BODY', ('*' * 20))
             for line in req.body_file:
-                LOG.debug(mask_password(line))
+                LOG.debug('%s', log.mask_password(line))
             LOG.debug('')
 
         resp = req.get_response(self.application)
-        if LOG.isEnabledFor(logging.DEBUG):
+        if not hasattr(LOG, 'isEnabledFor') or LOG.isEnabledFor(LOG.debug):
             LOG.debug('%s %s %s', ('*' * 20), 'RESPONSE HEADERS', ('*' * 20))
-            for (key, value) in resp.headers.iteritems():
+            for (key, value) in six.iteritems(resp.headers):
                 LOG.debug('%s = %s', key, value)
             LOG.debug('')
 
@@ -395,11 +451,6 @@ class Router(object):
           mapper.connect(None, '/v1.0/{path_info:.*}', controller=BlogApp())
 
         """
-        # if we're only running in debug, bump routes' internal logging up a
-        # notch, as it's very spammy
-        if CONF.debug:
-            logging.getLogger('routes.middleware').setLevel(logging.INFO)
-
         self.map = mapper
         self._router = routes.middleware.RoutesMiddleware(self._dispatch,
                                                           self.map)
@@ -426,7 +477,8 @@ class Router(object):
         match = req.environ['wsgiorg.routing_args'][1]
         if not match:
             return render_exception(
-                exception.NotFound(_('The resource could not be found.')))
+                exception.NotFound(_('The resource could not be found.')),
+                user_locale=req.best_match_language())
         app = match['controller']
         return app
 
@@ -484,12 +536,12 @@ class ExtensionRouter(Router):
 
             [filter:analytics]
             redis_host = 127.0.0.1
-            paste.filter_factory = nova.api.analytics:Analytics.factory
+            paste.filter_factory = keystone.analytics:Analytics.factory
 
         which would result in a call to the `Analytics` class as
 
-            import nova.api.analytics
-            analytics.Analytics(app_from_paste, redis_host='127.0.0.1')
+            import keystone.analytics
+            keystone.analytics.Analytics(app, redis_host='127.0.0.1')
 
         You could of course re-implement the `factory` method in subclasses,
         but using the kwarg passing it shouldn't be necessary.
@@ -498,7 +550,7 @@ class ExtensionRouter(Router):
         def _factory(app):
             conf = global_config.copy()
             conf.update(local_config)
-            return cls(app)
+            return cls(app, **local_config)
         return _factory
 
 
@@ -520,13 +572,28 @@ def render_response(body=None, status=None, headers=None):
                           headerlist=headers)
 
 
-def render_exception(error):
+def render_exception(error, user_locale=None):
     """Forms a WSGI response based on the current error."""
+
+    error_message = error.args[0]
+    message = gettextutils.translate(error_message, desired_locale=user_locale)
+    if message is error_message:
+        # translate() didn't do anything because it wasn't a Message,
+        # convert to a string.
+        message = six.text_type(message)
+
     body = {'error': {
         'code': error.code,
         'title': error.title,
-        'message': str(error)
+        'message': message,
     }}
+    headers = []
     if isinstance(error, exception.AuthPluginException):
         body['error']['identity'] = error.authentication
-    return render_response(status=(error.code, error.title), body=body)
+    elif isinstance(error, exception.Unauthorized):
+        headers.append(('WWW-Authenticate',
+                        'Keystone uri="%s"' % (
+                            CONF.public_endpoint % CONF)))
+    return render_response(status=(error.code, error.title),
+                           body=body,
+                           headers=headers)

@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 OpenStack LLC
+# Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -19,20 +19,18 @@ import copy
 
 import memcache
 
-from keystone.common import logging
 from keystone.common import utils
 from keystone import config
 from keystone import exception
 from keystone.openstack.common import jsonutils
+from keystone.openstack.common import log
 from keystone.openstack.common import timeutils
 from keystone import token
 
 
 CONF = config.CONF
-config.register_str('servers', group='memcache', default='localhost:11211')
-config.register_int('max_compare_and_set_retry', group='memcache', default=16)
 
-LOG = logging.getLogger(__name__)
+LOG = log.getLogger(__name__)
 
 
 class Token(token.Driver):
@@ -46,7 +44,7 @@ class Token(token.Driver):
         return self._memcache_client or self._get_memcache_client()
 
     def _get_memcache_client(self):
-        memcache_servers = CONF.memcache.servers.split(',')
+        memcache_servers = CONF.memcache.servers
         # NOTE(morganfainberg): The memcache client library for python is NOT
         # thread safe and should not be passed between threads. This is highly
         # specific to the cas() (compare and set) methods and the caching of
@@ -65,7 +63,7 @@ class Token(token.Driver):
     def get_token(self, token_id):
         if token_id is None:
             raise exception.TokenNotFound(token_id='')
-        ptk = self._prefix_token_id(token.unique_id(token_id))
+        ptk = self._prefix_token_id(token_id)
         token_ref = self.client.get(ptk)
         if token_ref is None:
             raise exception.TokenNotFound(token_id=token_id)
@@ -74,7 +72,7 @@ class Token(token.Driver):
 
     def create_token(self, token_id, data):
         data_copy = copy.deepcopy(data)
-        ptk = self._prefix_token_id(token.unique_id(token_id))
+        ptk = self._prefix_token_id(token_id)
         if not data_copy.get('expires'):
             data_copy['expires'] = token.default_expire_time()
         if not data_copy.get('user_id'):
@@ -118,7 +116,7 @@ class Token(token.Driver):
             if record is not None:
                 token_list = jsonutils.loads('[%s]' % record)
                 for token_i in token_list:
-                    ptk = self._prefix_token_id(token.unique_id(token_i))
+                    ptk = self._prefix_token_id(token_i)
                     token_ref = self.client.get(ptk)
                     if not token_ref:
                         # skip tokens that do not exist in memcache
@@ -174,19 +172,29 @@ class Token(token.Driver):
 
     def delete_token(self, token_id):
         # Test for existence
-        data = self.get_token(token.unique_id(token_id))
-        ptk = self._prefix_token_id(token.unique_id(token_id))
+        data = self.get_token(token_id)
+        ptk = self._prefix_token_id(token_id)
         result = self.client.delete(ptk)
         self._add_to_revocation_list(data)
         return result
 
-    def list_tokens(self, user_id, tenant_id=None, trust_id=None):
+    def delete_tokens(self, user_id, tenant_id=None, trust_id=None,
+                      consumer_id=None):
+        return super(Token, self).delete_tokens(
+            user_id=user_id,
+            tenant_id=tenant_id,
+            trust_id=trust_id,
+            consumer_id=consumer_id,
+        )
+
+    def _list_tokens(self, user_id, tenant_id=None, trust_id=None,
+                     consumer_id=None):
         tokens = []
         user_key = self._prefix_user_id(user_id)
         user_record = self.client.get(user_key) or ""
         token_list = jsonutils.loads('[%s]' % user_record)
         for token_id in token_list:
-            ptk = self._prefix_token_id(token.unique_id(token_id))
+            ptk = self._prefix_token_id(token_id)
             token_ref = self.client.get(ptk)
             if token_ref:
                 if tenant_id is not None:
@@ -201,6 +209,13 @@ class Token(token.Driver):
                         continue
                     if trust != trust_id:
                         continue
+                if consumer_id is not None:
+                    try:
+                        oauth = token_ref['token_data']['token']['OS-OAUTH1']
+                        if oauth.get('consumer_id') != consumer_id:
+                            continue
+                    except KeyError:
+                        continue
 
                 tokens.append(token_id)
         return tokens
@@ -210,3 +225,8 @@ class Token(token.Driver):
         if list_json:
             return jsonutils.loads('[%s]' % list_json)
         return []
+
+    def flush_expired_tokens(self):
+        """Archive or delete tokens that have expired.
+        """
+        raise exception.NotImplemented()

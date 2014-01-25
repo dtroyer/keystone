@@ -1,21 +1,43 @@
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+
+# Copyright 2013 OpenStack Foundation
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
 import collections
 import functools
 import uuid
 
 from keystone.common import dependency
-from keystone.common import logging
+from keystone.common import driver_hints
+from keystone.common import utils
 from keystone.common import wsgi
 from keystone import config
 from keystone import exception
+from keystone.openstack.common import log
+from keystone.openstack.common import versionutils
 
 
-LOG = logging.getLogger(__name__)
+LOG = log.getLogger(__name__)
 CONF = config.CONF
-DEFAULT_DOMAIN_ID = CONF.identity.default_domain_id
+
+v2_deprecated = versionutils.deprecated(what='v2 API',
+                                        as_of=versionutils.deprecated.ICEHOUSE,
+                                        in_favor_of='v3 API')
 
 
 def _build_policy_check_credentials(self, action, context, kwargs):
-    LOG.debug(_('RBAC: Authorizing %(action)s(%(kwargs)s)') % {
+    LOG.debug(_('RBAC: Authorizing %(action)s(%(kwargs)s)'), {
         'action': action,
         'kwargs': ', '.join(['%s=%s' % (k, kwargs[k]) for k in kwargs])})
 
@@ -25,8 +47,12 @@ def _build_policy_check_credentials(self, action, context, kwargs):
         LOG.warning(_('RBAC: Invalid token'))
         raise exception.Unauthorized()
 
+    # NOTE(jamielennox): whilst this maybe shouldn't be within this function
+    # it would otherwise need to reload the token_ref from backing store.
+    wsgi.validate_token_bind(context, token_ref)
+
     creds = {}
-    if 'token_data' in token_ref:
+    if 'token_data' in token_ref and 'token' in token_ref['token_data']:
         #V3 Tokens
         token_data = token_ref['token_data']['token']
         try:
@@ -60,7 +86,7 @@ def _build_policy_check_credentials(self, action, context, kwargs):
         except AttributeError:
             LOG.debug(_('RBAC: Proceeding without tenant'))
         # NOTE(vish): this is pretty inefficient
-        creds['roles'] = [self.identity_api.get_role(role)['name']
+        creds['roles'] = [self.assignment_api.get_role(role)['name']
                           for role in creds.get('roles', [])]
 
     return creds
@@ -83,23 +109,71 @@ def flatten(d, parent_key=''):
     return dict(items)
 
 
-def protected(f):
-    """Wraps API calls with role based access controls (RBAC)."""
-    @functools.wraps(f)
-    def wrapper(self, context, *args, **kwargs):
-        if 'is_admin' in context and context['is_admin']:
-            LOG.warning(_('RBAC: Bypassing authorization'))
-        else:
-            action = 'identity:%s' % f.__name__
-            creds = _build_policy_check_credentials(self, action,
-                                                    context, kwargs)
-            # Simply use the passed kwargs as the target dict, which
-            # would typically include the prime key of a get/update/delete
-            # call.
-            self.policy_api.enforce(creds, action, flatten(kwargs))
-            LOG.debug(_('RBAC: Authorization granted'))
+def protected(callback=None):
+    """Wraps API calls with role based access controls (RBAC).
 
-        return f(self, context, *args, **kwargs)
+    This handles both the protection of the API parameters as well as any
+    target entities for single-entity API calls.
+
+    More complex API calls (for example that deal with several different
+    entities) should pass in a callback function, that will be subsequently
+    called to check protection for these multiple entities. This callback
+    function should gather the appropriate entities needed and then call
+    check_proetction() in the V3Controller class.
+
+    """
+    def wrapper(f):
+        @functools.wraps(f)
+        def inner(self, context, *args, **kwargs):
+            if 'is_admin' in context and context['is_admin']:
+                LOG.warning(_('RBAC: Bypassing authorization'))
+            elif callback is not None:
+                prep_info = {'f_name': f.__name__,
+                             'input_attr': kwargs}
+                callback(self, context, prep_info, *args, **kwargs)
+            else:
+                action = 'identity:%s' % f.__name__
+                creds = _build_policy_check_credentials(self, action,
+                                                        context, kwargs)
+
+                policy_dict = {}
+
+                # Check to see if we need to include the target entity in our
+                # policy checks.  We deduce this by seeing if the class has
+                # specified a get_member() method and that kwargs contains the
+                # appropriate entity id.
+                if (hasattr(self, 'get_member_from_driver') and
+                        self.get_member_from_driver is not None):
+                    key = '%s_id' % self.member_name
+                    if key in kwargs:
+                        ref = self.get_member_from_driver(kwargs[key])
+                        policy_dict['target'] = {self.member_name: ref}
+
+                # TODO(henry-nash): Move this entire code to a member
+                # method inside v3 Auth
+                if context.get('subject_token_id') is not None:
+                    token_ref = self.token_api.get_token(
+                        context['subject_token_id'])
+                    policy_dict.setdefault('target', {})
+                    policy_dict['target'].setdefault(self.member_name, {})
+                    policy_dict['target'][self.member_name]['user_id'] = (
+                        token_ref['user_id'])
+                    if 'domain' in token_ref['user']:
+                        policy_dict['target'][self.member_name].setdefault(
+                            'user', {})
+                        policy_dict['target'][self.member_name][
+                            'user'].setdefault('domain', {})
+                        policy_dict['target'][self.member_name]['user'][
+                            'domain']['id'] = (
+                                token_ref['user']['domain']['id'])
+
+                # Add in the kwargs, which means that any entity provided as a
+                # parameter for calls like create and update will be included.
+                policy_dict.update(kwargs)
+                self.policy_api.enforce(creds, action, flatten(policy_dict))
+                LOG.debug(_('RBAC: Authorization granted'))
+            return f(self, context, *args, **kwargs)
+        return inner
     return wrapper
 
 
@@ -122,14 +196,14 @@ def filterprotected(*filters):
                 #
                 # First  any query filter parameters
                 target = dict()
-                if len(filters) > 0:
-                    for filter in filters:
-                        if filter in context['query_string']:
-                            target[filter] = context['query_string'][filter]
+                if filters:
+                    for item in filters:
+                        if item in context['query_string']:
+                            target[item] = context['query_string'][item]
 
-                    LOG.debug(_('RBAC: Adding query filter params (%s)') % (
-                        ', '.join(['%s=%s' % (filter, target[filter])
-                                  for filter in target])))
+                    LOG.debug(_('RBAC: Adding query filter params (%s)'), (
+                        ', '.join(['%s=%s' % (item, target[item])
+                                  for item in target])))
 
                 # Now any formal url parameters
                 for key in kwargs:
@@ -145,31 +219,8 @@ def filterprotected(*filters):
     return _filterprotected
 
 
-@dependency.requires('identity_api', 'policy_api', 'token_api',
-                     'trust_api', 'catalog_api', 'credential_api')
 class V2Controller(wsgi.Application):
     """Base controller class for Identity API v2."""
-
-    def _delete_tokens_for_trust(self, user_id, trust_id):
-        self.token_api.delete_tokens(user_id, trust_id=trust_id)
-
-    def _delete_tokens_for_user(self, user_id, project_id=None):
-        #First delete tokens that could get other tokens.
-        self.token_api.delete_tokens(user_id, tenant_id=project_id)
-
-        #delete tokens generated from trusts
-        for trust in self.trust_api.list_trusts_for_trustee(user_id):
-            self._delete_tokens_for_trust(user_id, trust['id'])
-        for trust in self.trust_api.list_trusts_for_trustor(user_id):
-            self._delete_tokens_for_trust(trust['trustee_user_id'],
-                                          trust['id'])
-
-    def _require_attribute(self, ref, attr):
-        """Ensures the reference contains the specified attribute."""
-        if ref.get(attr) is None or ref.get(attr) == '':
-            msg = '%s field is required and cannot be empty' % attr
-            raise exception.ValidationError(message=msg)
-
     def _normalize_domain_id(self, context, ref):
         """Fill in domain_id since v2 calls are not domain-aware.
 
@@ -177,16 +228,18 @@ class V2Controller(wsgi.Application):
         specified in the v2 call.
 
         """
-        ref['domain_id'] = DEFAULT_DOMAIN_ID
+        ref['domain_id'] = CONF.identity.default_domain_id
         return ref
 
-    def _filter_domain_id(self, ref):
+    @staticmethod
+    def filter_domain_id(ref):
         """Remove domain_id since v2 calls are not domain-aware."""
         ref.pop('domain_id', None)
         return ref
 
 
-class V3Controller(V2Controller):
+@dependency.requires('policy_api', 'token_api')
+class V3Controller(wsgi.Application):
     """Base controller class for Identity API v3.
 
     Child classes should set the ``collection_name`` and ``member_name`` class
@@ -198,11 +251,7 @@ class V3Controller(V2Controller):
 
     collection_name = 'entities'
     member_name = 'entity'
-
-    def _delete_tokens_for_group(self, group_id):
-        user_refs = self.identity_api.list_users_in_group(group_id)
-        for user in user_refs:
-            self._delete_tokens_for_user(user['id'])
+    get_member_from_driver = None
 
     @classmethod
     def base_url(cls, path=None):
@@ -230,9 +279,29 @@ class V3Controller(V2Controller):
         return {cls.member_name: ref}
 
     @classmethod
-    def wrap_collection(cls, context, refs, filters=[]):
-        for f in filters:
-            refs = cls.filter_by_attribute(context, refs, f)
+    def wrap_collection(cls, context, refs, hints=None):
+        """Wrap a collection, checking for filtering and pagination.
+
+        Returns the wrapped collection, which includes:
+        - Executing any filtering not already carried out
+        - Paginating if necessary
+        - Adds 'self' links in every member
+        - Adds 'next', 'self' and 'prev' links for the whole collection.
+
+        :param context: the current context, containing the original url path
+                        and query string
+        :param refs: the list of members of the collection
+        :param hints: list hints, containing any relevant
+                      filters. Any filters already satisfied by drivers
+                      will have been removed
+        """
+        # Check if there are any filters in hints that were not
+        # handled by the drivers. The driver will not have paginated or
+        # limited the output if it found there were filters it was unable to
+        # handle.
+
+        if hints is not None:
+            refs = cls.filter_by_attributes(refs, hints)
 
         refs = cls.paginate(context, refs)
 
@@ -257,8 +326,8 @@ class V3Controller(V2Controller):
         return refs[per_page * (page - 1):per_page * page]
 
     @classmethod
-    def filter_by_attribute(cls, context, refs, attr):
-        """Filters a list of references by query string value."""
+    def filter_by_attributes(cls, refs, hints):
+        """Filters a list of references by filter values."""
 
         def _attr_match(ref_attr, val_attr):
             """Matches attributes allowing for booleans as strings.
@@ -269,19 +338,112 @@ class V3Controller(V2Controller):
 
             """
             if type(ref_attr) is bool:
-                if (isinstance(val_attr, basestring) and
-                        val_attr == '0'):
-                    val = False
-                else:
-                    val = True
-                return (ref_attr == val)
+                return ref_attr == utils.attr_as_boolean(val_attr)
             else:
-                return (ref_attr == val_attr)
+                return ref_attr == val_attr
 
-        if attr in context['query_string']:
-            value = context['query_string'][attr]
-            return [r for r in refs if _attr_match(r[attr], value)]
+        def _inexact_attr_match(filter, ref):
+            """Applies an inexact filter to a result dict.
+
+            :param filter: the filter in question
+            :param ref: the dict to check
+
+            :returns True if there is a match
+
+            """
+            comparator = filter['comparator']
+            key = filter['name']
+
+            if key in ref:
+                filter_value = filter['value']
+                target_value = ref[key]
+                if not filter['case_sensitive']:
+                    # We only support inexact filters on strings so
+                    # it's OK to use lower()
+                    filter_value = filter_value.lower()
+                    target_value = target_value.lower()
+
+                if comparator == 'contains':
+                    return (filter_value in target_value)
+                elif comparator == 'startswith':
+                    return target_value.startswith(filter_value)
+                elif comparator == 'endswith':
+                    return target_value.endswith(filter_value)
+                else:
+                    # We silently ignore unsupported filters
+                    return True
+
+            return False
+
+        for filter in hints.filters():
+            if filter['comparator'] == 'equals':
+                attr = filter['name']
+                value = filter['value']
+                refs = [r for r in refs if _attr_match(
+                    flatten(r).get(attr), value)]
+            else:
+                # It might be an inexact filter
+                refs = [r for r in refs if _inexact_attr_match(
+                    filter, r)]
+
         return refs
+
+    @classmethod
+    def build_driver_hints(cls, context, supported_filters):
+        """Build list hints based on the context query string.
+
+        :param context: contains the query_string from which any list hints can
+                        be extracted
+        :param supported_filters: list of filters supported, so ignore any
+                                  keys in query_dict that are not in this list.
+
+        """
+        query_dict = context['query_string']
+        hints = driver_hints.Hints()
+
+        if query_dict is None:
+            return hints
+
+        for key in query_dict:
+            # Check if this is an exact filter
+            if supported_filters is None or key in supported_filters:
+                hints.add_filter(key, query_dict[key])
+                continue
+
+            # Check if it is an inexact filter
+            for valid_key in supported_filters:
+                # See if this entry in query_dict matches a known key with an
+                # inexact suffix added.  If it doesn't match, then that just
+                # means that there is no inexact filter for that key in this
+                # query.
+                if not key.startswith(valid_key + '__'):
+                    continue
+
+                base_key, comparator = key.split('__', 1)
+
+                # We map the query-style inexact of, for example:
+                #
+                # {'email__contains', 'myISP'}
+                #
+                # into a list directive add filter call parameters of:
+                #
+                # name = 'email'
+                # value = 'myISP'
+                # comparator = 'contains'
+                # case_sensitive = True
+
+                case_sensitive = True
+                if comparator.startswith('i'):
+                    case_sensitive = False
+                    comparator = comparator[1:]
+                hints.add_filter(base_key, query_dict[key],
+                                 comparator=comparator,
+                                 case_sensitive=case_sensitive)
+
+        # NOTE(henry-nash): If we were to support pagination, we would pull any
+        # pagination directives out of the query_dict here, and add them into
+        # the hints list.
+        return hints
 
     def _require_matching_id(self, value, ref):
         """Ensures the value matches the reference's ID, if any."""
@@ -294,36 +456,65 @@ class V3Controller(V2Controller):
         ref['id'] = uuid.uuid4().hex
         return ref
 
+    def _get_domain_id_for_request(self, context):
+        """Get the domain_id for a v3 call."""
+
+        if context['is_admin']:
+            return CONF.identity.default_domain_id
+
+        # Fish the domain_id out of the token
+        #
+        # We could make this more efficient by loading the domain_id
+        # into the context in the wrapper function above (since
+        # this version of normalize_domain will only be called inside
+        # a v3 protected call).  However, this optimization is probably not
+        # worth the duplication of state
+        try:
+            token_ref = self.token_api.get_token(context['token_id'])
+        except exception.TokenNotFound:
+            LOG.warning(_('Invalid token in _get_domain_id_for_request'))
+            raise exception.Unauthorized()
+
+        if 'domain' in token_ref:
+            return token_ref['domain']['id']
+        else:
+            return CONF.identity.default_domain_id
+
     def _normalize_domain_id(self, context, ref):
         """Fill in domain_id if not specified in a v3 call."""
-
         if 'domain_id' not in ref:
-            if context['is_admin']:
-                ref['domain_id'] = DEFAULT_DOMAIN_ID
-            else:
-                # Fish the domain_id out of the token
-                #
-                # We could make this more efficient by loading the domain_id
-                # into the context in the wrapper function above (since
-                # this version of normalize_domain will only be called inside
-                # a v3 protected call).  However, given that we only use this
-                # for creating entities, this optimization is probably not
-                # worth the duplication of state
-                try:
-                    token_ref = self.token_api.get_token(
-                        context=context, token_id=context['token_id'])
-                except exception.TokenNotFound:
-                    LOG.warning(_('Invalid token in normalize_domain_id'))
-                    raise exception.Unauthorized()
-
-                if 'domain' in token_ref:
-                    ref['domain_id'] = token_ref['domain']['id']
-                else:
-                    # FIXME(henry-nash) Revisit this once v3 token scoping
-                    # across domains has been hashed out
-                    ref['domain_id'] = DEFAULT_DOMAIN_ID
+            ref['domain_id'] = self._get_domain_id_for_request(context)
         return ref
 
-    def _filter_domain_id(self, ref):
+    @staticmethod
+    def filter_domain_id(ref):
         """Override v2 filter to let domain_id out for v3 calls."""
         return ref
+
+    def check_protection(self, context, prep_info, target_attr=None):
+        """Provide call protection for complex target attributes.
+
+        As well as including the standard parameters from the original API
+        call (which is passed in prep_info), this call will add in any
+        additional entities or attributes (passed in target_attr), so that
+        they can be referenced by policy rules.
+
+         """
+        if 'is_admin' in context and context['is_admin']:
+            LOG.warning(_('RBAC: Bypassing authorization'))
+        else:
+            action = 'identity:%s' % prep_info['f_name']
+            # TODO(henry-nash) need to log the target attributes as well
+            creds = _build_policy_check_credentials(self, action,
+                                                    context,
+                                                    prep_info['input_attr'])
+            # Build the dict the policy engine will check against from both the
+            # parameters passed into the call we are protecting (which was
+            # stored in the prep_info by protected()), plus the target
+            # attributes provided.
+            policy_dict = {}
+            if target_attr:
+                policy_dict = {'target': target_attr}
+            policy_dict.update(prep_info['input_attr'])
+            self.policy_api.enforce(creds, action, flatten(policy_dict))
+            LOG.debug(_('RBAC: Authorization granted'))

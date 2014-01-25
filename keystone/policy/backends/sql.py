@@ -34,14 +34,13 @@ class Policy(sql.Base, rules.Policy):
     def db_sync(self, version=None):
         migration.db_sync(version=version)
 
-    @sql.handle_conflicts(type='policy')
+    @sql.handle_conflicts(conflict_type='policy')
     def create_policy(self, policy_id, policy):
         session = self.get_session()
 
         with session.begin():
             ref = PolicyModel.from_dict(policy)
             session.add(ref)
-            session.flush()
 
         return ref.to_dict()
 
@@ -63,7 +62,7 @@ class Policy(sql.Base, rules.Policy):
 
         return self._get_policy(session, policy_id).to_dict()
 
-    @sql.handle_conflicts(type='policy')
+    @sql.handle_conflicts(conflict_type='policy')
     def update_policy(self, policy_id, policy):
         session = self.get_session()
 
@@ -75,7 +74,6 @@ class Policy(sql.Base, rules.Policy):
             ref.blob = new_policy.blob
             ref.type = new_policy.type
             ref.extra = new_policy.extra
-            session.flush()
 
         return ref.to_dict()
 
@@ -85,4 +83,3 @@ class Policy(sql.Base, rules.Policy):
         with session.begin():
             ref = self._get_policy(session, policy_id)
             session.delete(ref)
-            session.flush()

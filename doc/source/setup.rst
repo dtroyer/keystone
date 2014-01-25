@@ -1,5 +1,5 @@
 ..
-      Copyright 2011-2012 OpenStack, LLC
+      Copyright 2011-2012 OpenStack Foundation
       All Rights Reserved.
 
       Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -26,14 +26,13 @@ Documentation`_.
 
 .. _`GitHub Repository`: http://github.com/openstack/keystone
 .. _`User Documentation`: http://docs.openstack.org/
-.. _developing: developing.rst
 
 Prerequisites
 =============
 
 This document assumes you are using:
 
-- Ubuntu 11.10, Fedora 15, or Mac OS X Lion
+- Ubuntu 12.04, Fedora 15, or Mac OS X Lion
 - `Python 2.7`_
 
 .. _`Python 2.7`: http://www.python.org/
@@ -81,9 +80,10 @@ extension, PyPi) cannot satisfy. These dependencies should be installed
 prior to using `pip`, and the installation method may vary depending on
 your platform.
 
-Ubuntu 11.10::
+Ubuntu 12.04::
 
-    $ sudo apt-get install python-dev libxml2-dev libxslt1-dev libsasl2-dev libsqlite3-dev libssl-dev libldap2-dev
+    $ sudo apt-get install python-dev libxml2-dev libxslt1-dev libsasl2-dev libsqlite3-dev libssl-dev libldap2-dev libffi-dev
+
 
 Fedora 15::
 
@@ -150,7 +150,7 @@ without issue::
     >>>
 
 If you can import keystone successfully, you should be ready to move on to
-developing_.
+:doc:`developing`.
 
 Troubleshooting
 ===============

@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2013 OpenStack LLC
+# Copyright 2013 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -16,19 +16,18 @@
 
 import json
 
-from keystone.auth import token_factory
 from keystone.common import cms
 from keystone.common import controller
-from keystone.common import logging
+from keystone.common import dependency
+from keystone.common import wsgi
 from keystone import config
 from keystone import exception
-from keystone import identity
 from keystone.openstack.common import importutils
-from keystone import token
-from keystone import trust
+from keystone.openstack.common import log
+from keystone.openstack.common import timeutils
 
 
-LOG = logging.getLogger(__name__)
+LOG = log.getLogger(__name__)
 
 CONF = config.CONF
 
@@ -50,12 +49,17 @@ def get_auth_method(method_name):
     return AUTH_METHODS[method_name]
 
 
+@dependency.requires('assignment_api', 'identity_api', 'trust_api')
 class AuthInfo(object):
     """Encapsulation of "auth" request."""
 
+    @staticmethod
+    def create(context, auth=None):
+        auth_info = AuthInfo(context, auth=auth)
+        auth_info._validate_and_normalize_auth_data()
+        return auth_info
+
     def __init__(self, context, auth=None):
-        self.identity_api = identity.Manager()
-        self.trust_api = trust.Manager()
         self.context = context
         self.auth = auth
         self._scope_data = (None, None, None)
@@ -64,7 +68,6 @@ class AuthInfo(object):
         # domain scope: (domain_id, None, None)
         # trust scope: (None, None, trust_ref)
         # unscoped: (None, None, None)
-        self._validate_and_normalize_auth_data()
 
     def _assert_project_is_enabled(self, project_ref):
         # ensure the project is enabled
@@ -94,9 +97,10 @@ class AuthInfo(object):
                                             target='domain')
         try:
             if domain_name:
-                domain_ref = self.identity_api.get_domain_by_name(domain_name)
+                domain_ref = self.assignment_api.get_domain_by_name(
+                    domain_name)
             else:
-                domain_ref = self.identity_api.get_domain(domain_id)
+                domain_ref = self.assignment_api.get_domain(domain_id)
         except exception.DomainNotFound as e:
             LOG.exception(e)
             raise exception.Unauthorized(e)
@@ -116,10 +120,10 @@ class AuthInfo(object):
                     raise exception.ValidationError(attribute='domain',
                                                     target='project')
                 domain_ref = self._lookup_domain(project_info['domain'])
-                project_ref = self.identity_api.get_project_by_name(
+                project_ref = self.assignment_api.get_project_by_name(
                     project_name, domain_ref['id'])
             else:
-                project_ref = self.identity_api.get_project(project_id)
+                project_ref = self.assignment_api.get_project(project_id)
         except exception.ProjectNotFound as e:
             LOG.exception(e)
             raise exception.Unauthorized(e)
@@ -190,6 +194,10 @@ class AuthInfo(object):
                 self._scope_data = (None, None, trust_ref)
 
     def _validate_auth_methods(self):
+        if 'identity' not in self.auth:
+            raise exception.ValidationError(attribute='identity',
+                                            target='auth')
+
         # make sure auth methods are provided
         if 'methods' not in self.auth['identity']:
             raise exception.ValidationError(attribute='methods',
@@ -222,7 +230,7 @@ class AuthInfo(object):
         :returns: list of auth method names
 
         """
-        return self.auth['identity']['methods']
+        return self.auth['identity']['methods'] or []
 
     def get_method_data(self, method):
         """Get the auth method payload.
@@ -243,7 +251,7 @@ class AuthInfo(object):
         :returns: (domain_id, project_id, trust_ref).
                    If scope to a project, (None, project_id, None)
                    will be returned.
-                   If scoped to a domain, (domain_id, None,None)
+                   If scoped to a domain, (domain_id, None, None)
                    will be returned.
                    If scoped to a trust, (None, project_id, trust_ref),
                    Will be returned, where the project_id comes from the
@@ -267,27 +275,55 @@ class AuthInfo(object):
         self._scope_data = (domain_id, project_id, trust)
 
 
+@dependency.requires('assignment_api', 'identity_api', 'token_api',
+                     'token_provider_api')
 class Auth(controller.V3Controller):
+
+    # Note(atiwari): From V3 auth controller code we are
+    # calling protection() wrappers, so we need to setup
+    # the member_name and  collection_name attributes of
+    # auth controller code.
+    # In the absence of these attributes, default 'entity'
+    # string will be used to represent the target which is
+    # generic. Policy can be defined using 'entity' but it
+    # would not reflect the exact entity that is in context.
+    # We are defining collection_name = 'tokens' and
+    # member_name = 'token' to facilitate policy decisions.
+    collection_name = 'tokens'
+    member_name = 'token'
+
     def __init__(self, *args, **kw):
         super(Auth, self).__init__(*args, **kw)
-        self.token_controllers_ref = token.controllers.Auth()
         config.setup_authentication()
 
     def authenticate_for_token(self, context, auth=None):
         """Authenticate user and issue a token."""
+        include_catalog = 'nocatalog' not in context['query_string']
+
         try:
-            auth_info = AuthInfo(context, auth=auth)
-            auth_context = {'extras': {}, 'method_names': []}
+            auth_info = AuthInfo.create(context, auth=auth)
+            auth_context = {'extras': {}, 'method_names': [], 'bind': {}}
             self.authenticate(context, auth_info, auth_context)
+            if auth_context.get('access_token_id'):
+                auth_info.set_scope(None, auth_context['project_id'], None)
             self._check_and_set_default_scoping(auth_info, auth_context)
-            (token_id, token_data) = token_factory.create_token(
-                auth_context, auth_info)
-            return token_factory.render_token_data_response(
-                token_id, token_data, created=True)
-        except exception.SecurityError:
-            raise
-        except Exception as e:
-            LOG.exception(e)
+            (domain_id, project_id, trust) = auth_info.get_scope()
+            method_names = auth_info.get_method_names()
+            method_names += auth_context.get('method_names', [])
+            # make sure the list is unique
+            method_names = list(set(method_names))
+            expires_at = auth_context.get('expires_at')
+            # NOTE(morganfainberg): define this here so it is clear what the
+            # argument is during the issue_v3_token provider call.
+            metadata_ref = None
+
+            (token_id, token_data) = self.token_provider_api.issue_v3_token(
+                auth_context['user_id'], method_names, expires_at, project_id,
+                domain_id, auth_context, trust, metadata_ref, include_catalog)
+
+            return render_token_data_response(token_id, token_data,
+                                              created=True)
+        except exception.TrustNotFound as e:
             raise exception.Unauthorized(e)
 
     def _check_and_set_default_scoping(self, auth_info, auth_context):
@@ -301,39 +337,56 @@ class Auth(controller.V3Controller):
         # fill in default_project_id if it is available
         try:
             user_ref = self.identity_api.get_user(auth_context['user_id'])
-            default_project_id = user_ref.get('default_project_id')
-            if default_project_id:
-                auth_info.set_scope(domain_id=None,
-                                    project_id=default_project_id)
         except exception.UserNotFound as e:
             LOG.exception(e)
             raise exception.Unauthorized(e)
 
-    def _build_remote_user_auth_context(self, context, auth_info,
-                                        auth_context):
-        username = context['REMOTE_USER']
-        # FIXME(gyee): REMOTE_USER is not good enough since we are
-        # requiring domain_id to do user lookup now. Try to get
-        # the user_id from auth_info for now, assuming external auth
-        # has check to make sure user is the same as the one specify
-        # in "identity".
-        if 'password' in auth_info.get_method_names():
-            user_info = auth_info.get_method_data('password')
-            user_ref = auth_info.lookup_user(user_info['user'])
-            auth_context['user_id'] = user_ref['id']
-        else:
-            msg = _('Unable to lookup user %s') % (username)
-            raise exception.Unauthorized(msg)
+        default_project_id = user_ref.get('default_project_id')
+        if not default_project_id:
+            # User has no default project. He shall get an unscoped token.
+            return
+
+        # make sure user's default project is legit before scoping to it
+        try:
+            default_project_ref = self.assignment_api.get_project(
+                default_project_id)
+            default_project_domain_ref = self.assignment_api.get_domain(
+                default_project_ref['domain_id'])
+            if (default_project_ref.get('enabled', True) and
+                    default_project_domain_ref.get('enabled', True)):
+                if self.assignment_api.get_roles_for_user_and_project(
+                        user_ref['id'], default_project_id):
+                    auth_info.set_scope(project_id=default_project_id)
+                else:
+                    msg = _("User %(user_id)s doesn't have access to"
+                            " default project %(project_id)s. The token will"
+                            " be unscoped rather than scoped to the project.")
+                    LOG.warning(msg,
+                                {'user_id': user_ref['id'],
+                                 'project_id': default_project_id})
+            else:
+                msg = _("User %(user_id)s's default project %(project_id)s is"
+                        " disabled. The token will be unscoped rather than"
+                        " scoped to the project.")
+                LOG.warning(msg,
+                            {'user_id': user_ref['id'],
+                             'project_id': default_project_id})
+        except (exception.ProjectNotFound, exception.DomainNotFound):
+            # default project or default project domain doesn't exist,
+            # will issue unscoped token instead
+            msg = _("User %(user_id)s's default project %(project_id)s not"
+                    " found. The token will be unscoped rather than"
+                    " scoped to the project.")
+            LOG.warning(msg, {'user_id': user_ref['id'],
+                              'project_id': default_project_id})
 
     def authenticate(self, context, auth_info, auth_context):
         """Authenticate user."""
 
-        # user have been authenticated externally
-        if 'REMOTE_USER' in context:
-            self._build_remote_user_auth_context(context,
-                                                 auth_info,
-                                                 auth_context)
-            return
+        # user has been authenticated externally
+        if 'REMOTE_USER' in context['environment']:
+            external = get_auth_method('external')
+            external.authenticate(context, auth_info, auth_context)
 
         # need to aggregate the results in case two or more methods
         # are specified
@@ -347,7 +400,7 @@ class Auth(controller.V3Controller):
                 auth_response['methods'].append(method_name)
                 auth_response[method_name] = resp
 
-        if len(auth_response["methods"]) > 0:
+        if auth_response["methods"]:
             # authentication continuation required
             raise exception.AdditionalAuthRequired(auth_response)
 
@@ -355,44 +408,57 @@ class Auth(controller.V3Controller):
             msg = _('User not found')
             raise exception.Unauthorized(msg)
 
-    def _get_token_ref(self, context, token_id, belongs_to=None):
-        token_ref = self.token_api.get_token(token_id)
-        if cms.is_ans1_token(token_id):
-            verified_token = cms.cms_verify(cms.token_to_cms(token_id),
-                                            CONF.signing.certfile,
-                                            CONF.signing.ca_certs)
-            token_ref = json.loads(verified_token)
-        if belongs_to:
-            assert token_ref['project']['id'] == belongs_to
-        return token_ref
-
-    @controller.protected
+    @controller.protected()
     def check_token(self, context):
-        try:
-            token_id = context.get('subject_token_id')
-            belongs_to = context['query_string'].get('belongsTo')
-            assert self._get_token_ref(context, token_id, belongs_to)
-        except Exception as e:
-            LOG.error(e)
-            raise exception.Unauthorized(e)
+        token_id = context.get('subject_token_id')
+        self.token_provider_api.check_v3_token(token_id)
 
-    @controller.protected
+    @controller.protected()
     def revoke_token(self, context):
         token_id = context.get('subject_token_id')
-        return self.token_controllers_ref.delete_token(context, token_id)
+        return self.token_provider_api.revoke_token(token_id)
 
-    @controller.protected
+    @controller.protected()
     def validate_token(self, context):
         token_id = context.get('subject_token_id')
-        self.check_token(context)
-        token_ref = self.token_api.get_token(token_id)
-        token_data = token_factory.recreate_token_data(
-            token_ref.get('token_data'),
-            token_ref['expires'],
-            token_ref.get('user'),
-            token_ref.get('tenant'))
-        return token_factory.render_token_data_response(token_id, token_data)
+        include_catalog = 'nocatalog' not in context['query_string']
+        token_data = self.token_provider_api.validate_v3_token(
+            token_id)
+        if not include_catalog and 'catalog' in token_data['token']:
+            del token_data['token']['catalog']
+        return render_token_data_response(token_id, token_data)
 
-    @controller.protected
+    @controller.protected()
     def revocation_list(self, context, auth=None):
-        return self.token_controllers_ref.revocation_list(context, auth)
+        tokens = self.token_api.list_revoked_tokens()
+
+        for t in tokens:
+            expires = t['expires']
+            if not (expires and isinstance(expires, unicode)):
+                    t['expires'] = timeutils.isotime(expires)
+        data = {'revoked': tokens}
+        json_data = json.dumps(data)
+        signed_text = cms.cms_sign_text(json_data,
+                                        CONF.signing.certfile,
+                                        CONF.signing.keyfile)
+
+        return {'signed': signed_text}
+
+
+#FIXME(gyee): not sure if it belongs here or keystone.common. Park it here
+# for now.
+def render_token_data_response(token_id, token_data, created=False):
+    """Render token data HTTP response.
+
+    Stash token ID into the X-Subject-Token header.
+
+    """
+    headers = [('X-Subject-Token', token_id)]
+
+    if created:
+        status = (201, 'Created')
+    else:
+        status = (200, 'OK')
+
+    return wsgi.render_response(body=token_data,
+                                status=status, headers=headers)

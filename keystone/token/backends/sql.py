@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 OpenStack LLC
+# Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -15,8 +15,6 @@
 # under the License.
 
 import copy
-import datetime
-
 
 from keystone.common import sql
 from keystone import exception
@@ -30,9 +28,13 @@ class TokenModel(sql.ModelBase, sql.DictBase):
     id = sql.Column(sql.String(64), primary_key=True)
     expires = sql.Column(sql.DateTime(), default=None)
     extra = sql.Column(sql.JsonBlob())
-    valid = sql.Column(sql.Boolean(), default=True)
+    valid = sql.Column(sql.Boolean(), default=True, nullable=False)
     user_id = sql.Column(sql.String(64))
-    trust_id = sql.Column(sql.String(64), nullable=True)
+    trust_id = sql.Column(sql.String(64))
+    __table_args__ = (
+        sql.Index('ix_token_expires', 'expires'),
+        sql.Index('ix_token_expires_valid', 'expires', 'valid')
+    )
 
 
 class Token(sql.Base, token.Driver):
@@ -41,13 +43,8 @@ class Token(sql.Base, token.Driver):
         if token_id is None:
             raise exception.TokenNotFound(token_id=token_id)
         session = self.get_session()
-        token_ref = session.query(TokenModel).get(token.unique_id(token_id))
-        now = datetime.datetime.utcnow()
+        token_ref = session.query(TokenModel).get(token_id)
         if not token_ref or not token_ref.valid:
-            raise exception.TokenNotFound(token_id=token_id)
-        if not token_ref.expires:
-            raise exception.TokenNotFound(token_id=token_id)
-        if now >= token_ref.expires:
             raise exception.TokenNotFound(token_id=token_id)
         return token_ref.to_dict()
 
@@ -59,25 +56,22 @@ class Token(sql.Base, token.Driver):
             data_copy['user_id'] = data_copy['user']['id']
 
         token_ref = TokenModel.from_dict(data_copy)
-        token_ref.id = token.unique_id(token_id)
         token_ref.valid = True
         session = self.get_session()
         with session.begin():
             session.add(token_ref)
-            session.flush()
         return token_ref.to_dict()
 
     def delete_token(self, token_id):
         session = self.get_session()
-        key = token.unique_id(token_id)
         with session.begin():
-            token_ref = session.query(TokenModel).get(key)
+            token_ref = session.query(TokenModel).get(token_id)
             if not token_ref or not token_ref.valid:
                 raise exception.TokenNotFound(token_id=token_id)
             token_ref.valid = False
-            session.flush()
 
-    def delete_tokens(self, user_id, tenant_id=None, trust_id=None):
+    def delete_tokens(self, user_id, tenant_id=None, trust_id=None,
+                      consumer_id=None):
         """Deletes all tokens in one session
 
         The user_id will be ignored if the trust_id is specified. user_id
@@ -102,14 +96,27 @@ class Token(sql.Base, token.Driver):
                     token_ref_dict = token_ref.to_dict()
                     if not self._tenant_matches(tenant_id, token_ref_dict):
                         continue
-                token_ref.valid = False
+                if consumer_id:
+                    token_ref_dict = token_ref.to_dict()
+                    if not self._consumer_matches(consumer_id, token_ref_dict):
+                        continue
 
-            session.flush()
+                token_ref.valid = False
 
     def _tenant_matches(self, tenant_id, token_ref_dict):
         return ((tenant_id is None) or
                 (token_ref_dict.get('tenant') and
                  token_ref_dict['tenant'].get('id') == tenant_id))
+
+    def _consumer_matches(self, consumer_id, ref):
+        if consumer_id is None:
+            return True
+        else:
+            try:
+                oauth = ref['token_data']['token'].get('OS-OAUTH1', {})
+                return oauth and oauth['consumer_id'] == consumer_id
+            except KeyError:
+                return False
 
     def _list_tokens_for_trust(self, trust_id):
         session = self.get_session()
@@ -140,9 +147,28 @@ class Token(sql.Base, token.Driver):
                 tokens.append(token_ref['id'])
         return tokens
 
-    def list_tokens(self, user_id, tenant_id=None, trust_id=None):
+    def _list_tokens_for_consumer(self, user_id, consumer_id):
+        tokens = []
+        session = self.get_session()
+        with session.begin():
+            now = timeutils.utcnow()
+            query = session.query(TokenModel)
+            query = query.filter(TokenModel.expires > now)
+            query = query.filter(TokenModel.user_id == user_id)
+            token_references = query.filter_by(valid=True)
+
+            for token_ref in token_references:
+                token_ref_dict = token_ref.to_dict()
+                if self._consumer_matches(consumer_id, token_ref_dict):
+                    tokens.append(token_ref_dict['id'])
+        return tokens
+
+    def _list_tokens(self, user_id, tenant_id=None, trust_id=None,
+                     consumer_id=None):
         if trust_id:
             return self._list_tokens_for_trust(trust_id)
+        if consumer_id:
+            return self._list_tokens_for_consumer(user_id, consumer_id)
         else:
             return self._list_tokens_for_user(user_id, tenant_id)
 
@@ -150,22 +176,52 @@ class Token(sql.Base, token.Driver):
         session = self.get_session()
         tokens = []
         now = timeutils.utcnow()
-        query = session.query(TokenModel)
+        query = session.query(TokenModel.id, TokenModel.expires)
         query = query.filter(TokenModel.expires > now)
         token_references = query.filter_by(valid=False)
         for token_ref in token_references:
             record = {
-                'id': token_ref['id'],
-                'expires': token_ref['expires'],
+                'id': token_ref[0],
+                'expires': token_ref[1],
             }
             tokens.append(record)
         return tokens
 
+    def token_flush_batch_size(self, dialect):
+        batch_size = 0
+        if dialect == 'ibm_db_sa':
+            # This functionality is limited to DB2, because
+            # it is necessary to prevent the tranaction log
+            # from filling up, whereas at least some of the
+            # other supported databases do not support update
+            # queries with LIMIT subqueries nor do they appear
+            # to require the use of such queries when deleting
+            # large numbers of records at once.
+            batch_size = 100
+            # Limit of 100 is known to not fill a transaction log
+            # of default maximum size while not significantly
+            # impacting the performance of large token purges on
+            # systems where the maximum transaction log size has
+            # been increased beyond the default.
+        return batch_size
+
     def flush_expired_tokens(self):
         session = self.get_session()
-
-        query = session.query(TokenModel)
-        query = query.filter(TokenModel.expires < timeutils.utcnow())
-        query.delete(synchronize_session=False)
+        dialect = session.bind.dialect.name
+        batch_size = self.token_flush_batch_size(dialect)
+        if batch_size > 0:
+            query = session.query(TokenModel.id)
+            query = query.filter(TokenModel.expires < timeutils.utcnow())
+            query = query.limit(batch_size).subquery()
+            delete_query = (session.query(TokenModel).
+                            filter(TokenModel.id.in_(query)))
+            while True:
+                rowcount = delete_query.delete(synchronize_session=False)
+                if rowcount == 0:
+                    break
+        else:
+            query = session.query(TokenModel)
+            query = query.filter(TokenModel.expires < timeutils.utcnow())
+            query.delete(synchronize_session=False)
 
         session.flush()

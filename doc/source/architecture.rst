@@ -1,5 +1,5 @@
 ..
-      Copyright 2011-2012 OpenStack, LLC
+      Copyright 2011-2012 OpenStack Foundation
       All Rights Reserved.
 
       Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -131,16 +131,6 @@ expected to subclass from these classes. The default response for the defined
 apis in these Drivers is to raise a :mod:`keystone.service.TokenController`.
 
 
-KVS Backend
------------
-
-A simple backend interface meant to be further backended on anything that can
-support primary key lookups, the most trivial implementation being an in-memory
-dict.
-
-Supports all features of the general data model.
-
-
 SQL Backend
 -----------
 
@@ -178,7 +168,7 @@ interpolation)::
 LDAP Backend
 ------------
 
-The LDAP backend stored Users and Tenents in separate Subtrees.  Roles are recorded
+The LDAP backend stored Users and Tenants in separate Subtrees.  Roles are recorded
 as entries under the Tenants.
 
 
