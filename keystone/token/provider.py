@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -24,7 +22,9 @@ from keystone.common import cache
 from keystone.common import dependency
 from keystone.common import manager
 from keystone import config
+
 from keystone import exception
+from keystone.openstack.common.gettextutils import _
 from keystone.openstack.common import log
 from keystone.openstack.common import timeutils
 
@@ -43,7 +43,15 @@ VERSIONS = frozenset([V2, V3])
 
 # default token providers
 PKI_PROVIDER = 'keystone.token.providers.pki.Provider'
+PKIZ_PROVIDER = 'keystone.token.providers.pkiz.Provider'
 UUID_PROVIDER = 'keystone.token.providers.uuid.Provider'
+
+_FORMAT_TO_PROVIDER = {
+    'PKI': PKI_PROVIDER,
+    # should not support new options, but PKIZ keeps the option consistent
+    'PKIZ': PKIZ_PROVIDER,
+    'UUID': UUID_PROVIDER
+}
 
 
 class UnsupportedTokenVersionException(Exception):
@@ -52,6 +60,7 @@ class UnsupportedTokenVersionException(Exception):
 
 
 @dependency.requires('token_api')
+@dependency.optional('revoke_api')
 @dependency.provider('token_provider_api')
 class Manager(manager.Manager):
     """Default pivot point for the token provider backend.
@@ -74,36 +83,24 @@ class Manager(manager.Manager):
         ``provider`` instead.
 
         """
-        if CONF.token.provider is not None:
-            # NOTE(gyee): we are deprecating CONF.signing.token_format. This
-            # code is to ensure the token provider configuration agrees with
-            # CONF.signing.token_format.
-            if (CONF.signing.token_format and
-                    ((CONF.token.provider == PKI_PROVIDER and
-                        CONF.signing.token_format != 'PKI') or
-                        (CONF.token.provider == UUID_PROVIDER and
-                            CONF.signing.token_format != 'UUID'))):
-                raise exception.UnexpectedError(
-                    _('keystone.conf [signing] token_format (deprecated) '
-                      'conflicts with keystone.conf [token] provider'))
-            return CONF.token.provider
-        else:
-            if not CONF.signing.token_format:
-                # No token provider and no format, so use default (PKI)
-                return PKI_PROVIDER
 
-            msg = _('keystone.conf [signing] token_format is deprecated in '
-                    'favor of keystone.conf [token] provider')
-            if CONF.signing.token_format == 'PKI':
-                LOG.warning(msg)
-                return PKI_PROVIDER
-            elif CONF.signing.token_format == 'UUID':
-                LOG.warning(msg)
-                return UUID_PROVIDER
-            else:
+        if CONF.signing.token_format:
+            LOG.warn(_('[signing] token_format is deprecated. '
+                       'Please change to setting the [token] provider '
+                       'configuration value instead'))
+            try:
+
+                mapped = _FORMAT_TO_PROVIDER[CONF.signing.token_format]
+            except KeyError:
                 raise exception.UnexpectedError(
                     _('Unrecognized keystone.conf [signing] token_format: '
                       'expected either \'UUID\' or \'PKI\''))
+            return mapped
+
+        if CONF.token.provider is None:
+            return PKIZ_PROVIDER
+        else:
+            return CONF.token.provider
 
     def __init__(self):
         super(Manager, self).__init__(self.get_token_provider())
@@ -117,14 +114,42 @@ class Manager(manager.Manager):
         self._is_valid_token(token)
         return token
 
+    def check_revocation_v2(self, token):
+        try:
+            token_data = token['access']
+        except KeyError:
+            raise exception.TokenNotFound(_('Failed to validate token'))
+
+        if self.revoke_api is not None:
+            token_values = self.revoke_api.model.build_token_values_v2(
+                token_data, CONF.identity.default_domain_id)
+            self.revoke_api.check_token(token_values)
+
     def validate_v2_token(self, token_id, belongs_to=None):
         unique_id = self.token_api.unique_id(token_id)
         # NOTE(morganfainberg): Ensure we never use the long-form token_id
         # (PKI) as part of the cache_key.
         token = self._validate_v2_token(unique_id)
+        self.check_revocation_v2(token)
         self._token_belongs_to(token, belongs_to)
         self._is_valid_token(token)
         return token
+
+    def check_revocation_v3(self, token):
+        try:
+            token_data = token['token']
+        except KeyError:
+            raise exception.TokenNotFound(_('Failed to validate token'))
+        if self.revoke_api is not None:
+            token_values = self.revoke_api.model.build_token_values(token_data)
+            self.revoke_api.check_token(token_values)
+
+    def check_revocation(self, token):
+        version = self.driver.get_token_version(token)
+        if version == V2:
+            return self.check_revocation_v2(token)
+        else:
+            return self.check_revocation_v3(token)
 
     def validate_v3_token(self, token_id):
         unique_id = self.token_api.unique_id(token_id)
@@ -175,7 +200,8 @@ class Manager(manager.Manager):
         return self.driver.validate_v3_token(token_id)
 
     def _is_valid_token(self, token):
-         # Verify the token has not expired.
+        """Verify the token is valid format and has not expired."""
+
         current_time = timeutils.normalize_time(timeutils.utcnow())
 
         try:
@@ -188,18 +214,17 @@ class Manager(manager.Manager):
                 expires_at = token_data['token']['expires']
             expiry = timeutils.normalize_time(
                 timeutils.parse_isotime(expires_at))
-            if current_time < expiry:
-                # Token is has not expired and has not been revoked.
-                return None
         except Exception:
             LOG.exception(_('Unexpected error or malformed token determining '
                             'token expiry: %s'), token)
+            raise exception.TokenNotFound(_('Failed to validate token'))
 
-        # FIXME(morganfainberg): This error message needs to be updated to
-        # reflect the token couldn't be found, but this change needs to wait
-        # until Icehouse due to string freeze in Havana.  This should be:
-        # "Failed to find valid token" or something similar.
-        raise exception.TokenNotFound(_('Failed to validate token'))
+        if current_time < expiry:
+            self.check_revocation(token)
+            # Token has not expired and has not been revoked.
+            return None
+        else:
+            raise exception.TokenNotFound(_('Failed to validate token'))
 
     def _token_belongs_to(self, token, belongs_to):
         """Check if the token belongs to the right tenant.

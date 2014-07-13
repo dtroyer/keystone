@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -14,15 +12,19 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import json
+from keystoneclient.common import cms
+import six
 
-from keystone.common import cms
 from keystone.common import controller
 from keystone.common import dependency
 from keystone.common import wsgi
 from keystone import config
+from keystone.contrib import federation
 from keystone import exception
+from keystone.openstack.common.gettextutils import _
+from keystone.openstack.common.gettextutils import _LI  # noqa
 from keystone.openstack.common import importutils
+from keystone.openstack.common import jsonutils
 from keystone.openstack.common import log
 from keystone.openstack.common import timeutils
 
@@ -33,22 +35,99 @@ CONF = config.CONF
 
 # registry of authentication methods
 AUTH_METHODS = {}
+AUTH_PLUGINS_LOADED = False
 
 
-def load_auth_method(method_name):
-    if method_name not in CONF.auth.methods:
-        raise exception.AuthMethodNotSupported()
-    driver = CONF.auth.get(method_name)
-    return importutils.import_object(driver)
+def load_auth_methods():
+    global AUTH_PLUGINS_LOADED
+
+    if AUTH_PLUGINS_LOADED:
+        # Only try and load methods a single time.
+        return
+    # config.setup_authentication should be idempotent, call it to ensure we
+    # have setup all the appropriate configuration options we may need.
+    config.setup_authentication()
+    for plugin in CONF.auth.methods:
+        if '.' in plugin:
+            # NOTE(morganfainberg): if '.' is in the plugin name, it should be
+            # imported rather than used as a plugin identifier.
+            plugin_class = plugin
+            driver = importutils.import_object(plugin)
+            if not hasattr(driver, 'method'):
+                raise ValueError(_('Cannot load an auth-plugin by class-name '
+                                   'without a "method" attribute defined: %s'),
+                                 plugin_class)
+        else:
+            plugin_class = CONF.auth.get(plugin)
+            driver = importutils.import_object(plugin_class)
+            if hasattr(driver, 'method'):
+                if driver.method != plugin:
+                    raise ValueError(_('Driver requested method %(req)s does '
+                                       'not match plugin name %(plugin)s.') %
+                                     {'req': driver.method,
+                                      'plugin': plugin})
+            else:
+                LOG.warning(_('Auth Plugin %s does not have a "method" '
+                              'attribute.'), plugin)
+                setattr(driver, 'method', plugin)
+        if driver.method in AUTH_METHODS:
+            raise ValueError(_('Auth plugin %(plugin)s is requesting '
+                               'previously registered method %(method)s') %
+                             {'plugin': plugin_class, 'method': driver.method})
+        AUTH_METHODS[driver.method] = driver
+    AUTH_PLUGINS_LOADED = True
 
 
 def get_auth_method(method_name):
     global AUTH_METHODS
     if method_name not in AUTH_METHODS:
-        AUTH_METHODS[method_name] = load_auth_method(method_name)
+        raise exception.AuthMethodNotSupported()
     return AUTH_METHODS[method_name]
 
 
+class AuthContext(dict):
+    """Retrofitting auth_context to reconcile identity attributes.
+
+    The identity attributes must not have conflicting values among the
+    auth plug-ins. The only exception is `expires_at`, which is set to its
+    earliest value.
+
+    """
+
+    # identity attributes need to be reconciled among the auth plugins
+    IDENTITY_ATTRIBUTES = frozenset(['user_id', 'project_id',
+                                     'access_token_id', 'domain_id',
+                                     'expires_at'])
+
+    def __setitem__(self, key, val):
+        if key in self.IDENTITY_ATTRIBUTES and key in self:
+            existing_val = self[key]
+            if key == 'expires_at':
+                # special treatment for 'expires_at', we are going to take
+                # the earliest expiration instead.
+                if existing_val != val:
+                    LOG.info(_LI('"expires_at" has conflicting values '
+                                 '%(existing)s and %(new)s.  Will use the '
+                                 'earliest value.'),
+                             {'existing': existing_val, 'new': val})
+                if existing_val is None or val is None:
+                    val = existing_val or val
+                else:
+                    val = min(existing_val, val)
+            elif existing_val != val:
+                msg = _('Unable to reconcile identity attribute %(attribute)s '
+                        'as it has conflicting values %(new)s and %(old)s') % (
+                            {'attribute': key,
+                             'new': val,
+                             'old': existing_val})
+                raise exception.Unauthorized(msg)
+        return super(AuthContext, self).__setitem__(key, val)
+
+
+# TODO(blk-u): this class doesn't use identity_api directly, but makes it
+# available for consumers. Consumers should probably not be getting
+# identity_api from this since it's available in global registry, then
+# identity_api should be removed from this list.
 @dependency.requires('assignment_api', 'identity_api', 'trust_api')
 class AuthInfo(object):
     """Encapsulation of "auth" request."""
@@ -79,12 +158,6 @@ class AuthInfo(object):
     def _assert_domain_is_enabled(self, domain_ref):
         if not domain_ref.get('enabled'):
             msg = _('Domain is disabled: %s') % (domain_ref['id'])
-            LOG.warning(msg)
-            raise exception.Unauthorized(msg)
-
-    def _assert_user_is_enabled(self, user_ref):
-        if not user_ref.get('enabled', True):
-            msg = _('User is disabled: %s') % (user_ref['id'])
             LOG.warning(msg)
             raise exception.Unauthorized(msg)
 
@@ -124,6 +197,10 @@ class AuthInfo(object):
                     project_name, domain_ref['id'])
             else:
                 project_ref = self.assignment_api.get_project(project_id)
+                # NOTE(morganfainberg): The _lookup_domain method will raise
+                # exception.Unauthorized if the domain isn't found or is
+                # disabled.
+                self._lookup_domain({'id': project_ref['domain_id']})
         except exception.ProjectNotFound as e:
             LOG.exception(e)
             raise exception.Unauthorized(e)
@@ -139,29 +216,6 @@ class AuthInfo(object):
         if not trust:
             raise exception.TrustNotFound(trust_id=trust_id)
         return trust
-
-    def lookup_user(self, user_info):
-        user_id = user_info.get('id')
-        user_name = user_info.get('name')
-        user_ref = None
-        if not user_id and not user_name:
-            raise exception.ValidationError(attribute='id or name',
-                                            target='user')
-        try:
-            if user_name:
-                if 'domain' not in user_info:
-                    raise exception.ValidationError(attribute='domain',
-                                                    target='user')
-                domain_ref = self._lookup_domain(user_info['domain'])
-                user_ref = self.identity_api.get_user_by_name(
-                    user_name, domain_ref['id'])
-            else:
-                user_ref = self.identity_api.get_user(user_id)
-        except exception.UserNotFound as e:
-            LOG.exception(e)
-            raise exception.Unauthorized(e)
-        self._assert_user_is_enabled(user_ref)
-        return user_ref
 
     def _validate_and_normalize_scope_data(self):
         """Validate and normalize scope data."""
@@ -186,7 +240,7 @@ class AuthInfo(object):
             trust_ref = self._lookup_trust(
                 self.auth['scope']['OS-TRUST:trust'])
             # TODO(ayoung): when trusts support domains, fill in domain data
-            if 'project_id' in trust_ref:
+            if trust_ref.get('project_id') is not None:
                 project_ref = self._lookup_project(
                     {'id': trust_ref['project_id']})
                 self._scope_data = (None, project_ref['id'], trust_ref)
@@ -211,7 +265,7 @@ class AuthInfo(object):
 
         # make sure auth method is supported
         for method_name in self.get_method_names():
-            if method_name not in CONF.auth.methods:
+            if method_name not in AUTH_METHODS:
                 raise exception.AuthMethodNotSupported()
 
     def _validate_and_normalize_auth_data(self):
@@ -230,7 +284,13 @@ class AuthInfo(object):
         :returns: list of auth method names
 
         """
-        return self.auth['identity']['methods'] or []
+        # Sanitizes methods received in request's body
+        # Filters out duplicates, while keeping elements' order.
+        method_names = []
+        for method in self.auth['identity']['methods']:
+            if method not in method_names:
+                method_names.append(method)
+        return method_names
 
     def get_method_data(self, method):
         """Get the auth method payload.
@@ -276,7 +336,7 @@ class AuthInfo(object):
 
 
 @dependency.requires('assignment_api', 'identity_api', 'token_api',
-                     'token_provider_api')
+                     'token_provider_api', 'trust_api')
 class Auth(controller.V3Controller):
 
     # Note(atiwari): From V3 auth controller code we are
@@ -302,12 +362,18 @@ class Auth(controller.V3Controller):
 
         try:
             auth_info = AuthInfo.create(context, auth=auth)
-            auth_context = {'extras': {}, 'method_names': [], 'bind': {}}
+            auth_context = AuthContext(extras={},
+                                       method_names=[],
+                                       bind={})
             self.authenticate(context, auth_info, auth_context)
             if auth_context.get('access_token_id'):
                 auth_info.set_scope(None, auth_context['project_id'], None)
             self._check_and_set_default_scoping(auth_info, auth_context)
             (domain_id, project_id, trust) = auth_info.get_scope()
+
+            if trust:
+                self.trust_api.consume_use(trust['id'])
+
             method_names = auth_info.get_method_names()
             method_names += auth_context.get('method_names', [])
             # make sure the list is unique
@@ -332,6 +398,10 @@ class Auth(controller.V3Controller):
             project_id = trust['project_id']
         if domain_id or project_id or trust:
             # scope is specified
+            return
+
+        # Skip scoping when unscoped federated token is being issued
+        if federation.IDENTITY_PROVIDER in auth_context:
             return
 
         # fill in default_project_id if it is available
@@ -383,10 +453,19 @@ class Auth(controller.V3Controller):
     def authenticate(self, context, auth_info, auth_context):
         """Authenticate user."""
 
-        # user has been authenticated externally
+        # The 'external' method allows any 'REMOTE_USER' based authentication
         if 'REMOTE_USER' in context['environment']:
-            external = get_auth_method('external')
-            external.authenticate(context, auth_info, auth_context)
+            try:
+                external = get_auth_method('external')
+                external.authenticate(context, auth_info, auth_context)
+            except exception.AuthMethodNotSupported:
+                # This will happen there is no 'external' plugin registered
+                # and the container is performing authentication.
+                # The 'kerberos'  and 'saml' methods will be used this way.
+                # In those cases, it is correct to not register an
+                # 'external' plugin;  if there is both an 'external' and a
+                # 'kerberos' plugin, it would run the check on identity twice.
+                pass
 
         # need to aggregate the results in case two or more methods
         # are specified
@@ -411,7 +490,12 @@ class Auth(controller.V3Controller):
     @controller.protected()
     def check_token(self, context):
         token_id = context.get('subject_token_id')
-        self.token_provider_api.check_v3_token(token_id)
+        token_data = self.token_provider_api.validate_v3_token(
+            token_id)
+        # NOTE(morganfainberg): The code in
+        # ``keystone.common.wsgi.render_response`` will remove the content
+        # body.
+        return render_token_data_response(token_id, token_data)
 
     @controller.protected()
     def revoke_token(self, context):
@@ -430,14 +514,16 @@ class Auth(controller.V3Controller):
 
     @controller.protected()
     def revocation_list(self, context, auth=None):
+        if not CONF.token.revoke_by_id:
+            raise exception.Gone()
         tokens = self.token_api.list_revoked_tokens()
 
         for t in tokens:
             expires = t['expires']
-            if not (expires and isinstance(expires, unicode)):
+            if not (expires and isinstance(expires, six.text_type)):
                     t['expires'] = timeutils.isotime(expires)
         data = {'revoked': tokens}
-        json_data = json.dumps(data)
+        json_data = jsonutils.dumps(data)
         signed_text = cms.cms_sign_text(json_data,
                                         CONF.signing.certfile,
                                         CONF.signing.keyfile)
@@ -445,7 +531,7 @@ class Auth(controller.V3Controller):
         return {'signed': signed_text}
 
 
-#FIXME(gyee): not sure if it belongs here or keystone.common. Park it here
+# FIXME(gyee): not sure if it belongs here or keystone.common. Park it here
 # for now.
 def render_token_data_response(token_id, token_data, created=False):
     """Render token data HTTP response.

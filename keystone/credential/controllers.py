@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -15,11 +13,13 @@
 # under the License.
 
 import hashlib
-import json
 
 from keystone.common import controller
 from keystone.common import dependency
+from keystone.common import driver_hints
 from keystone import exception
+from keystone.openstack.common.gettextutils import _
+from keystone.openstack.common import jsonutils
 
 
 @dependency.requires('credential_api')
@@ -32,11 +32,11 @@ class CredentialV3(controller.V3Controller):
         self.get_member_from_driver = self.credential_api.get_credential
 
     def _assign_unique_id(self, ref, trust_id=None):
-        # Generates and assigns a unique identifer to
+        # Generates and assigns a unique identifier to
         # a credential reference.
         if ref.get('type', '').lower() == 'ec2':
             try:
-                blob = json.loads(ref.get('blob'))
+                blob = jsonutils.loads(ref.get('blob'))
             except (ValueError, TypeError):
                 raise exception.ValidationError(
                     message=_('Invalid blob in credential'))
@@ -53,7 +53,7 @@ class CredentialV3(controller.V3Controller):
             # tokens when authentication via ec2tokens happens
             if trust_id is not None:
                 blob['trust_id'] = trust_id
-                ret_ref['blob'] = json.dumps(blob)
+                ret_ref['blob'] = jsonutils.dumps(blob)
             return ret_ref
         else:
             return super(CredentialV3, self)._assign_unique_id(ref)
@@ -73,16 +73,20 @@ class CredentialV3(controller.V3Controller):
         blob = ref.get('blob')
         if isinstance(blob, dict):
             new_ref = ref.copy()
-            new_ref['blob'] = json.dumps(blob)
+            new_ref['blob'] = jsonutils.dumps(blob)
             return new_ref
         else:
             return ref
 
     @controller.protected()
     def list_credentials(self, context):
+        # NOTE(henry-nash): Since there are no filters for credentials, we
+        # shouldn't limit the output, hence we don't pass a hints list into
+        # the driver.
         refs = self.credential_api.list_credentials()
         ret_refs = [self._blob_to_json(r) for r in refs]
-        return CredentialV3.wrap_collection(context, ret_refs)
+        return CredentialV3.wrap_collection(context, ret_refs,
+                                            driver_hints.Hints())
 
     @controller.protected()
     def get_credential(self, context, credential_id):

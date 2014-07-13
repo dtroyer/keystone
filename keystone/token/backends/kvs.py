@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 # Copyright 2013 Metacloud, Inc.
 # Copyright 2012 OpenStack Foundation
 #
@@ -23,6 +21,7 @@ import six
 from keystone.common import kvs
 from keystone import config
 from keystone import exception
+from keystone.openstack.common.gettextutils import _
 from keystone.openstack.common import log
 from keystone.openstack.common import timeutils
 from keystone import token
@@ -166,8 +165,8 @@ class Token(token.Driver):
                     continue
 
                 if expires < current_time:
-                    LOG.debug(_('Token `%(token_id)s` is expired, removing '
-                                'from `%(user_key)s`.'),
+                    LOG.debug(('Token `%(token_id)s` is expired, removing '
+                               'from `%(user_key)s`.'),
                               {'token_id': item_id, 'user_key': user_key})
                     continue
 
@@ -175,8 +174,8 @@ class Token(token.Driver):
                     # NOTE(morganfainberg): If the token has been revoked, it
                     # can safely be removed from this list.  This helps to keep
                     # the user_token_list as reasonably small as possible.
-                    LOG.debug(_('Token `%(token_id)s` is revoked, removing '
-                                'from `%(user_key)s`.'),
+                    LOG.debug(('Token `%(token_id)s` is revoked, removing '
+                               'from `%(user_key)s`.'),
                               {'token_id': item_id, 'user_key': user_key})
                     continue
                 filtered_list.append(item)
@@ -265,8 +264,8 @@ class Token(token.Driver):
         try:
             token_id, expires = item
         except (TypeError, ValueError):
-            LOG.debug(_('Invalid token entry expected tuple of '
-                        '`(<token_id>, <expires>)` got: `%(item)r`'),
+            LOG.debug(('Invalid token entry expected tuple of '
+                       '`(<token_id>, <expires>)` got: `%(item)r`'),
                       dict(item=item))
             raise
 
@@ -274,8 +273,8 @@ class Token(token.Driver):
             expires = timeutils.normalize_time(
                 timeutils.parse_isotime(expires))
         except ValueError:
-            LOG.debug(_('Invalid expires time on token `%(token_id)s`:'
-                        ' %(expires)r'),
+            LOG.debug(('Invalid expires time on token `%(token_id)s`:'
+                       ' %(expires)r'),
                       dict(token_id=token_id, expires=expires))
             raise
         return token_id, expires
@@ -299,6 +298,15 @@ class Token(token.Driver):
 
     def _list_tokens(self, user_id, tenant_id=None, trust_id=None,
                      consumer_id=None):
+        # This function is used to generate the list of tokens that should be
+        # revoked when revoking by token identifiers.  This approach will be
+        # deprecated soon, probably in the Juno release.  Setting revoke_by_id
+        # to False indicates that this kind of recording should not be
+        # performed.  In order to test the revocation events, tokens shouldn't
+        # be deleted from the backends.  This check ensures that tokens are
+        # still recorded.
+        if not CONF.token.revoke_by_id:
+            return []
         tokens = []
         user_key = self._prefix_user_id(user_id)
         token_list = self._get_user_token_list_with_expiry(user_key)

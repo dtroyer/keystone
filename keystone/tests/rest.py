@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -20,6 +18,7 @@ from lxml import etree
 import six
 import webtest
 
+from keystone.auth import controllers as auth_controllers
 from keystone.common import serializer
 from keystone.openstack.common import jsonutils
 from keystone import tests
@@ -58,6 +57,9 @@ class RestfulTestCase(tests.TestCase):
 
     def setUp(self, app_conf='keystone'):
         super(RestfulTestCase, self).setUp()
+
+        # Will need to reset the plug-ins
+        self.addCleanup(setattr, auth_controllers, 'AUTH_METHODS', {})
 
         self.load_backends()
         self.load_fixtures(default_fixtures)
@@ -101,7 +103,7 @@ class RestfulTestCase(tests.TestCase):
 
         example::
 
-             self.assertResponseSuccessful(response, 203)
+             self.assertResponseSuccessful(response)
         """
         self.assertTrue(
             response.status_code >= 200 and response.status_code <= 299,
@@ -116,7 +118,7 @@ class RestfulTestCase(tests.TestCase):
 
         example::
 
-            self.assertResponseStatus(response, 203)
+            self.assertResponseStatus(response, 204)
         """
         self.assertEqual(
             response.status_code,
@@ -127,6 +129,17 @@ class RestfulTestCase(tests.TestCase):
     def assertValidResponseHeaders(self, response):
         """Ensures that response headers appear as expected."""
         self.assertIn('X-Auth-Token', response.headers.get('Vary'))
+
+    def assertValidErrorResponse(self, response, expected_status=400):
+        """Verify that the error response is valid.
+
+        Subclasses can override this function based on the expected response.
+
+        """
+        self.assertEqual(response.status_code, expected_status)
+        error = response.result['error']
+        self.assertEqual(error['code'], response.status_code)
+        self.assertIsNotNone(error.get('title'))
 
     def _to_content_type(self, body, headers, content_type=None):
         """Attempt to encode JSON and XML automatically."""
@@ -149,16 +162,19 @@ class RestfulTestCase(tests.TestCase):
 
         if response.body is not None and response.body.strip():
             # if a body is provided, a Content-Type is also expected
-            header = response.headers.get('Content-Type', None)
+            header = response.headers.get('Content-Type')
             self.assertIn(content_type, header)
 
             if content_type == 'json':
                 response.result = jsonutils.loads(response.body)
             elif content_type == 'xml':
                 response.result = etree.fromstring(response.body)
+            else:
+                response.result = response.body
 
     def restful_request(self, method='GET', headers=None, body=None,
-                        content_type=None, **kwargs):
+                        content_type=None, response_content_type=None,
+                        **kwargs):
         """Serializes/deserializes json/xml as request/response body.
 
         .. WARNING::
@@ -176,7 +192,8 @@ class RestfulTestCase(tests.TestCase):
         response = self.request(method=method, headers=headers, body=body,
                                 **kwargs)
 
-        self._from_content_type(response, content_type)
+        response_content_type = response_content_type or content_type
+        self._from_content_type(response, content_type=response_content_type)
 
         # we can save some code & improve coverage by always doing this
         if method != 'HEAD' and response.status_code >= 400:

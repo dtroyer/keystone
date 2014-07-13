@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 Red Hat, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -39,12 +37,13 @@ This module provides the following base64 utility functionality:
 
 """
 
-import io
 import re
 import string
-import urllib
 
-from six import moves
+import six
+from six.moves import urllib
+
+from keystone.openstack.common.gettextutils import _
 
 
 class InvalidBase64Error(ValueError):
@@ -155,7 +154,7 @@ def base64_to_base64url(text):
             trailing pad character(s) for use in URL's it can be added back
             using the base64_assure_padding() function.
 
-        This function makes no decisions about which padding methodolgy to
+        This function makes no decisions about which padding methodology to
         use. One can either call base64_strip_padding() to remove any pad
         characters (restoring later with base64_assure_padding()) or call
         base64url_percent_encode() to percent-encode the pad characters.
@@ -241,7 +240,7 @@ def base64url_percent_encode(text):
         raise InvalidBase64Error(_('padded base64url text must be '
                                    'multiple of 4 characters'))
 
-    return urllib.quote(text)
+    return urllib.parse.quote(text)
 
 
 def base64url_percent_decode(text):
@@ -256,7 +255,7 @@ def base64url_percent_decode(text):
     :returns: string -- percent-decoded base64url text
     """
 
-    decoded_text = urllib.unquote(text)
+    decoded_text = urllib.parse.unquote(text)
 
     if len(decoded_text) % 4 != 0:
         raise InvalidBase64Error(_('padded base64url text must be '
@@ -297,11 +296,11 @@ def base64_assure_padding(text, pad='='):
     Base64 text is normally expected to be a multple of 4
     characters. Each 4 character base64 sequence produces 3 octets of
     binary data. If the binary data is not a multiple of 3 the base64
-    text is padded at the end with a pad character such that is is
+    text is padded at the end with a pad character such that it is
     always a multple of 4. Padding is ignored and does not alter the
     binary data nor it's length.
 
-    In some circumstances is is desirable to omit the padding
+    In some circumstances it is desirable to omit the padding
     character due to transport encoding conflicts. Base64 text can
     still be correctly decoded if the length of the base64 text
     (consisting only of characters in the desired base64 alphabet) is
@@ -361,8 +360,8 @@ def base64_wrap_iter(text, width=64):
     :returns: generator -- sequence of lines of base64 text.
     """
 
-    text = unicode(text)
-    for x in moves.range(0, len(text), width):
+    text = six.text_type(text)
+    for x in six.moves.range(0, len(text), width):
         yield text[x:x + width]
 
 
@@ -385,7 +384,7 @@ def base64_wrap(text, width=64):
     :returns: string -- wrapped text.
     """
 
-    buf = io.StringIO()
+    buf = six.StringIO()
 
     for line in base64_wrap_iter(text, width):
         buf.write(line)

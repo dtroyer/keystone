@@ -57,7 +57,7 @@ Interacting with Keystone
 You can interact with Keystone through the command line using
 :doc:`man/keystone-manage` which allows you to initialize keystone, etc.
 
-You can also interact with Keystone through its REST API. There is a python
+You can also interact with Keystone through its REST API. There is a Python
 keystone client library `python-keystoneclient`_ which interacts exclusively
 through the REST API, and which keystone itself uses to provide its
 command-line interface.
@@ -69,6 +69,16 @@ place::
     $ bin/keystone-manage db_sync
 
 .. _`python-keystoneclient`: https://github.com/openstack/python-keystoneclient
+
+If the above commands result in a ``KeyError``, or they fail on a
+``.pyc`` file with the message, ``You can only have one Python script per
+version``, then it is possible that there are out-of-date compiled Python
+bytecode files in the Keystone directory tree that are causing problems. This
+can occur if you have previously installed and ran older versions of Keystone.
+These out-of-date files can be easily removed by running a command like the
+following from the Keystone root project directory::
+
+    $ find . -name "*.pyc" -delete
 
 Database Schema Migrations
 --------------------------
@@ -100,8 +110,9 @@ The directory ``keystone/contrib/example`` contains a sample extension
 migration.
 
 Migrations must be explicitly run for each extension individually. To run a
-migration for a specific extension, run ``keystone-manage --extension <name>
-db_sync``.
+migration for a specific extension, simply run::
+
+    $ keystone-manage db_sync --extension <name>
 
 Initial Sample Data
 -------------------
@@ -134,7 +145,7 @@ The communication of the filter details between the controller level and its
 drivers is handled by the passing of a reference to a Hints object,
 which is a list of dicts describing the filters. A driver that satisfies a
 filter must delete the filter from the Hints object so that when it is returned
-back to the controller level, it knows to only execute any unsatisfied
+to the controller level, it knows to only execute any unsatisfied
 filters.
 
 The contract for a driver for ``list_{entity}`` methods is therefore:
@@ -142,7 +153,45 @@ The contract for a driver for ``list_{entity}`` methods is therefore:
 * It MUST return a list of entities of the specified type
 * It MAY either just return all such entities, or alternatively reduce the
   list by filtering for one or more of the specified filters in the passed
-  Hints reference, and removing any such satisfied filters.
+  Hints reference, and removing any such satisfied filters. An exception to
+  this is that for identity drivers that support domains, then they should
+  at least support filtering by domain_id.
+
+Entity list truncation by drivers
+---------------------------------
+
+Keystone supports the ability for a deployment to restrict the number of
+entries returned from ``list_{entity}`` methods, typically to prevent poorly
+formed searches (e.g. without sufficient filters) from becoming a performance
+issue.
+
+These limits are set in the configuration file, either for a specific driver or
+across all drivers.  These limits are read at the Manager level and passed into
+individual drivers as part of the Hints list object. A driver should try and
+honor any such limit if possible, but if it is unable to do so then it may
+ignore it (and the truncation of the returned list of entities will happen at
+the controller level).
+
+Identity entity ID management between controllers and drivers
+-------------------------------------------------------------
+
+Keystone supports the option of having domain-specific backends for the
+identity driver (i.e. for user and group storage), allowing, for example,
+a different LDAP server for each domain. To ensure that Keystone can determine
+to which backend it should route an API call, starting with Juno, the
+identity manager will, provided that domain-specific backends are enabled,
+build on-the-fly a persistent mapping table between Keystone Public IDs that
+are presented to the controller and the domain that holds the entity, along
+with whatever local ID is understood by the driver.  This hides, for instance,
+the LDAP specifics of whatever ID is being used.
+
+To ensure backward compatibility, the default configuration of either a
+single SQL or LDAP backend for Identity will not use the mapping table,
+meaning that public facing IDs will be the unchanged. If keeping these IDs
+the same for the default LDAP backend is not required, then setting the
+configuration variable ``backward_compatible_ids`` to ``False`` will enable
+the mapping for the default LDAP driver, hence hiding the LDAP specifics of the
+IDs being used.
 
 Testing
 -------
@@ -197,6 +246,23 @@ you'll normally only want to run the test that hits your breakpoint::
 
 For reference, the ``debug`` tox environment implements the instructions
 here: https://wiki.openstack.org/wiki/Testr#Debugging_.28pdb.29_Tests
+
+Disabling Stream Capture
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The stdout, stderr and log messages generated during a test are captured and
+in the event of a test failure those streams will be printed to the terminal
+along with the traceback. The data is discarded for passing tests.
+
+Each stream has an environment variable that can be used to force captured
+data to be discarded even if the test fails: `OS_STDOUT_CAPTURE` for stdout,
+`OS_STDERR_CAPTURE` for stderr and `OS_LOG_CAPTURE` for logging. If the value
+of the environment variable is not one of (True, true, 1, yes) the stream will
+be discarded. All three variables default to 1.
+
+For example, to discard logging data during a test run::
+
+    $ OS_LOG_CAPTURE=0 tox -e py27
 
 Test Structure
 ==============
@@ -269,11 +335,11 @@ devstack_ is the *best* way to quickly deploy keystone with the rest of the
 OpenStack universe and should be critical step in your development workflow!
 
 You may also be interested in either the
-`OpenStack Continuous Integration Project`_ or the
+`OpenStack Continuous Integration Infrastructure`_ or the
 `OpenStack Integration Testing Project`_.
 
 .. _devstack: http://devstack.org/
-.. _OpenStack Continuous Integration Project: https://github.com/openstack/openstack-ci
+.. _OpenStack Continuous Integration Infrastructure: http://ci.openstack.org
 .. _OpenStack Integration Testing Project: https://github.com/openstack/tempest
 
 
@@ -288,9 +354,33 @@ and set environment variables ``KEYSTONE_IDENTITY_BACKEND=ldap`` and
 ``KEYSTONE_CLEAR_LDAP=yes`` in your ``localrc`` file.
 
 The unit tests can be run against a live server with
-``keystone/tests/_ldap_livetest.py``.  The default password is ``test`` but if you have
+``keystone/tests/test_ldap_livetest.py``.  The default password is ``test`` but if you have
 installed devstack with a different LDAP password, modify the file
 ``keystone/tests/backend_liveldap.conf`` to reflect your password.
+
+.. NOTE::
+    To run the live tests you need to set the environment variable ``ENABLE_LDAP_LIVE_TEST``
+    to a non-negative value.
+
+
+Generating Updated Sample Config File
+-------------------------------------
+
+Keystone's sample configuration file ``etc/keystone.conf.sample`` is automatically
+generated based upon all of the options available within Keystone. These options
+are sourced from the many files around Keystone as well as some external libraries.
+
+If new options are added, primarily located in ``keystone.common.config``, a new
+sample configuration file needs to be generated. Generating a new sample configuration
+to be included in a commit run::
+
+    $ tox -esample_config -r
+
+The tox command will place an updated sample config in ``etc/keystone.conf.sample``.
+
+If there is a new external library (e.g. ``oslo.messaging``) that utilizes the
+``oslo.config`` package for configuration, it can be added to the list of libraries
+found in ``tools/config/oslo.config.generator.rc``.
 
 
 Translated responses
@@ -346,7 +436,9 @@ which will provide a reference, to a function, that will consult the global cach
         calling ``should_cache_fn``, the returned function reference will default to enabling
         caching for that ``manager``.
 
-Example use of cache and ``should_cache_fn`` (in this example, ``token`` is the manager)::
+Example use of cache and ``should_cache_fn`` (in this example, ``token`` is the manager):
+
+.. code:: python
 
     from keystone.common import cache
     SHOULD_CACHE = cache.should_cache_fn('token')
@@ -372,7 +464,9 @@ If the ``expiration_time`` argument passed to the decorator is set to ``None``, 
 time will be set to the global default (``expiration_time`` option in the ``[cache]``
 configuration section.
 
-Example of using a section specific ``cache_time`` (in this example, ``identity`` is the manager)::
+Example of using a section specific ``cache_time`` (in this example, ``identity`` is the manager):
+
+.. code:: python
 
     from keystone.common import cache
     SHOULD_CACHE = cache.should_cache_fn('identity')
@@ -387,7 +481,9 @@ For cache invalidation, the ``on_arguments`` decorator will add an ``invalidate`
 (attribute) to your decorated function.  To invalidate the cache, you pass the same arguments
 to the ``invalidate`` method as you would the normal function.
 
-Example (using the above cacheable_function)::
+Example (using the above cacheable_function):
+
+.. code:: python
 
     def invalidate_cache(arg1, arg2, arg3):
         cacheable_function.invalidate(arg1, arg2, arg3)
@@ -411,7 +507,7 @@ backend of the KVS system. The implementation allows for the use of any normal `
 cache backends to be used as a store. All interfacing to the KVS system happens via the
 ``KeyValueStore`` object located at ``keystone.common.kvs.KeyValueStore``.
 
-To utilize the KVS system an instantiation of the ``KeyValueStore`` class is needed. To accquire
+To utilize the KVS system an instantiation of the ``KeyValueStore`` class is needed. To acquire
 a KeyValueStore instantiation use the ``keystone.common.kvs.get_key_value_store`` factory
 function. This factory will either create a new ``KeyValueStore`` object or retrieve the
 already instantiated ``KeyValueStore`` object by the name passed as an argument. The object must
@@ -420,27 +516,78 @@ be configured before use. The KVS object will only be retrievable with the
 Once all references have been removed the object is gone (the registry uses a ``weakref`` to
 match the object to the name).
 
-Example Instantiation and Configuration::
+Example Instantiation and Configuration:
+
+.. code:: python
 
     kvs_store = kvs.get_key_value_store('TestKVSRegion')
     kvs_store.configure('openstack.kvs.Memory', ...)
 
 Any keyword arguments passed to the configure method that are not defined as part of the
 KeyValueStore object configuration are passed to the backend for further configuration (e.g.
-memcache servers, lock_timeout, etc).
+memcached servers, lock_timeout, etc).
 
 The memcached backend uses the Keystone manager mechanism to support the use of any of the
-provided dogpile.cache memcached backends (``BMemcached``, ``pylibmc``, and basic ``Memcached``).
-By default the standard Memcache backend is used.  Currently the Memcache URLs come from the
+provided memcached backends (``bmemcached``, ``pylibmc``, and basic ``memcached``).
+By default the ``memcached`` backend is used.  Currently the Memcache URLs come from the
 ``servers`` option in the ``[memcache]`` configuration section of the Keystone config.
 
-Example configuring the KVS system to use memcached and a specific dogpile.cache memcached backend::
+The following is an example showing how to configure the KVS system to use a
+KeyValueStore object named "TestKVSRegion" and a specific Memcached driver:
+
+.. code:: python
 
     kvs_store = kvs.get_key_value_store('TestKVSRegion')
-    kvs_store.configure('openstack.kvs.Memcached', dogpile_cache_backend='MemcachedBackend')
+    kvs_store.configure('openstack.kvs.Memcached', memcached_backend='Memcached')
+
+The memcached backend supports a mechanism to supply an explicit TTL (in seconds) to all keys
+set via the KVS object. This is accomplished by passing the argument ``memcached_expire_time``
+as a keyword argument to the ``configure`` method. Passing the ``memcache_expire_time`` argument
+will cause the ``time`` argument to be added to all ``set`` and ``set_multi`` calls performed by
+the memcached client. ``memcached_expire_time`` is an argument exclusive to the memcached dogpile
+backend, and will be ignored if passed to another backend:
+
+.. code:: python
+
+    kvs_store.configure('openstack.kvs.Memcached', memcached_backend='Memcached',
+                        memcached_expire_time=86400)
+
+If an explicit TTL is configured via the ``memcached_expire_time`` argument, it is possible to
+exempt specific keys from receiving the TTL by passing the argument ``no_expiry_keys`` (list)
+as a keyword argument to the ``configure`` method. ``no_expiry_keys`` should be supported by
+all OpenStack-specific dogpile backends (memcached) that have the ability to set an explicit TTL:
+
+.. code:: python
+
+    kvs_store.configure('openstack.kvs.Memcached', memcached_backend='Memcached',
+                    memcached_expire_time=86400, no_expiry_keys=['key', 'second_key', ...])
+
+
+.. NOTE::
+    For the non-expiring keys functionality to work, the backend must support the ability for
+    the region to set the key_mangler on it and have the attribute ``raw_no_expiry_keys``.
+    In most cases, support for setting the key_mangler on the backend is handled by allowing
+    the region object to set the ``key_mangler`` attribute on the backend.
+
+    The ``raw_no_expiry_keys`` attribute is expected to be used to hold the values of the
+    keyword argument ``no_expiry_keys`` prior to hashing. It is the responsibility of the
+    backend to use these raw values to determine if a key should be exempt from expiring
+    and not set the TTL on the non-expiring keys when the ``set`` or ``set_multi`` methods are
+    called.
+
+    Typically the key will be hashed by the region using its key_mangler method
+    before being passed to the backend to set the value in the KeyValueStore. This
+    means that in most cases, the backend will need to either pre-compute the hashed versions
+    of the keys (when the key_mangler is set) and store a cached copy, or hash each item in
+    the ``raw_no_expiry_keys`` attribute on each call to ``.set()`` and ``.set_multi()``. The
+    ``memcached`` backend handles this hashing and caching of the keys by utilizing an
+    ``@property`` method for the ``.key_mangler`` attribute on the backend and utilizing the
+    associated ``.settr()`` method to front-load the hashing work at attribute set time.
 
 Once a KVS object has been instantiated the method of interacting is the same as most memcache
-implementations::
+implementations:
+
+.. code:: python
 
     kvs_store = kvs.get_key_value_store('TestKVSRegion')
     kvs_store.configure(...)
@@ -486,11 +633,63 @@ All registered backends will receive the "short name" of "openstack.kvs.<class n
 ``configure`` method on the ``KeyValueStore`` object.  The ``<class name>`` of a backend must be
 globally unique.
 
+dogpile.cache based MongoDB (NoSQL) backend
+--------------------------------------------
+
+The ``dogpile.cache`` based MongoDB backend implementation allows for various MongoDB
+configurations, e.g., standalone, a replica set, sharded replicas, with or without SSL,
+use of TTL type collections, etc.
+
+Example of typical configuration for MongoDB backend:
+
+.. code:: python
+
+    from dogpile.cache import region
+
+    arguments = {
+        'db_hosts': 'localhost:27017',
+        'db_name': 'ks_cache',
+        'cache_collection': 'cache',
+        'username': 'test_user',
+        'password': 'test_password',
+
+        # optional arguments
+        'son_manipulator': 'my_son_manipulator_impl'
+    }
+
+    region.make_region().configure('keystone.cache.mongo',
+                                   arguments=arguments)
+
+The optional `son_manipulator` is used to manipulate custom data type while its saved in
+or retrieved from MongoDB. If the dogpile cached values contain built-in data types and no
+custom classes, then the provided implementation class is sufficient. For further details, refer
+http://api.mongodb.org/python/current/examples/custom_type.html#automatic-encoding-and-decoding
+
+Similar to other backends, this backend can be added via keystone configuration in
+``keystone.conf``::
+
+    [cache]
+    # Global cache functionality toggle.
+    enabled = True
+
+    # Referring to specific cache backend
+    backend = keystone.cache.mongo
+
+    # Backend specific configuration arguments
+    backend_argument = db_hosts:localhost:27017
+    backend_argument = db_name:ks_cache
+    backend_argument = cache_collection:cache
+    backend_argument = username:test_user
+    backend_argument = password:test_password
+
+This backend is registered in ``keystone.common.cache.core`` module. So, its usage
+is similar to other dogpile caching backends as it implements the same dogpile APIs.
+
 
 Building the Documentation
 --------------------------
 
-The documentation is generated with Sphinx uning the tox command.  To create HTML docs and man pages::
+The documentation is generated with Sphinx using the tox command.  To create HTML docs and man pages::
 
     $ tox -e docs
 

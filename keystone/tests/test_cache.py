@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 Metacloud
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -74,9 +72,6 @@ class TestProxyValue(object):
 
 
 class CacheRegionTest(tests.TestCase):
-    def __init__(self, *args, **kwargs):
-        super(CacheRegionTest, self).__init__(*args, **kwargs)
-        self.region = None
 
     def setUp(self):
         super(CacheRegionTest, self).setUp()
@@ -84,6 +79,10 @@ class CacheRegionTest(tests.TestCase):
         cache.configure_cache_region(self.region)
         self.region.wrap(TestProxy)
         self.test_value = TestProxyValue('Decorator Test')
+
+    def _add_test_caching_option(self):
+        self.config_fixture.register_opt(
+            config.config.cfg.BoolOpt('caching', default=True), group='cache')
 
     def _get_cacheable_function(self):
         SHOULD_CACHE_FN = cache.should_cache_fn('cache')
@@ -111,7 +110,7 @@ class CacheRegionTest(tests.TestCase):
         # functions as expected with caching globally enabled.
         cacheable_function = self._get_cacheable_function()
 
-        self.opt_in_group('cache', enabled=True)
+        self.config_fixture.config(group='cache', enabled=True)
         cacheable_function(self.test_value)
         cached_value = cacheable_function(self.test_value)
         self.assertTrue(cached_value.cached)
@@ -121,7 +120,7 @@ class CacheRegionTest(tests.TestCase):
         # functions as expected with caching globally disabled.
         cacheable_function = self._get_cacheable_function()
 
-        self.opt_in_group('cache', enabled=False)
+        self.config_fixture.config(group='cache', enabled=False)
         cacheable_function(self.test_value)
         cached_value = cacheable_function(self.test_value)
         self.assertFalse(cached_value.cached)
@@ -132,10 +131,10 @@ class CacheRegionTest(tests.TestCase):
         # section caching enabled.
         cacheable_function = self._get_cacheable_function()
 
-        self.opt_in_group('cache', enabled=False)
-        # NOTE(morganfainberg): cannot use opt_in_group because 'caching' is a
-        # fabricated setting for tests.
-        setattr(CONF.cache, 'caching', True)
+        self._add_test_caching_option()
+        self.config_fixture.config(group='cache', enabled=False)
+        self.config_fixture.config(group='cache', caching=True)
+
         cacheable_function(self.test_value)
         cached_value = cacheable_function(self.test_value)
         self.assertFalse(cached_value.cached)
@@ -146,10 +145,10 @@ class CacheRegionTest(tests.TestCase):
         # section caching disabled.
         cacheable_function = self._get_cacheable_function()
 
-        self.opt_in_group('cache', enabled=True)
-        # NOTE(morganfainberg): cannot use opt_in_group because 'caching' is a
-        # fabricated setting for tests.
-        setattr(CONF.cache, 'caching', False)
+        self._add_test_caching_option()
+        self.config_fixture.config(group='cache', enabled=True)
+        self.config_fixture.config(group='cache', caching=False)
+
         cacheable_function(self.test_value)
         cached_value = cacheable_function(self.test_value)
         self.assertFalse(cached_value.cached)
@@ -160,32 +159,34 @@ class CacheRegionTest(tests.TestCase):
         # section caching enabled.
         cacheable_function = self._get_cacheable_function()
 
-        self.opt_in_group('cache', enabled=True)
-        # NOTE(morganfainberg): cannot use opt_in_group because 'caching' is a
-        # fabricated setting for tests.
-        setattr(CONF.cache, 'caching', True)
+        self._add_test_caching_option()
+        self.config_fixture.config(group='cache', enabled=True)
+        self.config_fixture.config(group='cache', caching=True)
+
         cacheable_function(self.test_value)
         cached_value = cacheable_function(self.test_value)
         self.assertTrue(cached_value.cached)
 
     def test_cache_dictionary_config_builder(self):
         """Validate we build a sane dogpile.cache dictionary config."""
-        CONF.cache.config_prefix = 'test_prefix'
-        CONF.cache.backend = 'some_test_backend'
-        CONF.cache.expiration_time = 86400
-        CONF.cache.backend_argument = ['arg1:test', 'arg2:test:test',
-                                       'arg3.invalid']
+        self.config_fixture.config(group='cache',
+                                   config_prefix='test_prefix',
+                                   backend='some_test_backend',
+                                   expiration_time=86400,
+                                   backend_argument=['arg1:test',
+                                                     'arg2:test:test',
+                                                     'arg3.invalid'])
 
         config_dict = cache.build_cache_config()
         self.assertEqual(
-            config_dict['test_prefix.backend'], CONF.cache.backend)
+            CONF.cache.backend, config_dict['test_prefix.backend'])
         self.assertEqual(
-            config_dict['test_prefix.expiration_time'],
-            CONF.cache.expiration_time)
-        self.assertEqual(config_dict['test_prefix.arguments.arg1'], 'test')
-        self.assertEqual(config_dict['test_prefix.arguments.arg2'],
-                         'test:test')
-        self.assertFalse('test_prefix.arguments.arg3' in config_dict)
+            CONF.cache.expiration_time,
+            config_dict['test_prefix.expiration_time'])
+        self.assertEqual('test', config_dict['test_prefix.arguments.arg1'])
+        self.assertEqual('test:test',
+                         config_dict['test_prefix.arguments.arg2'])
+        self.assertNotIn('test_prefix.arguments.arg3', config_dict)
 
     def test_cache_debug_proxy(self):
         single_value = 'Test Value'
@@ -215,15 +216,16 @@ class CacheRegionTest(tests.TestCase):
 
 
 class CacheNoopBackendTest(tests.TestCase):
-    def __init__(self, *args, **kwargs):
-        super(CacheNoopBackendTest, self).__init__(*args, **kwargs)
-        self.region = None
 
     def setUp(self):
         super(CacheNoopBackendTest, self).setUp()
         self.region = cache.make_region()
-        setattr(CONF.cache, 'backend', 'keystone.common.cache.noop')
         cache.configure_cache_region(self.region)
+
+    def config_overrides(self):
+        super(CacheNoopBackendTest, self).config_overrides()
+        self.config_fixture.config(group='cache',
+                                   backend='keystone.common.cache.noop')
 
     def test_noop_backend(self):
         single_value = 'Test Value'

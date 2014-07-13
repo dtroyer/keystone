@@ -42,9 +42,9 @@ Bugs and feature requests are tracked on Launchpad at:
 
 Future design work is tracked at:
 
-    https://blueprints.launchpad.net/keystone
+    https://github.com/openstack/keystone-specs
 
-Contributors are encouraged to join IRC (``#openstack-dev`` on freenode):
+Contributors are encouraged to join IRC (``#openstack-keystone`` on freenode):
 
     https://wiki.openstack.org/wiki/IRC
 

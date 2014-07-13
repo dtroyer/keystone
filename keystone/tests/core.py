@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -15,7 +13,8 @@
 # under the License.
 
 from __future__ import absolute_import
-
+import atexit
+import copy
 import functools
 import os
 import re
@@ -27,22 +26,14 @@ import warnings
 
 import fixtures
 import logging
+import oslotest.base as oslotest
+from oslotest import mockpatch
 from paste import deploy
 import six
-import testtools
 from testtools import testcase
-
+import webob
 
 from keystone.openstack.common import gettextutils
-
-# NOTE(blk-u):
-# gettextutils.install() must run to set _ before importing any modules that
-# contain static translated strings.
-#
-# Configure gettextutils for deferred translation of messages
-# so that error messages in responses can be translated according to the
-# Accept-Language in the request rather than the Keystone server locale.
-gettextutils.install('keystone', lazy=True)
 
 # NOTE(ayoung)
 # environment.use_eventlet must run before any of the code that will
@@ -50,20 +41,19 @@ gettextutils.install('keystone', lazy=True)
 from keystone.common import environment
 environment.use_eventlet()
 
-from keystone.common import cache
+from keystone import auth
+from keystone import backends
 from keystone.common import dependency
 from keystone.common import kvs
 from keystone.common.kvs import core as kvs_core
-from keystone.common import sql
-from keystone.common import utils
-from keystone.common import wsgi
+from keystone.common import utils as common_utils
 from keystone import config
 from keystone import exception
 from keystone import notifications
-from keystone.openstack.common.db.sqlalchemy import session
+from keystone.openstack.common.fixture import config as config_fixture
+from keystone.openstack.common.gettextutils import _
 from keystone.openstack.common import log
-from keystone.openstack.common import timeutils
-from keystone import service
+from keystone.tests import ksfixtures
 
 # NOTE(dstanek): Tests inheriting from TestCase depend on having the
 #   policy_file command-line option declared before setUp runs. Importing the
@@ -75,15 +65,30 @@ config.configure()
 
 
 LOG = log.getLogger(__name__)
+PID = six.text_type(os.getpid())
 TESTSDIR = os.path.dirname(os.path.abspath(__file__))
+TESTCONF = os.path.join(TESTSDIR, 'config_files')
 ROOTDIR = os.path.normpath(os.path.join(TESTSDIR, '..', '..'))
 VENDOR = os.path.join(ROOTDIR, 'vendor')
 ETCDIR = os.path.join(ROOTDIR, 'etc')
-TMPDIR = os.path.join(TESTSDIR, 'tmp')
+
+
+def _calc_tmpdir():
+    env_val = os.environ.get('KEYSTONE_TEST_TEMP_DIR')
+    if not env_val:
+        return os.path.join(TESTSDIR, 'tmp', PID)
+    return os.path.join(env_val, PID)
+
+
+TMPDIR = _calc_tmpdir()
 
 CONF = config.CONF
 
+IN_MEM_DB_CONN_STRING = 'sqlite://'
+
 exception._FATAL_EXCEPTION_FORMAT_ERRORS = True
+os.makedirs(TMPDIR)
+atexit.register(shutil.rmtree, TMPDIR)
 
 
 class dirs:
@@ -103,16 +108,13 @@ class dirs:
     def tmp(*p):
         return os.path.join(TMPDIR, *p)
 
+    @staticmethod
+    def tests_conf(*p):
+        return os.path.join(TESTCONF, *p)
+
 
 # keystone.common.sql.initialize() for testing.
-def _initialize_sql_session():
-    db_file = dirs.tmp('test.db')
-    session.set_defaults(
-        sql_connection="sqlite:///" + db_file,
-        sqlite_db=db_file)
-
-
-_initialize_sql_session()
+DEFAULT_TEST_DB_FILE = dirs.tmp('test.db')
 
 
 def checkout_vendor(repo, rev):
@@ -131,12 +133,12 @@ def checkout_vendor(repo, rev):
                 return revdir
 
         if not os.path.exists(revdir):
-            utils.git('clone', repo, revdir)
+            common_utils.git('clone', repo, revdir)
 
         os.chdir(revdir)
-        utils.git('checkout', '-q', 'master')
-        utils.git('pull', '-q')
-        utils.git('checkout', '-q', rev)
+        common_utils.git('checkout', '-q', 'master')
+        common_utils.git('pull', '-q')
+        common_utils.git('checkout', '-q', rev)
 
         # write out a modified time
         with open(modcheck, 'w') as fd:
@@ -147,20 +149,14 @@ def checkout_vendor(repo, rev):
     return revdir
 
 
-def setup_database():
+@atexit.register
+def remove_test_databases():
     db = dirs.tmp('test.db')
+    if os.path.exists(db):
+        os.unlink(db)
     pristine = dirs.tmp('test.db.pristine')
-
-    try:
-        if os.path.exists(db):
-            os.unlink(db)
-        if not os.path.exists(pristine):
-            sql.migration.db_sync()
-            shutil.copyfile(db, pristine)
-        else:
-            shutil.copyfile(pristine, db)
-    except Exception:
-        pass
+    if os.path.exists(pristine):
+        os.unlink(pristine)
 
 
 def generate_paste_config(extension_name):
@@ -183,10 +179,6 @@ def remove_generated_paste_config(extension_name):
     # Remove the generated paste config file, named extension_name.ini
     paste_file_to_remove = dirs.tmp(extension_name + '.ini')
     os.remove(paste_file_to_remove)
-
-
-def teardown_database():
-    session.cleanup()
 
 
 def skip_if_cache_disabled(*sections):
@@ -224,6 +216,10 @@ def skip_if_cache_disabled(*sections):
     return wrapper
 
 
+class UnexpectedExit(Exception):
+    pass
+
+
 class TestClient(object):
     def __init__(self, app=None, token=None):
         self.app = app
@@ -236,7 +232,7 @@ class TestClient(object):
         if self.token:
             headers.setdefault('X-Auth-Token', self.token)
 
-        req = wsgi.Request.blank(path)
+        req = webob.Request.blank(path)
         req.method = method
         for k, v in six.iteritems(headers):
             req.headers[k] = v
@@ -265,10 +261,15 @@ class NoModule(object):
         def cleanup_finders():
             for finder in self._finders:
                 sys.meta_path.remove(finder)
+            del self._finders
         self.addCleanup(cleanup_finders)
 
         self._cleared_modules = {}
-        self.addCleanup(sys.modules.update, self._cleared_modules)
+
+        def cleanup_modules():
+            sys.modules.update(self._cleared_modules)
+            del self._cleared_modules
+        self.addCleanup(cleanup_modules)
 
     def clear_module(self, module):
         cleared_modules = {}
@@ -294,9 +295,90 @@ class NoModule(object):
         sys.meta_path.insert(0, finder)
 
 
-class TestCase(testtools.TestCase):
+class BaseTestCase(oslotest.BaseTestCase):
+    """Light weight base test class.
+
+    This is a placeholder that will eventually go away once thc
+    setup/teardown in TestCase is properly trimmed down to the bare
+    essentials. This is really just a play to speed up the tests by
+    eliminating unnecessary work.
+    """
+
+    def cleanup_instance(self, *names):
+        """Create a function suitable for use with self.addCleanup.
+
+        :returns: a callable that uses a closure to delete instance attributes
+
+        """
+        def cleanup():
+            for name in names:
+                # TODO(dstanek): remove this 'if' statement once
+                # load_backend in test_backend_ldap is only called once
+                # per test
+                if hasattr(self, name):
+                    delattr(self, name)
+        return cleanup
+
+
+@dependency.optional('revoke_api')
+class TestCase(BaseTestCase):
+
+    _config_file_list = []
+
+    def config_files(self):
+        return copy.copy(self._config_file_list)
+
+    def config_overrides(self):
+        # Exercise multiple worker process code paths
+        self.config_fixture.config(public_workers=2)
+        self.config_fixture.config(admin_workers=2)
+        self.config_fixture.config(policy_file=dirs.etc('policy.json'))
+        self.config_fixture.config(
+            group='auth',
+            methods=['keystone.auth.plugins.external.DefaultDomain',
+                     'keystone.auth.plugins.password.Password',
+                     'keystone.auth.plugins.token.Token',
+                     'keystone.auth.plugins.oauth1.OAuth',
+                     'keystone.auth.plugins.saml2.Saml2'])
+        self.config_fixture.config(
+            # TODO(morganfainberg): Make Cache Testing a separate test case
+            # in tempest, and move it out of the base unit tests.
+            group='cache',
+            backend='dogpile.cache.memory',
+            enabled=True,
+            proxies=['keystone.tests.test_cache.CacheIsolatingProxy'])
+        self.config_fixture.config(
+            group='catalog',
+            driver='keystone.catalog.backends.templated.Catalog',
+            template_file=dirs.tests('default_catalog.templates'))
+        self.config_fixture.config(
+            group='identity',
+            driver='keystone.identity.backends.kvs.Identity')
+        self.config_fixture.config(
+            group='kvs',
+            backends=[
+                'keystone.tests.test_kvs.KVSBackendForcedKeyMangleFixture',
+                'keystone.tests.test_kvs.KVSBackendFixture'])
+        self.config_fixture.config(
+            group='revoke',
+            driver='keystone.contrib.revoke.backends.kvs.Revoke')
+        self.config_fixture.config(
+            group='signing',
+            certfile='examples/pki/certs/signing_cert.pem',
+            keyfile='examples/pki/private/signing_key.pem',
+            ca_certs='examples/pki/certs/cacert.pem')
+        self.config_fixture.config(
+            group='token',
+            driver='keystone.token.backends.kvs.Token')
+        self.config_fixture.config(
+            group='trust',
+            driver='keystone.trust.backends.kvs.Trust')
+
     def setUp(self):
         super(TestCase, self).setUp()
+        self.addCleanup(self.cleanup_instance(
+            '_paths', '_memo', '_overrides', '_group_overrides', 'maxDiff',
+            'exit_patch', 'config_fixture', 'logger'))
 
         self._paths = []
 
@@ -315,21 +397,16 @@ class TestCase(testtools.TestCase):
 
         self.addCleanup(CONF.reset)
 
-        self.config([dirs.etc('keystone.conf.sample'),
-                     dirs.tests('test_overrides.conf')])
+        self.exit_patch = self.useFixture(mockpatch.PatchObject(sys, 'exit'))
+        self.exit_patch.mock.side_effect = UnexpectedExit
+        self.config_fixture = self.useFixture(config_fixture.Config(CONF))
+        self.config(self.config_files())
 
-        self.opt(policy_file=dirs.etc('policy.json'))
-
-        # NOTE(morganfainberg):  The only way to reconfigure the
-        # CacheRegion object on each setUp() call is to remove the
-        # .backend property.
-        self.addCleanup(delattr, cache.REGION, 'backend')
-
-        # ensure the cache region instance is setup
-        cache.configure_cache_region(cache.REGION)
+        self.config_overrides()
 
         self.logger = self.useFixture(fixtures.FakeLogger(level=logging.DEBUG))
         warnings.filterwarnings('ignore', category=DeprecationWarning)
+        self.useFixture(ksfixtures.Cache())
 
         # Clear the registry of providers so that providers from previous
         # tests aren't used.
@@ -337,21 +414,15 @@ class TestCase(testtools.TestCase):
 
         self.addCleanup(kvs.INMEMDB.clear)
 
-        self.addCleanup(timeutils.clear_time_override)
-
         # Ensure Notification subscriotions and resource types are empty
-        self.addCleanup(notifications.SUBSCRIBERS.clear)
+        self.addCleanup(notifications.clear_subscribers)
+        self.addCleanup(notifications.reset_notifier)
+
+        # Reset the auth-plugin registry
+        self.addCleanup(self.clear_auth_plugin_registry)
 
     def config(self, config_files):
         CONF(args=[], project='keystone', default_config_files=config_files)
-
-    def opt_in_group(self, group, **kw):
-        for k, v in six.iteritems(kw):
-            CONF.set_override(k, v, group)
-
-    def opt(self, **kw):
-        for k, v in six.iteritems(kw):
-            CONF.set_override(k, v)
 
     def load_backends(self):
         """Initializes each manager and assigns them to an attribute."""
@@ -367,20 +438,14 @@ class TestCase(testtools.TestCase):
         # should eventually be removed once testing has been cleaned up.
         kvs_core.KEY_VALUE_STORE_REGISTRY.clear()
 
-        drivers = service.load_backends()
+        self.clear_auth_plugin_registry()
+        drivers = backends.load_backends()
 
-        # TODO(stevemar): currently, load oauth1 driver as well, eventually
-        # we need to have this as optional.
-        from keystone.contrib import oauth1
-        drivers['oauth1_api'] = oauth1.Manager()
-
-        from keystone.contrib import federation
-        drivers['federation_api'] = federation.Manager()
-
-        dependency.resolve_future_dependencies()
+        drivers.update(dependency.resolve_future_dependencies())
 
         for manager_name, manager in six.iteritems(drivers):
             setattr(self, manager_name, manager)
+        self.addCleanup(self.cleanup_instance(*drivers.keys()))
 
     def load_fixtures(self, fixtures):
         """Hacky basic and naive fixture loading based on a python module.
@@ -389,6 +454,10 @@ class TestCase(testtools.TestCase):
         defined on `self`.
 
         """
+        # NOTE(dstanek): create a list of attribute names to be removed
+        # from this instance during cleanup
+        fixtures_to_cleanup = []
+
         # TODO(termie): doing something from json, probably based on Django's
         #               loaddata will be much preferred.
         if hasattr(self, 'identity_api') and hasattr(self, 'assignment_api'):
@@ -400,40 +469,64 @@ class TestCase(testtools.TestCase):
                     rv = self.assignment_api.get_domain(domain['id'])
                 except exception.NotImplemented:
                     rv = domain
-                setattr(self, 'domain_%s' % domain['id'], rv)
+                attrname = 'domain_%s' % domain['id']
+                setattr(self, attrname, rv)
+                fixtures_to_cleanup.append(attrname)
 
             for tenant in fixtures.TENANTS:
-                try:
-                    rv = self.assignment_api.create_project(
-                        tenant['id'], tenant)
-                except exception.Conflict:
-                    rv = self.assignment_api.get_project(tenant['id'])
-                    pass
-                setattr(self, 'tenant_%s' % tenant['id'], rv)
+                if hasattr(self, 'tenant_%s' % tenant['id']):
+                    try:
+                        # This will clear out any roles on the project as well
+                        self.assignment_api.delete_project(tenant['id'])
+                    except exception.ProjectNotFound:
+                        pass
+                rv = self.assignment_api.create_project(
+                    tenant['id'], tenant)
+
+                attrname = 'tenant_%s' % tenant['id']
+                setattr(self, attrname, rv)
+                fixtures_to_cleanup.append(attrname)
 
             for role in fixtures.ROLES:
                 try:
                     rv = self.assignment_api.create_role(role['id'], role)
                 except exception.Conflict:
                     rv = self.assignment_api.get_role(role['id'])
-                    pass
-                setattr(self, 'role_%s' % role['id'], rv)
+                attrname = 'role_%s' % role['id']
+                setattr(self, attrname, rv)
+                fixtures_to_cleanup.append(attrname)
 
             for user in fixtures.USERS:
                 user_copy = user.copy()
                 tenants = user_copy.pop('tenants')
                 try:
-                    rv = self.identity_api.create_user(user['id'],
-                                                       user_copy.copy())
-                except exception.Conflict:
+                    existing_user = getattr(self, 'user_%s' % user['id'], None)
+                    if existing_user is not None:
+                        self.identity_api.delete_user(existing_user['id'])
+                except exception.UserNotFound:
                     pass
+
+                # For users, the manager layer will generate the ID
+                user_copy = self.identity_api.create_user(user_copy)
+                # Our tests expect that the password is still in the user
+                # record so that they can reference it, so put it back into
+                # the dict returned.
+                user_copy['password'] = user['password']
+
                 for tenant_id in tenants:
                     try:
-                        self.assignment_api.add_user_to_project(tenant_id,
-                                                                user['id'])
+                        self.assignment_api.add_user_to_project(
+                            tenant_id, user_copy['id'])
                     except exception.Conflict:
                         pass
-                setattr(self, 'user_%s' % user['id'], user_copy)
+                # Use the ID from the fixture as the attribute name, so
+                # that our tests can easily reference each user dict, while
+                # the ID in the dict will be the real public ID.
+                attrname = 'user_%s' % user['id']
+                setattr(self, attrname, user_copy)
+                fixtures_to_cleanup.append(attrname)
+
+            self.addCleanup(self.cleanup_instance(*fixtures_to_cleanup))
 
     def _paste_config(self, config):
         if not config.startswith('config:'):
@@ -454,6 +547,10 @@ class TestCase(testtools.TestCase):
         sys.path.insert(0, path)
         self._paths.append(path)
 
+    def clear_auth_plugin_registry(self):
+        auth.controllers.AUTH_METHODS.clear()
+        auth.controllers.AUTH_PLUGINS_LOADED = False
+
     def assertCloseEnoughForGovernmentWork(self, a, b, delta=3):
         """Asserts that two datetimes are nearly equal within a small delta.
 
@@ -467,8 +564,8 @@ class TestCase(testtools.TestCase):
         self.assertTrue(len(l))
 
     def assertDictEqual(self, d1, d2, msg=None):
-        self.assertTrue(isinstance(d1, dict), 'First argument is not a dict')
-        self.assertTrue(isinstance(d2, dict), 'Second argument is not a dict')
+        self.assertIsInstance(d1, dict)
+        self.assertIsInstance(d2, dict)
         self.assertEqual(d1, d2, msg)
 
     def assertRaisesRegexp(self, expected_exception, expected_regexp,
@@ -482,10 +579,10 @@ class TestCase(testtools.TestCase):
                 expected_regexp = re.compile(expected_regexp)
 
             if isinstance(exc_value.args[0], gettextutils.Message):
-                if not expected_regexp.search(unicode(exc_value)):
+                if not expected_regexp.search(six.text_type(exc_value)):
                     raise self.failureException(
                         '"%s" does not match "%s"' %
-                        (expected_regexp.pattern, unicode(exc_value)))
+                        (expected_regexp.pattern, six.text_type(exc_value)))
             else:
                 if not expected_regexp.search(str(exc_value)):
                     raise self.failureException(
@@ -496,7 +593,7 @@ class TestCase(testtools.TestCase):
                 excName = expected_exception.__name__
             else:
                 excName = str(expected_exception)
-            raise self.failureException, "%s not raised" % excName
+            raise self.failureException("%s not raised" % excName)
 
     def assertDictContainsSubset(self, expected, actual, msg=None):
         """Checks whether actual is a superset of expected."""
@@ -555,6 +652,10 @@ class TestCase(testtools.TestCase):
         if not self.ipv6_enabled:
             raise self.skipTest("IPv6 is not enabled in the system")
 
+    def skip_if_env_not_set(self, env_var):
+        if not os.environ.get(env_var):
+            self.skipTest('Env variable %s is not set.' % env_var)
+
     def assertSetEqual(self, set1, set2, msg=None):
         # TODO(morganfainberg): Remove this and self._assertSetEqual once
         # support for python 2.6 is no longer needed.
@@ -607,3 +708,31 @@ class TestCase(testtools.TestCase):
 
         standardMsg = '\n'.join(lines)
         self.fail(self._formatMessage(msg, standardMsg))
+
+
+class SQLDriverOverrides(object):
+    """A mixin for consolidating sql-specific test overrides."""
+    def config_overrides(self):
+        super(SQLDriverOverrides, self).config_overrides()
+        # SQL specific driver overrides
+        self.config_fixture.config(
+            group='catalog',
+            driver='keystone.catalog.backends.sql.Catalog')
+        self.config_fixture.config(
+            group='ec2',
+            driver='keystone.contrib.ec2.backends.sql.Ec2')
+        self.config_fixture.config(
+            group='identity',
+            driver='keystone.identity.backends.sql.Identity')
+        self.config_fixture.config(
+            group='policy',
+            driver='keystone.policy.backends.sql.Policy')
+        self.config_fixture.config(
+            group='revoke',
+            driver='keystone.contrib.revoke.backends.sql.Revoke')
+        self.config_fixture.config(
+            group='token',
+            driver='keystone.token.backends.sql.Token')
+        self.config_fixture.config(
+            group='trust',
+            driver='keystone.trust.backends.sql.Trust')

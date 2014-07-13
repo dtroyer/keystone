@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -20,8 +18,6 @@
 
 """Utility methods for working with WSGI servers."""
 
-import re
-
 import routes.middleware
 import six
 import webob.dec
@@ -32,6 +28,7 @@ from keystone.common import dependency
 from keystone.common import utils
 from keystone import exception
 from keystone.openstack.common import gettextutils
+from keystone.openstack.common.gettextutils import _
 from keystone.openstack.common import importutils
 from keystone.openstack.common import jsonutils
 from keystone.openstack.common import log
@@ -46,10 +43,6 @@ CONTEXT_ENV = 'openstack.context'
 
 # Environment variable used to pass the request params
 PARAMS_ENV = 'openstack.params'
-
-
-_RE_PASS = re.compile(r'([\'"].*?password[\'"]\s*:\s*u?[\'"]).*?([\'"])',
-                      re.DOTALL)
 
 
 def validate_token_bind(context, token_ref):
@@ -92,8 +85,8 @@ def validate_token_bind(context, token_ref):
             LOG.info(_("Kerberos bind authentication successful"))
 
         elif bind_mode == 'permissive':
-            LOG.debug(_("Ignoring unknown bind for permissive mode: "
-                        "{%(bind_type)s: %(identifier)s}"),
+            LOG.debug(("Ignoring unknown bind for permissive mode: "
+                       "{%(bind_type)s: %(identifier)s}"),
                       {'bind_type': bind_type, 'identifier': identifier})
         else:
             LOG.info(_("Couldn't verify unknown bind: "
@@ -102,16 +95,15 @@ def validate_token_bind(context, token_ref):
             raise exception.Unauthorized()
 
 
-class Request(webob.Request):
-    def best_match_language(self):
-        """Determines the best available locale from the Accept-Language
-        HTTP header passed in the request.
-        """
+def best_match_language(req):
+    """Determines the best available locale from the Accept-Language
+    HTTP header passed in the request.
+    """
 
-        if not self.accept_language:
-            return None
-        return self.accept_language.best_match(
-            gettextutils.get_available_languages('keystone'))
+    if not req.accept_language:
+        return None
+    return req.accept_language.best_match(
+        gettextutils.get_available_languages('keystone'))
 
 
 class BaseApplication(object):
@@ -145,7 +137,7 @@ class BaseApplication(object):
     def __call__(self, environ, start_response):
         r"""Subclasses will probably want to implement __call__ like this:
 
-        @webob.dec.wsgify(RequestClass=Request)
+        @webob.dec.wsgify()
         def __call__(self, req):
           # Any of the following objects work as responses:
 
@@ -153,7 +145,7 @@ class BaseApplication(object):
           res = 'message\n'
 
           # Option 2: a nicely formatted HTTP exception page
-          res = exc.HTTPForbidden(detail='Nice try')
+          res = exc.HTTPForbidden(explanation='Nice try')
 
           # Option 3: a webob Response object (in case you need to play with
           # headers, or you want to be treated like an iterable, or or or)
@@ -181,22 +173,23 @@ class BaseApplication(object):
 
 @dependency.requires('assignment_api', 'policy_api', 'token_api')
 class Application(BaseApplication):
-    @webob.dec.wsgify(RequestClass=Request)
+    @webob.dec.wsgify()
     def __call__(self, req):
         arg_dict = req.environ['wsgiorg.routing_args'][1]
         action = arg_dict.pop('action')
         del arg_dict['controller']
-        LOG.debug(_('arg_dict: %s'), arg_dict)
+        LOG.debug('arg_dict: %s', arg_dict)
 
         # allow middleware up the stack to provide context, params and headers.
         context = req.environ.get(CONTEXT_ENV, {})
         context['query_string'] = dict(six.iteritems(req.params))
         context['headers'] = dict(six.iteritems(req.headers))
         context['path'] = req.environ['PATH_INFO']
+        context['host_url'] = req.host_url
         params = req.environ.get(PARAMS_ENV, {})
-        #authentication and authorization attributes are set as environment
-        #values by the container and processed by the pipeline.  the complete
-        #set is not yet know.
+        # authentication and authorization attributes are set as environment
+        # values by the container and processed by the pipeline.  the complete
+        # set is not yet know.
         context['environment'] = req.environ
         req.environ = None
 
@@ -207,6 +200,11 @@ class Application(BaseApplication):
         # TODO(termie): do some basic normalization on methods
         method = getattr(self, action)
 
+        # NOTE(morganfainberg): use the request method to normalize the
+        # response code between GET and HEAD requests. The HTTP status should
+        # be the same.
+        req_method = req.environ['REQUEST_METHOD'].upper()
+
         # NOTE(vish): make sure we have no unicode keys for py2.6.
         params = self._normalize_dict(params)
 
@@ -216,18 +214,22 @@ class Application(BaseApplication):
             LOG.warning(
                 _('Authorization failed. %(exception)s from %(remote_addr)s'),
                 {'exception': e, 'remote_addr': req.environ['REMOTE_ADDR']})
-            return render_exception(e, user_locale=req.best_match_language())
+            return render_exception(e, context=context,
+                                    user_locale=best_match_language(req))
         except exception.Error as e:
             LOG.warning(e)
-            return render_exception(e, user_locale=req.best_match_language())
+            return render_exception(e, context=context,
+                                    user_locale=best_match_language(req))
         except TypeError as e:
             LOG.exception(e)
             return render_exception(exception.ValidationError(e),
-                                    user_locale=req.best_match_language())
+                                    context=context,
+                                    user_locale=best_match_language(req))
         except Exception as e:
             LOG.exception(e)
             return render_exception(exception.UnexpectedError(exception=e),
-                                    user_locale=req.best_match_language())
+                                    context=context,
+                                    user_locale=best_match_language(req))
 
         if result is None:
             return render_response(status=(204, 'No Content'))
@@ -239,7 +241,8 @@ class Application(BaseApplication):
             return result
 
         response_code = self._get_response_code(req)
-        return render_response(body=result, status=response_code)
+        return render_response(body=result, status=response_code,
+                               method=req_method)
 
     def _get_response_code(self, req):
         req_method = req.environ['REQUEST_METHOD']
@@ -284,18 +287,45 @@ class Application(BaseApplication):
             # Accept either is_admin or the admin role
             self.policy_api.enforce(creds, 'admin_required', {})
 
-    def _require_attribute(self, ref, attr):
-        """Ensures the reference contains the specified attribute."""
-        if ref.get(attr) is None or ref.get(attr) == '':
-            msg = '%s field is required and cannot be empty' % attr
+    def _attribute_is_empty(self, ref, attribute):
+        """Returns true if the attribute in the given ref (which is a
+        dict) is empty or None.
+        """
+        return ref.get(attribute) is None or ref.get(attribute) == ''
+
+    def _require_attribute(self, ref, attribute):
+        """Ensures the reference contains the specified attribute.
+
+        Raise a ValidationError if the given attribute is not present
+        """
+        if self._attribute_is_empty(ref, attribute):
+            msg = _('%s field is required and cannot be empty') % attribute
+            raise exception.ValidationError(message=msg)
+
+    def _require_attributes(self, ref, attrs):
+        """Ensures the reference contains the specified attributes.
+
+        Raise a ValidationError if any of the given attributes is not present
+        """
+        missing_attrs = [attribute for attribute in attrs
+                         if self._attribute_is_empty(ref, attribute)]
+
+        if missing_attrs:
+            msg = _('%s field(s) cannot be empty') % ', '.join(missing_attrs)
             raise exception.ValidationError(message=msg)
 
     def _get_trust_id_for_request(self, context):
         """Get the trust_id for a call.
 
         Retrieve the trust_id from the token
-        Returns None if token is is not trust scoped
+        Returns None if token is not trust scoped
         """
+        if ('token_id' not in context or
+                context.get('token_id') == CONF.admin_token):
+            LOG.debug(('will not lookup trust as the request auth token is '
+                       'either absent or it is the system admin token'))
+            return None
+
         try:
             token_ref = self.token_api.get_token(context['token_id'])
         except exception.TokenNotFound:
@@ -303,6 +333,22 @@ class Application(BaseApplication):
             raise exception.Unauthorized()
 
         return token_ref.get('trust_id')
+
+    @classmethod
+    def base_url(cls, context, endpoint_type):
+        url = CONF['%s_endpoint' % endpoint_type]
+
+        if url:
+            url = url % CONF
+        else:
+            # NOTE(jamielennox): if url is not set via the config file we
+            # should set it relative to the url that the user used to get here
+            # so as not to mess with version discovery. This is not perfect.
+            # host_url omits the path prefix, but there isn't another good
+            # solution that will work for all urls.
+            url = context['host_url']
+
+        return url.rstrip('/')
 
 
 class Middleware(Application):
@@ -345,6 +391,7 @@ class Middleware(Application):
         return _factory
 
     def __init__(self, application):
+        super(Middleware, self).__init__()
         self.application = application
 
     def process_request(self, request):
@@ -361,7 +408,7 @@ class Middleware(Application):
         """Do whatever you'd like to the response, based on the request."""
         return response
 
-    @webob.dec.wsgify(RequestClass=Request)
+    @webob.dec.wsgify()
     def __call__(self, request):
         try:
             response = self.process_request(request)
@@ -371,16 +418,18 @@ class Middleware(Application):
             return self.process_response(request, response)
         except exception.Error as e:
             LOG.warning(e)
-            return render_exception(e,
-                                    user_locale=request.best_match_language())
+            return render_exception(e, request=request,
+                                    user_locale=best_match_language(request))
         except TypeError as e:
             LOG.exception(e)
             return render_exception(exception.ValidationError(e),
-                                    user_locale=request.best_match_language())
+                                    request=request,
+                                    user_locale=best_match_language(request))
         except Exception as e:
             LOG.exception(e)
             return render_exception(exception.UnexpectedError(exception=e),
-                                    user_locale=request.best_match_language())
+                                    request=request,
+                                    user_locale=best_match_language(request))
 
 
 class Debug(Middleware):
@@ -391,7 +440,7 @@ class Debug(Middleware):
 
     """
 
-    @webob.dec.wsgify(RequestClass=Request)
+    @webob.dec.wsgify()
     def __call__(self, req):
         if not hasattr(LOG, 'isEnabledFor') or LOG.isEnabledFor(LOG.debug):
             LOG.debug('%s %s %s', ('*' * 20), 'REQUEST ENVIRON', ('*' * 20))
@@ -455,7 +504,7 @@ class Router(object):
         self._router = routes.middleware.RoutesMiddleware(self._dispatch,
                                                           self.map)
 
-    @webob.dec.wsgify(RequestClass=Request)
+    @webob.dec.wsgify()
     def __call__(self, req):
         """Route the incoming request to a controller based on self.map.
 
@@ -465,7 +514,7 @@ class Router(object):
         return self._router
 
     @staticmethod
-    @webob.dec.wsgify(RequestClass=Request)
+    @webob.dec.wsgify()
     def _dispatch(req):
         """Dispatch the request to the appropriate controller.
 
@@ -476,9 +525,10 @@ class Router(object):
         """
         match = req.environ['wsgiorg.routing_args'][1]
         if not match:
-            return render_exception(
-                exception.NotFound(_('The resource could not be found.')),
-                user_locale=req.best_match_language())
+            msg = _('The resource could not be found.')
+            return render_exception(exception.NotFound(msg),
+                                    request=req,
+                                    user_locale=best_match_language(req))
         app = match['controller']
         return app
 
@@ -554,25 +604,51 @@ class ExtensionRouter(Router):
         return _factory
 
 
-def render_response(body=None, status=None, headers=None):
+def render_response(body=None, status=None, headers=None, method=None):
     """Forms a WSGI response."""
-    headers = headers or []
+    if headers is None:
+        headers = []
+    else:
+        headers = list(headers)
     headers.append(('Vary', 'X-Auth-Token'))
 
     if body is None:
         body = ''
         status = status or (204, 'No Content')
     else:
-        body = jsonutils.dumps(body, cls=utils.SmarterEncoder)
-        headers.append(('Content-Type', 'application/json'))
+        content_types = [v for h, v in headers if h == 'Content-Type']
+        if content_types:
+            content_type = content_types[0]
+        else:
+            content_type = None
+        if content_type is None or content_type == 'application/json':
+            body = jsonutils.dumps(body, cls=utils.SmarterEncoder)
+            if content_type is None:
+                headers.append(('Content-Type', 'application/json'))
         status = status or (200, 'OK')
 
-    return webob.Response(body=body,
+    resp = webob.Response(body=body,
                           status='%s %s' % status,
                           headerlist=headers)
 
+    if method == 'HEAD':
+        # NOTE(morganfainberg): HEAD requests should return the same status
+        # as a GET request and same headers (including content-type and
+        # content-length). The webob.Response object automatically changes
+        # content-length (and other headers) if the body is set to b''. Capture
+        # all headers and reset them on the response object after clearing the
+        # body. The body can only be set to a binary-type (not TextType or
+        # NoneType), so b'' is used here and should be compatible with
+        # both py2x and py3x.
+        stored_headers = resp.headers.copy()
+        resp.body = b''
+        for header, value in six.iteritems(stored_headers):
+            resp.headers[header] = value
 
-def render_exception(error, user_locale=None):
+    return resp
+
+
+def render_exception(error, context=None, request=None, user_locale=None):
     """Forms a WSGI response based on the current error."""
 
     error_message = error.args[0]
@@ -591,9 +667,18 @@ def render_exception(error, user_locale=None):
     if isinstance(error, exception.AuthPluginException):
         body['error']['identity'] = error.authentication
     elif isinstance(error, exception.Unauthorized):
-        headers.append(('WWW-Authenticate',
-                        'Keystone uri="%s"' % (
-                            CONF.public_endpoint % CONF)))
+        url = CONF.public_endpoint
+        if not url:
+            if request:
+                context = {'host_url': request.host_url}
+            if context:
+                url = Application.base_url(context, 'public')
+            else:
+                url = 'http://localhost:%d' % CONF.public_port
+        else:
+            url = url % CONF
+
+        headers.append(('WWW-Authenticate', 'Keystone uri="%s"' % url))
     return render_response(status=(error.code, error.title),
                            body=body,
                            headers=headers)

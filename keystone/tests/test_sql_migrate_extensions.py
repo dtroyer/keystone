@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -33,11 +31,13 @@ To run these tests against a live database:
    all data will be lost.
 """
 
+from oslo.db.sqlalchemy import utils
 
 from keystone.contrib import endpoint_filter
 from keystone.contrib import example
 from keystone.contrib import federation
 from keystone.contrib import oauth1
+from keystone.contrib import revoke
 from keystone.tests import test_sql_upgrade
 
 
@@ -140,8 +140,8 @@ class EndpointFilterExtension(test_sql_upgrade.SqlMigrateBase):
 class FederationExtension(test_sql_upgrade.SqlMigrateBase):
     """Test class for ensuring the Federation SQL."""
 
-    def __init__(self, *args, **kwargs):
-        super(FederationExtension, self).__init__(*args, **kwargs)
+    def setUp(self):
+        super(FederationExtension, self).setUp()
         self.identity_provider = 'identity_provider'
         self.federation_protocol = 'federation_protocol'
         self.mapping = 'mapping'
@@ -169,8 +169,19 @@ class FederationExtension(test_sql_upgrade.SqlMigrateBase):
         self.assertTableColumns(self.mapping,
                                 ['id', 'rules'])
 
+        federation_protocol = utils.get_table(
+            self.engine,
+            'federation_protocol')
+        with self.engine.begin() as conn:
+            conn.execute(federation_protocol.insert(), id=0, idp_id=1)
+            self.upgrade(3, repository=self.repo_path)
+            federation_protocol = utils.get_table(
+                self.engine,
+                'federation_protocol')
+            self.assertFalse(federation_protocol.c.mapping_id.nullable)
+
     def test_downgrade(self):
-        self.upgrade(2, repository=self.repo_path)
+        self.upgrade(3, repository=self.repo_path)
         self.assertTableColumns(self.identity_provider,
                                 ['id', 'enabled', 'description'])
         self.assertTableColumns(self.federation_protocol,
@@ -178,7 +189,37 @@ class FederationExtension(test_sql_upgrade.SqlMigrateBase):
         self.assertTableColumns(self.mapping,
                                 ['id', 'rules'])
 
+        self.downgrade(2, repository=self.repo_path)
+        federation_protocol = utils.get_table(
+            self.engine,
+            'federation_protocol')
+        self.assertTrue(federation_protocol.c.mapping_id.nullable)
+
         self.downgrade(0, repository=self.repo_path)
         self.assertTableDoesNotExist(self.identity_provider)
         self.assertTableDoesNotExist(self.federation_protocol)
         self.assertTableDoesNotExist(self.mapping)
+
+
+_REVOKE_COLUMN_NAMES = ['id', 'domain_id', 'project_id', 'user_id', 'role_id',
+                        'trust_id', 'consumer_id', 'access_token_id',
+                        'issued_before', 'expires_at', 'revoked_at']
+
+
+class RevokeExtension(test_sql_upgrade.SqlMigrateBase):
+
+    def repo_package(self):
+        return revoke
+
+    def test_upgrade(self):
+        self.assertTableDoesNotExist('revocation_event')
+        self.upgrade(1, repository=self.repo_path)
+        self.assertTableColumns('revocation_event',
+                                _REVOKE_COLUMN_NAMES)
+
+    def test_downgrade(self):
+        self.upgrade(1, repository=self.repo_path)
+        self.assertTableColumns('revocation_event',
+                                _REVOKE_COLUMN_NAMES)
+        self.downgrade(0, repository=self.repo_path)
+        self.assertTableDoesNotExist('revocation_event')

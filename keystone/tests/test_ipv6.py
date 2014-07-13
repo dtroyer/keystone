@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,7 +16,7 @@
 from keystone.common import environment
 from keystone import config
 from keystone import tests
-from keystone.tests.fixtures import appserver
+from keystone.tests.ksfixtures import appserver
 
 
 CONF = config.CONF

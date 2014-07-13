@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -22,7 +20,9 @@ import six
 
 from keystone import auth
 from keystone.common import config
+from keystone.common import dependency
 from keystone import exception
+from keystone.openstack.common.gettextutils import _
 from keystone.openstack.common import versionutils
 
 
@@ -31,6 +31,9 @@ CONF = config.CONF
 
 @six.add_metaclass(abc.ABCMeta)
 class Base(auth.AuthMethodHandler):
+
+    method = 'external'
+
     def authenticate(self, context, auth_info, auth_context):
         """Use REMOTE_USER to look up the user in the identity backend.
 
@@ -43,7 +46,7 @@ class Base(auth.AuthMethodHandler):
             msg = _('No authenticated user')
             raise exception.Unauthorized(msg)
         try:
-            user_ref = self._authenticate(REMOTE_USER, context, auth_info)
+            user_ref = self._authenticate(REMOTE_USER, context)
             auth_context['user_id'] = user_ref['id']
             if ('kerberos' in CONF.token.bind and
                 (context['environment'].get('AUTH_TYPE', '').lower()
@@ -54,7 +57,7 @@ class Base(auth.AuthMethodHandler):
             raise exception.Unauthorized(msg)
 
     @abc.abstractmethod
-    def _authenticate(self, remote_user, context, auth_info):
+    def _authenticate(self, remote_user, context):
         """Look up the user in the identity backend.
 
         Return user_ref
@@ -62,17 +65,18 @@ class Base(auth.AuthMethodHandler):
         pass
 
 
+@dependency.requires('identity_api')
 class DefaultDomain(Base):
-    def _authenticate(self, remote_user, context, auth_info):
+    def _authenticate(self, remote_user, context):
         """Use remote_user to look up the user in the identity backend."""
         domain_id = CONF.identity.default_domain_id
-        user_ref = auth_info.identity_api.get_user_by_name(remote_user,
-                                                           domain_id)
+        user_ref = self.identity_api.get_user_by_name(remote_user, domain_id)
         return user_ref
 
 
+@dependency.requires('assignment_api', 'identity_api')
 class Domain(Base):
-    def _authenticate(self, remote_user, context, auth_info):
+    def _authenticate(self, remote_user, context):
         """Use remote_user to look up the user in the identity backend.
 
         The domain will be extracted from the REMOTE_DOMAIN environment
@@ -85,13 +89,23 @@ class Domain(Base):
         except KeyError:
             domain_id = CONF.identity.default_domain_id
         else:
-            domain_ref = (auth_info.identity_api.
-                          get_domain_by_name(domain_name))
+            domain_ref = self.assignment_api.get_domain_by_name(domain_name)
             domain_id = domain_ref['id']
 
-        user_ref = auth_info.identity_api.get_user_by_name(username,
-                                                           domain_id)
+        user_ref = self.identity_api.get_user_by_name(username, domain_id)
         return user_ref
+
+
+@dependency.requires('assignment_api', 'identity_api')
+class KerberosDomain(Domain):
+    """Allows `kerberos` as a method."""
+    method = 'kerberos'
+
+    def _authenticate(self, remote_user, context):
+        auth_type = context['environment'].get('AUTH_TYPE')
+        if auth_type != 'Negotiate':
+            raise exception.Unauthorized(_("auth_type is not Negotiate"))
+        return super(KerberosDomain, self)._authenticate(remote_user, context)
 
 
 class ExternalDefault(DefaultDomain):
@@ -116,6 +130,7 @@ class ExternalDomain(Domain):
         super(ExternalDomain, self).__init__()
 
 
+@dependency.requires('identity_api')
 class LegacyDefaultDomain(Base):
     """Deprecated. Please use keystone.auth.external.DefaultDomain instead.
 
@@ -131,17 +146,17 @@ class LegacyDefaultDomain(Base):
     def __init__(self):
         super(LegacyDefaultDomain, self).__init__()
 
-    def _authenticate(self, remote_user, context, auth_info):
+    def _authenticate(self, remote_user, context):
         """Use remote_user to look up the user in the identity backend."""
         # NOTE(dolph): this unintentionally discards half the REMOTE_USER value
         names = remote_user.split('@')
         username = names.pop(0)
         domain_id = CONF.identity.default_domain_id
-        user_ref = auth_info.identity_api.get_user_by_name(username,
-                                                           domain_id)
+        user_ref = self.identity_api.get_user_by_name(username, domain_id)
         return user_ref
 
 
+@dependency.requires('assignment_api', 'identity_api')
 class LegacyDomain(Base):
     """Deprecated. Please use keystone.auth.external.Domain instead."""
 
@@ -152,7 +167,7 @@ class LegacyDomain(Base):
     def __init__(self):
         super(LegacyDomain, self).__init__()
 
-    def _authenticate(self, remote_user, context, auth_info):
+    def _authenticate(self, remote_user, context):
         """Use remote_user to look up the user in the identity backend.
 
         If remote_user contains an `@` assume that the substring before the
@@ -163,11 +178,9 @@ class LegacyDomain(Base):
         username = names.pop(0)
         if names:
             domain_name = names[0]
-            domain_ref = (auth_info.assignment_api.
-                          get_domain_by_name(domain_name))
+            domain_ref = self.assignment_api.get_domain_by_name(domain_name)
             domain_id = domain_ref['id']
         else:
             domain_id = CONF.identity.default_domain_id
-        user_ref = auth_info.identity_api.get_user_by_name(username,
-                                                           domain_id)
+        user_ref = self.identity_api.get_user_by_name(username, domain_id)
         return user_ref

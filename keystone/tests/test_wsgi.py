@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -14,13 +12,21 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from babel import localedata
 import gettext
+import socket
+import uuid
 
+from babel import localedata
+import mock
+from oslotest import mockpatch
+from testtools import matchers
+import webob
+
+from keystone.common import environment
 from keystone.common import wsgi
 from keystone import exception
-from keystone.openstack.common.fixture import moxstubout
 from keystone.openstack.common import gettextutils
+from keystone.openstack.common.gettextutils import _
 from keystone.openstack.common import jsonutils
 from keystone import tests
 
@@ -30,13 +36,28 @@ class FakeApp(wsgi.Application):
         return {'a': 'b'}
 
 
+class FakeAttributeCheckerApp(wsgi.Application):
+    def index(self, context):
+        return context['query_string']
+
+    def assert_attribute(self, body, attr):
+        """Asserts that the given request has a certain attribute."""
+        ref = jsonutils.loads(body)
+        self._require_attribute(ref, attr)
+
+    def assert_attributes(self, body, attr):
+        """Asserts that the given request has a certain set attributes."""
+        ref = jsonutils.loads(body)
+        self._require_attributes(ref, attr)
+
+
 class BaseWSGITest(tests.TestCase):
     def setUp(self):
         self.app = FakeApp()
         super(BaseWSGITest, self).setUp()
 
     def _make_request(self, url='/'):
-        req = wsgi.Request.blank(url)
+        req = webob.Request.blank(url)
         args = {'action': 'index', 'controller': None}
         req.environ['wsgiorg.routing_args'] = [None, args]
         return req
@@ -83,6 +104,45 @@ class ApplicationTest(BaseWSGITest):
         self.assertEqual(resp.status, '501 Not Implemented')
         self.assertEqual(resp.status_int, 501)
 
+    def test_successful_require_attribute(self):
+        app = FakeAttributeCheckerApp()
+        req = self._make_request(url='/?1=2')
+        resp = req.get_response(app)
+        app.assert_attribute(resp.body, '1')
+
+    def test_require_attribute_fail_if_attribute_not_present(self):
+        app = FakeAttributeCheckerApp()
+        req = self._make_request(url='/?1=2')
+        resp = req.get_response(app)
+        self.assertRaises(exception.ValidationError,
+                          app.assert_attribute, resp.body, 'a')
+
+    def test_successful_require_multiple_attributes(self):
+        app = FakeAttributeCheckerApp()
+        req = self._make_request(url='/?a=1&b=2')
+        resp = req.get_response(app)
+        app.assert_attributes(resp.body, ['a', 'b'])
+
+    def test_attribute_missing_from_request(self):
+        app = FakeAttributeCheckerApp()
+        req = self._make_request(url='/?a=1&b=2')
+        resp = req.get_response(app)
+        ex = self.assertRaises(exception.ValidationError,
+                               app.assert_attributes,
+                               resp.body, ['a', 'missing_attribute'])
+        self.assertThat(ex.message, matchers.Contains('missing_attribute'))
+
+    def test_no_required_attributes_present(self):
+        app = FakeAttributeCheckerApp()
+        req = self._make_request(url='/')
+        resp = req.get_response(app)
+
+        ex = self.assertRaises(exception.ValidationError,
+                               app.assert_attributes, resp.body,
+                               ['missing_attribute1', 'missing_attribute2'])
+        self.assertThat(ex.message, matchers.Contains('missing_attribute1'))
+        self.assertThat(ex.message, matchers.Contains('missing_attribute2'))
+
     def test_render_response_custom_headers(self):
         resp = wsgi.render_response(headers=[('Custom-Header', 'Some-Value')])
         self.assertEqual(resp.headers.get('Custom-Header'), 'Some-Value')
@@ -94,7 +154,14 @@ class ApplicationTest(BaseWSGITest):
         self.assertEqual(resp.status_int, 204)
         self.assertEqual(resp.body, '')
         self.assertEqual(resp.headers.get('Content-Length'), '0')
-        self.assertEqual(resp.headers.get('Content-Type'), None)
+        self.assertIsNone(resp.headers.get('Content-Type'))
+
+    def test_render_response_head_with_body(self):
+        resp = wsgi.render_response({'id': uuid.uuid4().hex}, method='HEAD')
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.body, b'')
+        self.assertNotEqual(resp.headers.get('Content-Length'), '0')
+        self.assertEqual(resp.headers.get('Content-Type'), 'application/json')
 
     def test_application_local_config(self):
         class FakeApp(wsgi.Application):
@@ -108,6 +175,13 @@ class ApplicationTest(BaseWSGITest):
     def test_render_exception(self):
         e = exception.Unauthorized(message=u'\u7f51\u7edc')
         resp = wsgi.render_exception(e)
+        self.assertEqual(resp.status_int, 401)
+
+    def test_render_exception_host(self):
+        e = exception.Unauthorized(message=u'\u7f51\u7edc')
+        context = {'host_url': 'http://%s:5000' % uuid.uuid4().hex}
+        resp = wsgi.render_exception(e, context=context)
+
         self.assertEqual(resp.status_int, 401)
 
 
@@ -165,14 +239,26 @@ class MiddlewareTest(BaseWSGITest):
         self.assertEqual(resp.status_int, exception.ValidationError.code)
 
     def test_middleware_exception_error(self):
+
+        exception_str = 'EXCEPTIONERROR'
+
         class FakeMiddleware(wsgi.Middleware):
             def process_response(self, request, response):
-                raise exception.UnexpectedError("EXCEPTIONERROR")
+                raise exception.UnexpectedError(exception_str)
 
-        req = self._make_request()
-        resp = FakeMiddleware(self.app)(req)
-        self.assertEqual(resp.status_int, exception.UnexpectedError.code)
-        self.assertIn("EXCEPTIONERROR", resp.body)
+        def do_request():
+            req = self._make_request()
+            resp = FakeMiddleware(self.app)(req)
+            self.assertEqual(resp.status_int, exception.UnexpectedError.code)
+            return resp
+
+        # Exception data should not be in the message when debug is False
+        self.config_fixture.config(debug=False)
+        self.assertNotIn(exception_str, do_request().body)
+
+        # Exception data should be in the message when debug is True
+        self.config_fixture.config(debug=True)
+        self.assertIn(exception_str, do_request().body)
 
     def test_middleware_local_config(self):
         class FakeMiddleware(wsgi.Middleware):
@@ -192,15 +278,13 @@ class LocalizedResponseTest(tests.TestCase):
         gettextutils._AVAILABLE_LANGUAGES.clear()
         self.addCleanup(gettextutils._AVAILABLE_LANGUAGES.clear)
 
-        fixture = self.useFixture(moxstubout.MoxStubout())
-        self.stubs = fixture.stubs
-
-    def _set_expected_languages(self, all_locales=[], avail_locales=None):
+    def _set_expected_languages(self, all_locales, avail_locales=None):
         # Override localedata.locale_identifiers to return some locales.
         def returns_some_locales(*args, **kwargs):
             return all_locales
 
-        self.stubs.Set(localedata, 'locale_identifiers', returns_some_locales)
+        self.useFixture(mockpatch.PatchObject(
+            localedata, 'locale_identifiers', returns_some_locales))
 
         # Override gettext.find to return other than None for some languages.
         def fake_gettext_find(lang_id, *args, **kwargs):
@@ -213,12 +297,13 @@ class LocalizedResponseTest(tests.TestCase):
                 return found_ret
             return None
 
-        self.stubs.Set(gettext, 'find', fake_gettext_find)
+        self.useFixture(mockpatch.PatchObject(
+            gettext, 'find', fake_gettext_find))
 
     def test_request_match_default(self):
         # The default language if no Accept-Language is provided is None
-        req = wsgi.Request.blank('/')
-        self.assertIsNone(req.best_match_language())
+        req = webob.Request.blank('/')
+        self.assertIsNone(wsgi.best_match_language(req))
 
     def test_request_match_language_expected(self):
         # If Accept-Language is a supported language, best_match_language()
@@ -226,8 +311,8 @@ class LocalizedResponseTest(tests.TestCase):
 
         self._set_expected_languages(all_locales=['it'])
 
-        req = wsgi.Request.blank('/', headers={'Accept-Language': 'it'})
-        self.assertEqual(req.best_match_language(), 'it')
+        req = webob.Request.blank('/', headers={'Accept-Language': 'it'})
+        self.assertEqual(wsgi.best_match_language(req), 'it')
 
     def test_request_match_language_unexpected(self):
         # If Accept-Language is a language we do not support,
@@ -235,8 +320,8 @@ class LocalizedResponseTest(tests.TestCase):
 
         self._set_expected_languages(all_locales=['it'])
 
-        req = wsgi.Request.blank('/', headers={'Accept-Language': 'zh'})
-        self.assertIsNone(req.best_match_language())
+        req = webob.Request.blank('/', headers={'Accept-Language': 'zh'})
+        self.assertIsNone(wsgi.best_match_language(req))
 
     def test_static_translated_string_is_Message(self):
         # Statically created message strings are Message objects so that they
@@ -249,3 +334,128 @@ class LocalizedResponseTest(tests.TestCase):
         # are lazy-translated.
         self.assertIsInstance(_('The resource could not be found.'),
                               gettextutils.Message)
+
+    def test_get_localized_response(self):
+        # If the request has the Accept-Language set to a supported language
+        # and an exception is raised by the application that is translatable
+        # then the response will have the translated message.
+
+        language = uuid.uuid4().hex
+
+        self._set_expected_languages(all_locales=[language])
+
+        # The arguments for the xlated message format have to match the args
+        # for the chosen exception (exception.NotFound)
+        xlated_msg_fmt = "Xlated NotFound, %(target)s."
+
+        # Fake out gettext.translation() to return a translator for our
+        # expected language and a passthrough translator for other langs.
+
+        def fake_translation(*args, **kwargs):
+            class IdentityTranslator(object):
+                def ugettext(self, msgid):
+                    return msgid
+
+                gettext = ugettext
+
+            class LangTranslator(object):
+                def ugettext(self, msgid):
+                    if msgid == exception.NotFound.message_format:
+                        return xlated_msg_fmt
+                    return msgid
+
+                gettext = ugettext
+
+            if language in kwargs.get('languages', []):
+                return LangTranslator()
+            return IdentityTranslator()
+
+        with mock.patch.object(gettext, 'translation',
+                               side_effect=fake_translation) as xlation_mock:
+            target = uuid.uuid4().hex
+
+            # Fake app raises NotFound exception to simulate Keystone raising.
+
+            class FakeApp(wsgi.Application):
+                def index(self, context):
+                    raise exception.NotFound(target=target)
+
+            # Make the request with Accept-Language on the app, expect an error
+            # response with the translated message.
+
+            req = webob.Request.blank('/')
+            args = {'action': 'index', 'controller': None}
+            req.environ['wsgiorg.routing_args'] = [None, args]
+            req.headers['Accept-Language'] = language
+            resp = req.get_response(FakeApp())
+
+            # Assert that the translated message appears in the response.
+
+            exp_msg = xlated_msg_fmt % dict(target=target)
+            self.assertThat(resp.body, matchers.Contains(exp_msg))
+            self.assertThat(xlation_mock.called, matchers.Equals(True))
+
+
+class ServerTest(tests.TestCase):
+
+    def setUp(self):
+        super(ServerTest, self).setUp()
+        environment.use_eventlet()
+        self.host = '127.0.0.1'
+        self.port = '1234'
+
+    @mock.patch('eventlet.listen')
+    @mock.patch('socket.getaddrinfo')
+    def test_keepalive_unset(self, mock_getaddrinfo, mock_listen):
+        mock_getaddrinfo.return_value = [(1, 2, 3, 4, 5)]
+        mock_sock = mock.Mock()
+        mock_sock.setsockopt = mock.Mock()
+
+        mock_listen.return_value = mock_sock
+        server = environment.Server(mock.MagicMock(), host=self.host,
+                                    port=self.port)
+        server.start()
+        self.assertTrue(mock_listen.called)
+        self.assertFalse(mock_sock.setsockopt.called)
+
+    @mock.patch('eventlet.listen')
+    @mock.patch('socket.getaddrinfo')
+    def test_keepalive_set(self, mock_getaddrinfo, mock_listen):
+        mock_getaddrinfo.return_value = [(1, 2, 3, 4, 5)]
+        mock_sock = mock.Mock()
+        mock_sock.setsockopt = mock.Mock()
+
+        mock_listen.return_value = mock_sock
+        server = environment.Server(mock.MagicMock(), host=self.host,
+                                    port=self.port, keepalive=True)
+        server.start()
+        mock_sock.setsockopt.assert_called_once_with(socket.SOL_SOCKET,
+                                                     socket.SO_KEEPALIVE,
+                                                     1)
+        self.assertTrue(mock_listen.called)
+
+    @mock.patch('eventlet.listen')
+    @mock.patch('socket.getaddrinfo')
+    def test_keepalive_and_keepidle_set(self, mock_getaddrinfo, mock_listen):
+        mock_getaddrinfo.return_value = [(1, 2, 3, 4, 5)]
+        mock_sock = mock.Mock()
+        mock_sock.setsockopt = mock.Mock()
+
+        mock_listen.return_value = mock_sock
+        server = environment.Server(mock.MagicMock(), host=self.host,
+                                    port=self.port, keepalive=True,
+                                    keepidle=1)
+        server.start()
+
+        # keepidle isn't available in the OS X version of eventlet
+        if hasattr(socket, 'TCP_KEEPIDLE'):
+            self.assertEqual(mock_sock.setsockopt.call_count, 2)
+
+            # Test the last set of call args i.e. for the keepidle
+            mock_sock.setsockopt.assert_called_with(socket.IPPROTO_TCP,
+                                                    socket.TCP_KEEPIDLE,
+                                                    1)
+        else:
+            self.assertEqual(mock_sock.setsockopt.call_count, 1)
+
+        self.assertTrue(mock_listen.called)

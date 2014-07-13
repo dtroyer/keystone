@@ -15,7 +15,7 @@
 
 import fixtures
 
-from keystone.openstack.common.lockutils import lock
+from keystone.openstack.common import lockutils
 
 
 class LockFixture(fixtures.Fixture):
@@ -43,9 +43,9 @@ class LockFixture(fixtures.Fixture):
     test method exits. (either by completing or raising an exception)
     """
     def __init__(self, name, lock_file_prefix=None):
-        self.mgr = lock(name, lock_file_prefix, True)
+        self.mgr = lockutils.lock(name, lock_file_prefix, True)
 
     def setUp(self):
         super(LockFixture, self).setUp()
         self.addCleanup(self.mgr.__exit__, None, None, None)
-        self.mgr.__enter__()
+        self.lock = self.mgr.__enter__()

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 # Copyright 2012 Canonical Ltd.
 #
@@ -22,9 +20,11 @@ import abc
 import six
 
 from keystone.common import dependency
+from keystone.common import driver_hints
 from keystone.common import manager
 from keystone import config
 from keystone import exception
+from keystone.openstack.common.gettextutils import _
 from keystone.openstack.common import log
 
 
@@ -37,17 +37,19 @@ def format_url(url, data):
     try:
         result = url.replace('$(', '%(') % data
     except AttributeError:
-        return None
+        LOG.error(_('Malformed endpoint - %(url)r is not a string'),
+                  {"url": url})
+        raise exception.MalformedEndpoint(endpoint=url)
     except KeyError as e:
         LOG.error(_("Malformed endpoint %(url)s - unknown key %(keyerror)s"),
                   {"url": url,
                    "keyerror": e})
         raise exception.MalformedEndpoint(endpoint=url)
     except TypeError as e:
-        LOG.error(_("Malformed endpoint %(url)s - unknown key %(keyerror)s"
-                    "(are you missing brackets ?)"),
+        LOG.error(_("Malformed endpoint '%(url)s'. The following type error "
+                    "occurred during string substitution: %(typeerror)s"),
                   {"url": url,
-                   "keyerror": e})
+                   "typeerror": e})
         raise exception.MalformedEndpoint(endpoint=url)
     except ValueError as e:
         LOG.error(_("Malformed endpoint %s - incomplete format "
@@ -68,9 +70,22 @@ class Manager(manager.Manager):
     def __init__(self):
         super(Manager, self).__init__(CONF.catalog.driver)
 
-    def create_region(self, region_id, region_ref):
+    def create_region(self, region_ref):
+        # Check duplicate ID
         try:
-            return self.driver.create_region(region_id, region_ref)
+            self.get_region(region_ref['id'])
+        except exception.RegionNotFound:
+            pass
+        else:
+            msg = _('Duplicate ID, %s.') % region_ref['id']
+            raise exception.Conflict(type='region', details=msg)
+
+        # NOTE(lbragstad): The description column of the region database
+        # can not be null. So if the user doesn't pass in a description then
+        # set it to an empty string.
+        region_ref.setdefault('description', '')
+        try:
+            return self.driver.create_region(region_ref)
         except exception.NotFound:
             parent_region_id = region_ref.get('parent_region_id')
             raise exception.RegionNotFound(region_id=parent_region_id)
@@ -87,6 +102,10 @@ class Manager(manager.Manager):
         except exception.NotFound:
             raise exception.RegionNotFound(region_id=region_id)
 
+    def create_service(self, service_id, service_ref):
+        service_ref.setdefault('enabled', True)
+        return self.driver.create_service(service_id, service_ref)
+
     def get_service(self, service_id):
         try:
             return self.driver.get_service(service_id)
@@ -98,6 +117,10 @@ class Manager(manager.Manager):
             return self.driver.delete_service(service_id)
         except exception.NotFound:
             raise exception.ServiceNotFound(service_id=service_id)
+
+    @manager.response_truncated
+    def list_services(self, hints=None):
+        return self.driver.list_services(hints or driver_hints.Hints())
 
     def create_endpoint(self, endpoint_id, endpoint_ref):
         try:
@@ -118,6 +141,10 @@ class Manager(manager.Manager):
         except exception.NotFound:
             raise exception.EndpointNotFound(endpoint_id=endpoint_id)
 
+    @manager.response_truncated
+    def list_endpoints(self, hints=None):
+        return self.driver.list_endpoints(hints or driver_hints.Hints())
+
     def get_catalog(self, user_id, tenant_id, metadata=None):
         try:
             return self.driver.get_catalog(user_id, tenant_id, metadata)
@@ -129,8 +156,11 @@ class Manager(manager.Manager):
 class Driver(object):
     """Interface description for an Catalog driver."""
 
+    def _get_list_limit(self):
+        return CONF.catalog.list_limit or CONF.list_limit
+
     @abc.abstractmethod
-    def create_region(self, region_id, region_ref):
+    def create_region(self, region_ref):
         """Creates a new region.
 
         :raises: keystone.exception.Conflict
@@ -187,8 +217,12 @@ class Driver(object):
         raise exception.NotImplemented()
 
     @abc.abstractmethod
-    def list_services(self):
+    def list_services(self, hints):
         """List all services.
+
+        :param hints: contains the list of filters yet to be satisfied.
+                      Any filters satisfied here will be removed so that
+                      the caller will know if any filters remain.
 
         :returns: list of service_refs or an empty list.
 
@@ -245,8 +279,12 @@ class Driver(object):
         raise exception.NotImplemented()
 
     @abc.abstractmethod
-    def list_endpoints(self):
+    def list_endpoints(self, hints):
         """List all endpoints.
+
+        :param hints: contains the list of filters yet to be satisfied.
+                      Any filters satisfied here will be removed so that
+                      the caller will know if any filters remain.
 
         :returns: list of endpoint_refs or an empty list.
 
@@ -298,9 +336,10 @@ class Driver(object):
         """
         raise exception.NotImplemented()
 
-    @abc.abstractmethod
     def get_v3_catalog(self, user_id, tenant_id, metadata=None):
         """Retrieve and format the current V3 service catalog.
+
+        The default implementation builds the V3 catalog from the V2 catalog.
 
         Example::
 
@@ -327,4 +366,35 @@ class Driver(object):
         :raises: keystone.exception.NotFound
 
         """
-        raise exception.NotImplemented()
+        v2_catalog = self.get_catalog(user_id, tenant_id, metadata=metadata)
+        v3_catalog = []
+
+        for region_name, region in six.iteritems(v2_catalog):
+            for service_type, service in six.iteritems(region):
+                service_v3 = {
+                    'type': service_type,
+                    'endpoints': []
+                }
+
+                for attr, value in six.iteritems(service):
+                    # Attributes that end in URL are interfaces. In the V2
+                    # catalog, these are internalURL, publicURL, and adminURL.
+                    # For example, <region_name>.publicURL=<URL> in the V2
+                    # catalog becomes the V3 interface for the service:
+                    # { 'interface': 'public', 'url': '<URL>', 'region':
+                    #   'region: '<region_name>' }
+                    if attr.endswith('URL'):
+                        v3_interface = attr[:-len('URL')]
+                        service_v3['endpoints'].append({
+                            'interface': v3_interface,
+                            'region': region_name,
+                            'url': value,
+                        })
+                        continue
+
+                    # Other attributes are copied to the service.
+                    service_v3[attr] = value
+
+                v3_catalog.append(service_v3)
+
+        return v3_catalog

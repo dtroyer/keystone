@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -22,10 +20,8 @@ Starting point for routing EC2 requests.
 
 """
 
-import urlparse
-
-from eventlet.green import httplib
 from oslo.config import cfg
+import requests
 import webob.dec
 import webob.exc
 
@@ -37,6 +33,16 @@ keystone_ec2_opts = [
     cfg.StrOpt('keystone_ec2_url',
                default='http://localhost:5000/v2.0/ec2tokens',
                help='URL to get token from ec2 request.'),
+    cfg.StrOpt('keystone_ec2_keyfile', help='Required if EC2 server requires '
+               'client certificate.'),
+    cfg.StrOpt('keystone_ec2_certfile', help='Client certificate key '
+               'filename. Required if EC2 server requires client '
+               'certificate.'),
+    cfg.StrOpt('keystone_ec2_cafile', help='A PEM encoded certificate '
+               'authority to use when verifying HTTPS connections. Defaults '
+               'to the system CAs.'),
+    cfg.BoolOpt('keystone_ec2_insecure', default=False, help='Disable SSL '
+                'certificate verification.'),
 ]
 
 CONF = config.CONF
@@ -46,7 +52,7 @@ CONF.register_opts(keystone_ec2_opts)
 class EC2Token(wsgi.Middleware):
     """Authenticate an EC2 request with keystone and convert to token."""
 
-    @webob.dec.wsgify(RequestClass=wsgi.Request)
+    @webob.dec.wsgify()
     def __call__(self, req):
         # Read request signature and access id.
         try:
@@ -74,23 +80,26 @@ class EC2Token(wsgi.Middleware):
         creds_json = jsonutils.dumps(creds)
         headers = {'Content-Type': 'application/json'}
 
-        # Disable 'has no x member' pylint error
-        # for httplib and urlparse
-        # pylint: disable-msg=E1101
-        o = urlparse.urlparse(CONF.keystone_ec2_url)
-        if o.scheme == 'http':
-            conn = httplib.HTTPConnection(o.netloc)
-        else:
-            conn = httplib.HTTPSConnection(o.netloc)
-        conn.request('POST', o.path, body=creds_json, headers=headers)
-        response = conn.getresponse().read()
-        conn.close()
+        verify = True
+        if CONF.keystone_ec2_insecure:
+            verify = False
+        elif CONF.keystone_ec2_cafile:
+            verify = CONF.keystone_ec2_cafile
+
+        cert = None
+        if CONF.keystone_ec2_certfile and CONF.keystone_ec2_keyfile:
+            cert = (CONF.keystone_ec2_certfile, CONF.keystone_ec2_keyfile)
+        elif CONF.keystone_ec2_certfile:
+            cert = CONF.keystone_ec2_certfile
+
+        response = requests.post(CONF.keystone_ec2_url, data=creds_json,
+                                 headers=headers, verify=verify, cert=cert)
 
         # NOTE(vish): We could save a call to keystone by
         #             having keystone return token, tenant,
         #             user, and roles from this call.
 
-        result = jsonutils.loads(response)
+        result = response.json()
         try:
             token_id = result['access']['token']['id']
         except (AttributeError, KeyError):

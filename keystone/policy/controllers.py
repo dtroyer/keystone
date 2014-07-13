@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -35,10 +33,7 @@ class PolicyV3(controller.V3Controller):
     @controller.filterprotected('type')
     def list_policies(self, context, filters):
         hints = PolicyV3.build_driver_hints(context, filters)
-        # We don't bother passing the hints in, since this would be
-        # a highly unlikely filter to use - wrap_collection() can
-        # handle if required.
-        refs = self.policy_api.list_policies()
+        refs = self.policy_api.list_policies(hints=hints)
         return PolicyV3.wrap_collection(context, refs, hints=hints)
 
     @controller.protected()

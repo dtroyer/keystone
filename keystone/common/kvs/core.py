@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 # Copyright 2013 Metacloud, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -28,6 +26,7 @@ import six
 
 from keystone.common import config
 from keystone import exception
+from keystone.openstack.common.gettextutils import _
 from keystone.openstack.common import importutils
 from keystone.openstack.common import log
 
@@ -59,15 +58,15 @@ def _register_backends():
         for backend in CONF.kvs.backends:
             module, cls = backend.rsplit('.', 1)
             backend_name = prefix % cls
-            LOG.debug(_('Registering Dogpile Backend %(backend_path)s as '
-                        '%(backend_name)s'),
+            LOG.debug(('Registering Dogpile Backend %(backend_path)s as '
+                       '%(backend_name)s'),
                       {'backend_path': backend, 'backend_name': backend_name})
             region.register_backend(backend_name, module, cls)
         BACKENDS_REGISTERED = True
 
 
 class LockTimeout(exception.UnexpectedError):
-    message_format = _('Lock Timeout occurred for key, %(target)s')
+    debug_message_format = _('Lock Timeout occurred for key, %(target)s')
 
 
 class KeyValueStore(object):
@@ -118,7 +117,7 @@ class KeyValueStore(object):
 
             for item in proxy_list:
                 if isinstance(item, str):
-                    LOG.debug(_('Importing class %s as KVS proxy.'), item)
+                    LOG.debug('Importing class %s as KVS proxy.', item)
                     pxy = importutils.import_class(item)
                 else:
                     pxy = item
@@ -140,6 +139,26 @@ class KeyValueStore(object):
             raise exception.UnexpectedError(_('Key Value Store not '
                                               'configured: %s'),
                                             self._region.name)
+
+    def _set_keymangler_on_backend(self, key_mangler):
+            try:
+                self._region.backend.key_mangler = key_mangler
+            except Exception as e:
+                # NOTE(morganfainberg): The setting of the key_mangler on the
+                # backend is used to allow the backend to
+                # calculate a hashed key value as needed. Not all backends
+                # require the ability to calculate hashed keys. If the
+                # backend does not support/require this feature log a
+                # debug line and move on otherwise raise the proper exception.
+                # Support of the feature is implied by the existence of the
+                # 'raw_no_expiry_keys' attribute.
+                if not hasattr(self._region.backend, 'raw_no_expiry_keys'):
+                    LOG.debug(('Non-expiring keys not supported/required by '
+                               '%(region)s backend; unable to set '
+                               'key_mangler for backend: %(err)s'),
+                              {'region': self._region.name, 'err': e})
+                else:
+                    raise
 
     def _set_key_mangler(self, key_mangler):
         # Set the key_mangler that is appropriate for the given region being
@@ -180,9 +199,11 @@ class KeyValueStore(object):
                 # unintended cases of exceeding cache-key in backends such
                 # as memcache.
                 self._region.key_mangler = dogpile_util.sha1_mangle_key
+            self._set_keymangler_on_backend(self._region.key_mangler)
         else:
             LOG.info(_('KVS region %s key_mangler disabled.'),
                      self._region.name)
+            self._set_keymangler_on_backend(None)
 
     def _configure_region(self, backend, **config_args):
         prefix = CONF.kvs.config_prefix
@@ -209,7 +230,7 @@ class KeyValueStore(object):
             arg_key = '.'.join([prefix, 'arguments', argument])
             conf_dict[arg_key] = value
 
-        LOG.debug(_('KVS region configuration for %(name)s: %(config)r'),
+        LOG.debug('KVS region configuration for %(name)s: %(config)r',
                   {'name': self._region.name, 'config': conf_dict})
         self._region.configure_from_config(conf_dict, '%s.' % prefix)
 
@@ -350,7 +371,7 @@ class KeyValueStoreLock(object):
     def acquire(self):
         if self.enabled:
             self.mutex.acquire()
-            LOG.debug(_('KVS lock acquired for: %s'), self.key)
+            LOG.debug('KVS lock acquired for: %s', self.key)
         self.active = True
         self.acquire_time = time.time()
         return self
@@ -369,7 +390,7 @@ class KeyValueStoreLock(object):
         if self.enabled:
             self.mutex.release()
             if not self.expired:
-                LOG.debug(_('KVS lock released for: %s'), self.key)
+                LOG.debug('KVS lock released for: %s', self.key)
             else:
                 LOG.warning(_('KVS lock released (timeout reached) for: %s'),
                             self.key)

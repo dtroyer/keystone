@@ -1,6 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-# flake8: noqa
-
 # Copyright 2012 Red Hat, Inc
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -15,4 +12,4 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from keystone.contrib.user_crud.core import *
+from keystone.contrib.user_crud.core import *  # noqa

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -43,12 +41,17 @@ class EndpointFilterCatalog(sql.Catalog):
         for entry in refs:
             try:
                 endpoint = self.get_endpoint(entry.endpoint_id)
+                if not endpoint['enabled']:
+                    # Skip disabled endpoints.
+                    continue
                 service_id = endpoint['service_id']
                 services.setdefault(
                     service_id,
                     self.get_service(service_id))
                 service = services[service_id]
                 del endpoint['service_id']
+                del endpoint['enabled']
+                del endpoint['legacy_endpoint_id']
                 endpoint['url'] = catalog_core.format_url(
                     endpoint['url'], d)
                 # populate filtered endpoints

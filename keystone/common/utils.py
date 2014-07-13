@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -19,25 +17,45 @@
 #    under the License.
 
 import calendar
+import collections
 import grp
 import hashlib
-import json
 import os
 import pwd
 
 import passlib.hash
 import six
+from six import moves
 
 from keystone.common import config
 from keystone.common import environment
 from keystone import exception
+from keystone.openstack.common.gettextutils import _
+from keystone.openstack.common import jsonutils
 from keystone.openstack.common import log
-from six import moves
+from keystone.openstack.common import strutils
 
 
 CONF = config.CONF
 
 LOG = log.getLogger(__name__)
+
+
+def flatten_dict(d, parent_key=''):
+    """Flatten a nested dictionary
+
+    Converts a dictionary with nested values to a single level flat
+    dictionary, with dotted notation for each key.
+
+    """
+    items = []
+    for k, v in d.items():
+        new_key = parent_key + '.' + k if parent_key else k
+        if isinstance(v, collections.MutableMapping):
+            items.extend(flatten_dict(v, new_key).items())
+        else:
+            items.append((new_key, v))
+    return dict(items)
 
 
 def read_cached_file(filename, cache_info, reload_func=None):
@@ -60,7 +78,7 @@ def read_cached_file(filename, cache_info, reload_func=None):
     return cache_info['data']
 
 
-class SmarterEncoder(json.JSONEncoder):
+class SmarterEncoder(jsonutils.json.JSONEncoder):
     """Help for JSON encoding dict-like objects."""
     def default(self, obj):
         if not isinstance(obj, dict) and hasattr(obj, 'iteritems'):
@@ -68,14 +86,20 @@ class SmarterEncoder(json.JSONEncoder):
         return super(SmarterEncoder, self).default(obj)
 
 
-def trunc_password(password):
-    """Truncate passwords to the max_length."""
+def verify_length_and_trunc_password(password):
+    """Verify and truncate the provided password to the max_password_length."""
     max_length = CONF.identity.max_password_length
     try:
         if len(password) > max_length:
-            LOG.warning(
-                _('Truncating user password to %s characters.'), max_length)
-        return password[:max_length]
+            if CONF.strict_password_check:
+                raise exception.PasswordVerificationError(size=max_length)
+            else:
+                LOG.warning(
+                    _('Truncating user password to '
+                      '%d characters.'), max_length)
+                return password[:max_length]
+        else:
+            return password
     except TypeError:
         raise exception.ValidationError(attribute='string', target='password')
 
@@ -95,37 +119,11 @@ def hash_user_password(user):
     return dict(user, password=hash_password(password))
 
 
-def hash_ldap_user_password(user):
-    """Hash a user dict's password without modifying the passed-in dict."""
-    password = user.get('password')
-    if password is None:
-        return user
-
-    return dict(user, password=ldap_hash_password(password))
-
-
 def hash_password(password):
     """Hash a password. Hard."""
-    password_utf8 = trunc_password(password).encode('utf-8')
-    if passlib.hash.sha512_crypt.identify(password_utf8):
-        return password_utf8
-    h = passlib.hash.sha512_crypt.encrypt(password_utf8,
-                                          rounds=CONF.crypt_strength)
-    return h
-
-
-def ldap_hash_password(password):
-    """Hash a password. Hard."""
-    password_utf8 = trunc_password(password).encode('utf-8')
-    h = passlib.hash.ldap_salted_sha1.encrypt(password_utf8)
-    return h
-
-
-def ldap_check_password(password, hashed):
-    if password is None:
-        return False
-    password_utf8 = trunc_password(password).encode('utf-8')
-    return passlib.hash.ldap_salted_sha1.verify(password_utf8, hashed)
+    password_utf8 = verify_length_and_trunc_password(password).encode('utf-8')
+    return passlib.hash.sha512_crypt.encrypt(
+        password_utf8, rounds=CONF.crypt_strength)
 
 
 def check_password(password, hashed):
@@ -137,19 +135,20 @@ def check_password(password, hashed):
     """
     if password is None or hashed is None:
         return False
-    password_utf8 = trunc_password(password).encode('utf-8')
+    password_utf8 = verify_length_and_trunc_password(password).encode('utf-8')
     return passlib.hash.sha512_crypt.verify(password_utf8, hashed)
 
 
 def attr_as_boolean(val_attr):
     """Returns the boolean value, decoded from a string.
 
-    We test explicitly for a value '0' which we treat as meaning False.
+    We test explicitly for a value meaning False, which can be one of
+    several formats as specified in oslo strutils.FALSE_STRINGS.
     All other string values (including an empty string) are treated as
     meaning True.
 
     """
-    return not (isinstance(val_attr, six.string_types) and val_attr == '0')
+    return strutils.bool_from_string(val_attr, default=True)
 
 
 # From python 2.7
@@ -191,7 +190,7 @@ def check_output(*popenargs, **kwargs):
 
 def get_blob_from_credential(credential):
     try:
-        blob = json.loads(credential.blob)
+        blob = jsonutils.loads(credential.blob)
     except (ValueError, TypeError):
         raise exception.ValidationError(
             message=_('Invalid blob in credential'))
@@ -207,9 +206,9 @@ def convert_ec2_to_v3_credential(ec2credential):
     return {'id': hash_access_key(ec2credential.access),
             'user_id': ec2credential.user_id,
             'project_id': ec2credential.tenant_id,
-            'blob': json.dumps(blob),
+            'blob': jsonutils.dumps(blob),
             'type': 'ec2',
-            'extra': json.dumps({})}
+            'extra': jsonutils.dumps({})}
 
 
 def convert_v3_to_ec2_credential(credential):

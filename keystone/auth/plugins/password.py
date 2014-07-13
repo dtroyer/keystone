@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -17,6 +15,7 @@
 from keystone import auth
 from keystone.common import dependency
 from keystone import exception
+from keystone.openstack.common.gettextutils import _
 from keystone.openstack.common import log
 
 METHOD_NAME = 'password'
@@ -79,7 +78,7 @@ class UserAuthInfo(object):
         if not user_id and not user_name:
             raise exception.ValidationError(attribute='id or name',
                                             target='user')
-        self.password = user_info.get('password', None)
+        self.password = user_info.get('password')
         try:
             if user_name:
                 if 'domain' not in user_info:
@@ -104,7 +103,10 @@ class UserAuthInfo(object):
 
 @dependency.requires('identity_api')
 class Password(auth.AuthMethodHandler):
-    def authenticate(self, context, auth_payload, user_context):
+
+    method = METHOD_NAME
+
+    def authenticate(self, context, auth_payload, auth_context):
         """Try to authenticate against the identity backend."""
         user_info = UserAuthInfo.create(auth_payload)
 
@@ -112,13 +114,12 @@ class Password(auth.AuthMethodHandler):
         # all we care is password matches
         try:
             self.identity_api.authenticate(
+                context,
                 user_id=user_info.user_id,
-                password=user_info.password,
-                domain_scope=user_info.domain_id)
+                password=user_info.password)
         except AssertionError:
             # authentication failed because of invalid username or password
             msg = _('Invalid username or password')
             raise exception.Unauthorized(msg)
 
-        if 'user_id' not in user_context:
-            user_context['user_id'] = user_info.user_id
+        auth_context['user_id'] = user_info.user_id

@@ -1,6 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-#
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
 # a copy of the License at
@@ -14,15 +11,27 @@
 # under the License.
 
 from keystone.common import wsgi
+from keystone.contrib import federation
 from keystone.contrib.federation import controllers
 
 
-class FederationExtension(wsgi.ExtensionRouter):
+class _BaseFederationExtension(wsgi.ExtensionRouter):
+    """Base class for Federation Extension classes.
+
+    All generic methods should be stored here so
+    inheriting classes don't need to reimplement them.
+
+    """
+    def _construct_url(self, suffix):
+        return "/OS-FEDERATION/%s" % suffix
+
+
+class FederationExtension(_BaseFederationExtension):
     """API Endpoints for the Federation extension.
 
     The API looks like::
 
-        PUT /OS-FEDERATION/identity_providers
+        PUT /OS-FEDERATION/identity_providers/$identity_provider
         GET /OS-FEDERATION/identity_providers
         GET /OS-FEDERATION/identity_providers/$identity_provider
         DELETE /OS-FEDERATION/identity_providers/$identity_provider
@@ -45,15 +54,25 @@ class FederationExtension(wsgi.ExtensionRouter):
         GET /OS-FEDERATION/mappings/$mapping_id
         DELETE /OS-FEDERATION/mappings/$mapping_id
 
+        GET /OS-FEDERATION/projects
+        GET /OS-FEDERATION/domains
+
+        GET /OS-FEDERATION/identity_providers/$identity_provider/
+            protocols/$protocol/auth
+        POST /OS-FEDERATION/identity_providers/$identity_provider/
+            protocols/$protocol/auth
+
     """
-
-    def _construct_url(self, suffix):
-        return "/OS-FEDERATION/%s" % suffix
-
     def add_routes(self, mapper):
+        # This is needed for dependency injection
+        # it loads the Federation driver which registers it as a dependency.
+        federation.Manager()
+        auth_controller = controllers.Auth()
         idp_controller = controllers.IdentityProvider()
         protocol_controller = controllers.FederationProtocol()
         mapping_controller = controllers.MappingController()
+        project_controller = controllers.ProjectV3()
+        domain_controller = controllers.DomainV3()
 
         # Identity Provider CRUD operations
 
@@ -155,3 +174,23 @@ class FederationExtension(wsgi.ExtensionRouter):
             controller=mapping_controller,
             action='update_mapping',
             conditions=dict(method=['PATCH']))
+
+        mapper.connect(
+            self._construct_url('domains'),
+            controller=domain_controller,
+            action='list_domains_for_groups',
+            conditions=dict(method=['GET']))
+
+        mapper.connect(
+            self._construct_url('projects'),
+            controller=project_controller,
+            action='list_projects_for_groups',
+            conditions=dict(method=['GET']))
+
+        mapper.connect(
+            self._construct_url('identity_providers/'
+                                '{identity_provider}/protocols/'
+                                '{protocol}/auth'),
+            controller=auth_controller,
+            action='federated_authentication',
+            conditions=dict(method=['GET', 'POST']))

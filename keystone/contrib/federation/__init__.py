@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2014 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -14,4 +12,4 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from keystone.contrib.federation.core import * # flake8: noqa
+from keystone.contrib.federation.core import *  # noqa

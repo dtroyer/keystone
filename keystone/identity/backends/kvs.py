@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -18,6 +16,7 @@ from keystone.common import kvs
 from keystone.common import utils
 from keystone import exception
 from keystone import identity
+from keystone.openstack.common.gettextutils import _
 
 
 class _UserIdToDomainId(object):
@@ -61,18 +60,15 @@ class Identity(kvs.Base, identity.Driver):
     def default_assignment_driver(self):
         return "keystone.assignment.backends.kvs.Assignment"
 
-    def is_domain_aware(self):
-        return True
-
     # Public interface
     def authenticate(self, user_id, password):
         user_ref = None
         try:
             user_ref = self._get_user(user_id)
         except exception.UserNotFound:
-            raise AssertionError('Invalid user / password')
+            raise AssertionError(_('Invalid user / password'))
         if not utils.check_password(password, user_ref.get('password')):
-            raise AssertionError('Invalid user / password')
+            raise AssertionError(_('Invalid user / password'))
         return identity.filter_user(user_ref)
 
     def _get_user(self, user_id):
@@ -115,7 +111,7 @@ class Identity(kvs.Base, identity.Driver):
         except exception.UserNotFound:
             pass
         else:
-            msg = 'Duplicate ID, %s.' % user_id
+            msg = _('Duplicate ID, %s.') % user_id
             raise exception.Conflict(type='user', details=msg)
 
         try:
@@ -123,7 +119,7 @@ class Identity(kvs.Base, identity.Driver):
         except exception.UserNotFound:
             pass
         else:
-            msg = 'Duplicate name, %s.' % user['name']
+            msg = _('Duplicate name, %s.') % user['name']
             raise exception.Conflict(type='user', details=msg)
 
         user = utils.hash_user_password(user)
@@ -150,15 +146,13 @@ class Identity(kvs.Base, identity.Driver):
             user_key = self._calc_user_name_key(user['name'], domain_id)
             existing = self.db.get(user_key, False)
             if existing and user_id != existing['id']:
-                msg = 'Duplicate name, %s.' % user['name']
+                msg = _('Duplicate name, %s.') % user['name']
                 raise exception.Conflict(type='user', details=msg)
         # get the old name and delete it too
         old_user = self.db.get('user-%s' % user_id)
         new_user = old_user.copy()
         user = utils.hash_user_password(user)
         new_user.update(user)
-        if new_user['id'] != user_id:
-            raise exception.ValidationError('Cannot change user ID')
         self.db.delete(self._calc_user_name_key(old_user['name'], domain_id))
         self.db.set('user-%s' % user_id, new_user)
         user_name_key = self._calc_user_name_key(new_user['name'], domain_id)
@@ -190,10 +184,10 @@ class Identity(kvs.Base, identity.Driver):
 
     def list_users_in_group(self, group_id, hints):
         self.get_group(group_id)
-        user_keys = filter(lambda x: x.startswith("user-"), self.db.keys())
-        user_refs = [self.db.get(key) for key in user_keys]
-        user_refs_for_group = filter(lambda x: group_id in x['groups'],
-                                     user_refs)
+        user_keys = (k for k in self.db.keys() if k.startswith('user-'))
+        user_refs = (self.db.get(key) for key in user_keys)
+        user_refs_for_group = (ref for ref in user_refs
+                               if group_id in ref['groups'])
         return [identity.filter_user(x) for x in user_refs_for_group]
 
     def list_groups_for_user(self, user_id, hints):
@@ -278,8 +272,8 @@ class Identity(kvs.Base, identity.Driver):
         except exception.NotFound:
             raise exception.GroupNotFound(group_id=group_id)
         # Delete any entries in the group lists of all users
-        user_keys = filter(lambda x: x.startswith("user-"), self.db.keys())
-        user_refs = [self.db.get(key) for key in user_keys]
+        user_keys = (k for k in self.db.keys() if k.startswith('user-'))
+        user_refs = (self.db.get(key) for key in user_keys)
         for user_ref in user_refs:
             groups = set(user_ref.get('groups', []))
             if group_id in groups:

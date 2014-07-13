@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -15,8 +13,8 @@
 # under the License.
 
 import os
+import uuid
 
-from keystone import exception
 from keystone import tests
 from keystone.tests import default_fixtures
 from keystone.tests import test_backend
@@ -50,19 +48,66 @@ class TestTemplatedCatalog(tests.TestCase, test_backend.CatalogTests):
 
     def setUp(self):
         super(TestTemplatedCatalog, self).setUp()
-        self.opt_in_group('catalog', template_file=DEFAULT_CATALOG_TEMPLATES)
         self.load_backends()
         self.load_fixtures(default_fixtures)
+
+    def config_overrides(self):
+        super(TestTemplatedCatalog, self).config_overrides()
+        self.config_fixture.config(group='catalog',
+                                   template_file=DEFAULT_CATALOG_TEMPLATES)
 
     def test_get_catalog(self):
         catalog_ref = self.catalog_api.get_catalog('foo', 'bar')
         self.assertDictEqual(catalog_ref, self.DEFAULT_FIXTURE)
 
-    def test_malformed_catalog_throws_error(self):
+    def test_catalog_ignored_malformed_urls(self):
+        # both endpoints are in the catalog
+        catalog_ref = self.catalog_api.get_catalog('foo', 'bar')
+        self.assertEqual(2, len(catalog_ref['RegionOne']))
+
         (self.catalog_api.driver.templates
          ['RegionOne']['compute']['adminURL']) = \
-            'http://localhost:$(compute_port)s/v1.1/$(tenant)s'
-        self.assertRaises(exception.MalformedEndpoint,
-                          self.catalog_api.get_catalog,
-                          'fake-user',
-                          'fake-tenant')
+            'http://localhost:8774/v1.1/$(tenant)s'
+
+        # the malformed one has been removed
+        catalog_ref = self.catalog_api.get_catalog('foo', 'bar')
+        self.assertEqual(1, len(catalog_ref['RegionOne']))
+
+    def test_get_catalog_endpoint_disabled(self):
+        self.skipTest("Templated backend doesn't have disabled endpoints")
+
+    def test_get_v3_catalog_endpoint_disabled(self):
+        self.skipTest("Templated backend doesn't have disabled endpoints")
+
+    def test_get_v3_catalog(self):
+        user_id = uuid.uuid4().hex
+        project_id = uuid.uuid4().hex
+        catalog_ref = self.catalog_api.get_v3_catalog(user_id, project_id)
+        exp_catalog = [
+            {'endpoints': [
+                {'interface': 'admin',
+                 'region': 'RegionOne',
+                 'url': 'http://localhost:8774/v1.1/%s' % project_id},
+                {'interface': 'public',
+                 'region': 'RegionOne',
+                 'url': 'http://localhost:8774/v1.1/%s' % project_id},
+                {'interface': 'internal',
+                 'region': 'RegionOne',
+                 'url': 'http://localhost:8774/v1.1/%s' % project_id}],
+             'type': 'compute',
+             'name': "'Compute Service'",
+             'id': '2'},
+            {'endpoints': [
+                {'interface': 'admin',
+                 'region': 'RegionOne',
+                 'url': 'http://localhost:35357/v2.0'},
+                {'interface': 'public',
+                 'region': 'RegionOne',
+                 'url': 'http://localhost:5000/v2.0'},
+                {'interface': 'internal',
+                 'region': 'RegionOne',
+                 'url': 'http://localhost:35357/v2.0'}],
+             'type': 'identity',
+             'name': "'Identity Service'",
+             'id': '1'}]
+        self.assertEqual(exp_catalog, catalog_ref)

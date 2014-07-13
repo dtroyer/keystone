@@ -1,6 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-#
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
 # a copy of the License at
@@ -32,8 +29,7 @@ def upgrade(migrate_engine):
     federation_protocol_table = sql.Table(
         'federation_protocol',
         meta,
-        sql.Column('id', sql.String(64), primary_key=True,
-                   autoincrement=False),
+        sql.Column('id', sql.String(64), primary_key=True),
         sql.Column('idp_id', sql.String(64),
                    sql.ForeignKey('identity_provider.id', ondelete='CASCADE'),
                    primary_key=True),

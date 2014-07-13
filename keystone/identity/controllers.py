@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -16,79 +14,16 @@
 
 """Workflow Logic the Identity service."""
 
-import inspect
-import six
-import uuid
-
-from keystone.assignment import controllers as assignment_controllers
 from keystone.common import controller
 from keystone.common import dependency
 from keystone import config
 from keystone import exception
+from keystone.openstack.common.gettextutils import _
 from keystone.openstack.common import log
-from keystone.openstack.common import versionutils
 
 
 CONF = config.CONF
 LOG = log.getLogger(__name__)
-
-
-class DeprecatedMeta(type):
-    """Metaclass that ensures that the correct methods on the deprecated
-    classes are reported as deprecated on call.
-    """
-    @staticmethod
-    def moved_to_assignment(class_name):
-        # NOTE(morganfainberg): wrapper for versionutils.deprecated decorator
-        # with some values populated specifically for the migration for
-        # controllers from identity to assignment.
-        def inner(f):
-            subst = {'cls_name': class_name, 'meth_name': f.__name__}
-            what = 'identity.controllers.%(cls_name)s.%(meth_name)s' % subst
-            favor = 'assignment.controllers.%(cls_name)s.%(meth_name)s' % subst
-
-            deprecated = versionutils.deprecated(
-                versionutils.deprecated.ICEHOUSE,
-                what=what,
-                in_favor_of=favor,
-                remove_in=+1)
-            return deprecated(f)
-        return inner
-
-    @staticmethod
-    def _is_wrappable(item):
-        # NOTE(morganfainberg): Wrapping non-callables, non-methods, and
-        # builtins is not the point of the deprecation warnings. Simple test
-        # to ensure the item is one of the types that should be wrapped.
-        if (callable(item) and
-                inspect.ismethod(item) and
-                not inspect.isbuiltin(item)):
-            return True
-        return False
-
-    def __new__(mcs, class_name, bases, namespace):
-        def get_attribute(self, item):
-            # NOTE(morganfainberg): This implementation of __getattribute__
-            # is automatically added to any classes using the DeprecatedMeta
-            # metaclass. This will apply the moved_to_assignment wrapper to
-            # method calls (inherited or direct).
-            attr = super(bases[0], self).__getattribute__(item)
-            if DeprecatedMeta._is_wrappable(attr):
-                return DeprecatedMeta.moved_to_assignment(class_name)(attr)
-            return attr
-
-        namespace['__getattribute__'] = get_attribute
-        return type.__new__(mcs, class_name, bases, namespace)
-
-    def __getattribute__(cls, item):
-        # NOTE(morganfainberg): This implementation of __getattribute__ catches
-        # non-instantiated calls to @classmethods.
-        attr = type.__getattribute__(cls, item)
-        if DeprecatedMeta._is_wrappable(attr):
-            if (issubclass(cls, controller.V3Controller) and
-                    DeprecatedMeta._is_wrappable(attr)):
-                attr = DeprecatedMeta.moved_to_assignment(cls.__name__)(attr)
-        return attr
 
 
 @dependency.requires('assignment_api', 'identity_api')
@@ -98,7 +33,7 @@ class User(controller.V2Controller):
     def get_user(self, context, user_id):
         self.assert_admin(context)
         ref = self.identity_api.get_user(user_id)
-        return {'user': self.identity_api.v3_to_v2_user(ref)}
+        return {'user': self.v3_to_v2_user(ref)}
 
     @controller.v2_deprecated
     def get_users(self, context):
@@ -109,20 +44,22 @@ class User(controller.V2Controller):
                 context, context['query_string'].get('name'))
 
         self.assert_admin(context)
-        user_list = self.identity_api.list_users()
-        return {'users': self.identity_api.v3_to_v2_user(user_list)}
+        user_list = self.identity_api.list_users(
+            CONF.identity.default_domain_id)
+        return {'users': self.v3_to_v2_user(user_list)}
 
     @controller.v2_deprecated
     def get_user_by_name(self, context, user_name):
         self.assert_admin(context)
         ref = self.identity_api.get_user_by_name(
             user_name, CONF.identity.default_domain_id)
-        return {'user': self.identity_api.v3_to_v2_user(ref)}
+        return {'user': self.v3_to_v2_user(ref)}
 
     # CRUD extension
     @controller.v2_deprecated
     def create_user(self, context, user):
         user = self._normalize_OSKSADM_password_on_request(user)
+        user = self.normalize_username_in_request(user)
         user = self._normalize_dict(user)
         self.assert_admin(context)
 
@@ -139,20 +76,20 @@ class User(controller.V2Controller):
             self.assignment_api.get_project(default_project_id)
             user['default_project_id'] = default_project_id
 
-        user_id = uuid.uuid4().hex
+        # The manager layer will generate the unique ID for users
         user_ref = self._normalize_domain_id(context, user.copy())
-        user_ref['id'] = user_id
-        new_user_ref = self.identity_api.v3_to_v2_user(
-            self.identity_api.create_user(user_id, user_ref))
+        new_user_ref = self.v3_to_v2_user(
+            self.identity_api.create_user(user_ref))
 
         if default_project_id is not None:
             self.assignment_api.add_user_to_project(default_project_id,
-                                                    user_id)
+                                                    new_user_ref['id'])
         return {'user': new_user_ref}
 
     @controller.v2_deprecated
     def update_user(self, context, user_id, user):
         # NOTE(termie): this is really more of a patch than a put
+        user = self.normalize_username_in_request(user)
         self.assert_admin(context)
 
         if 'enabled' in user and not isinstance(user['enabled'], bool):
@@ -163,7 +100,7 @@ class User(controller.V2Controller):
         if default_project_id is not None:
             user['default_project_id'] = default_project_id
 
-        old_user_ref = self.identity_api.v3_to_v2_user(
+        old_user_ref = self.v3_to_v2_user(
             self.identity_api.get_user(user_id))
 
         # Check whether a tenant is being added or changed for the user.
@@ -179,7 +116,7 @@ class User(controller.V2Controller):
             # user update.
             self.assignment_api.get_project(default_project_id)
 
-        user_ref = self.identity_api.v3_to_v2_user(
+        user_ref = self.v3_to_v2_user(
             self.identity_api.update_user(user_id, user))
 
         # If 'tenantId' is in either ref, we might need to add or remove the
@@ -269,72 +206,57 @@ class UserV3(controller.V3Controller):
     def create_user(self, context, user):
         self._require_attribute(user, 'name')
 
-        ref = self._assign_unique_id(self._normalize_dict(user))
+        # The manager layer will generate the unique ID for users
+        ref = self._normalize_dict(user)
         ref = self._normalize_domain_id(context, ref)
-        ref = self.identity_api.create_user(ref['id'], ref)
+        ref = self.identity_api.create_user(ref)
         return UserV3.wrap_member(context, ref)
 
-    @controller.filterprotected('domain_id', 'email', 'enabled', 'name')
+    @controller.filterprotected('domain_id', 'enabled', 'name')
     def list_users(self, context, filters):
         hints = UserV3.build_driver_hints(context, filters)
         refs = self.identity_api.list_users(
-            domain_scope=self._get_domain_id_for_request(context),
+            domain_scope=self._get_domain_id_for_list_request(context),
             hints=hints)
         return UserV3.wrap_collection(context, refs, hints=hints)
 
-    @controller.filterprotected('domain_id', 'email', 'enabled', 'name')
+    @controller.filterprotected('domain_id', 'enabled', 'name')
     def list_users_in_group(self, context, filters, group_id):
         hints = UserV3.build_driver_hints(context, filters)
-        refs = self.identity_api.list_users_in_group(
-            group_id,
-            domain_scope=self._get_domain_id_for_request(context),
-            hints=hints)
+        refs = self.identity_api.list_users_in_group(group_id, hints=hints)
         return UserV3.wrap_collection(context, refs, hints=hints)
 
     @controller.protected()
     def get_user(self, context, user_id):
-        ref = self.identity_api.get_user(
-            user_id,
-            domain_scope=self._get_domain_id_for_request(context))
+        ref = self.identity_api.get_user(user_id)
         return UserV3.wrap_member(context, ref)
 
-    def _update_user(self, context, user_id, user, domain_scope):
+    def _update_user(self, context, user_id, user):
         self._require_matching_id(user_id, user)
-        ref = self.identity_api.update_user(
-            user_id, user, domain_scope=domain_scope)
+        self._require_matching_domain_id(
+            user_id, user, self.identity_api.get_user)
+        ref = self.identity_api.update_user(user_id, user)
         return UserV3.wrap_member(context, ref)
 
     @controller.protected()
     def update_user(self, context, user_id, user):
-        domain_scope = self._get_domain_id_for_request(context)
-        return self._update_user(context, user_id, user, domain_scope)
+        return self._update_user(context, user_id, user)
 
     @controller.protected(callback=_check_user_and_group_protection)
     def add_user_to_group(self, context, user_id, group_id):
-        self.identity_api.add_user_to_group(
-            user_id, group_id,
-            domain_scope=self._get_domain_id_for_request(context))
+        self.identity_api.add_user_to_group(user_id, group_id)
 
     @controller.protected(callback=_check_user_and_group_protection)
     def check_user_in_group(self, context, user_id, group_id):
-        return self.identity_api.check_user_in_group(
-            user_id, group_id,
-            domain_scope=self._get_domain_id_for_request(context))
+        return self.identity_api.check_user_in_group(user_id, group_id)
 
     @controller.protected(callback=_check_user_and_group_protection)
     def remove_user_from_group(self, context, user_id, group_id):
-        self.identity_api.remove_user_from_group(
-            user_id, group_id,
-            domain_scope=self._get_domain_id_for_request(context))
+        self.identity_api.remove_user_from_group(user_id, group_id)
 
     @controller.protected()
     def delete_user(self, context, user_id):
-        # Make sure any tokens are marked as deleted
-        domain_id = self._get_domain_id_for_request(context)
-        # Finally delete the user itself - the backend is
-        # responsible for deleting any role assignments related
-        # to this user
-        return self.identity_api.delete_user(user_id, domain_scope=domain_id)
+        return self.identity_api.delete_user(user_id)
 
     @controller.protected()
     def change_password(self, context, user_id, user):
@@ -347,17 +269,11 @@ class UserV3(controller.V3Controller):
         if password is None:
             raise exception.ValidationError(target='user',
                                             attribute='password')
-
-        domain_scope = self._get_domain_id_for_request(context)
         try:
-            self.identity_api.authenticate(user_id=user_id,
-                                           password=original_password,
-                                           domain_scope=domain_scope)
+            self.identity_api.change_password(
+                context, user_id, original_password, password)
         except AssertionError:
             raise exception.Unauthorized()
-
-        update_dict = {'password': password}
-        self._update_user(context, user_id, update_dict, domain_scope)
 
 
 @dependency.requires('identity_api')
@@ -373,76 +289,39 @@ class GroupV3(controller.V3Controller):
     def create_group(self, context, group):
         self._require_attribute(group, 'name')
 
-        ref = self._assign_unique_id(self._normalize_dict(group))
+        # The manager layer will generate the unique ID for groups
+        ref = self._normalize_dict(group)
         ref = self._normalize_domain_id(context, ref)
-        ref = self.identity_api.create_group(ref['id'], ref)
+        ref = self.identity_api.create_group(ref)
         return GroupV3.wrap_member(context, ref)
 
     @controller.filterprotected('domain_id', 'name')
     def list_groups(self, context, filters):
         hints = GroupV3.build_driver_hints(context, filters)
         refs = self.identity_api.list_groups(
-            domain_scope=self._get_domain_id_for_request(context),
+            domain_scope=self._get_domain_id_for_list_request(context),
             hints=hints)
         return GroupV3.wrap_collection(context, refs, hints=hints)
 
     @controller.filterprotected('name')
     def list_groups_for_user(self, context, filters, user_id):
         hints = GroupV3.build_driver_hints(context, filters)
-        refs = self.identity_api.list_groups_for_user(
-            user_id,
-            domain_scope=self._get_domain_id_for_request(context),
-            hints=hints)
+        refs = self.identity_api.list_groups_for_user(user_id, hints=hints)
         return GroupV3.wrap_collection(context, refs, hints=hints)
 
     @controller.protected()
     def get_group(self, context, group_id):
-        ref = self.identity_api.get_group(
-            group_id,
-            domain_scope=self._get_domain_id_for_request(context))
+        ref = self.identity_api.get_group(group_id)
         return GroupV3.wrap_member(context, ref)
 
     @controller.protected()
     def update_group(self, context, group_id, group):
         self._require_matching_id(group_id, group)
-
-        ref = self.identity_api.update_group(
-            group_id, group,
-            domain_scope=self._get_domain_id_for_request(context))
+        self._require_matching_domain_id(
+            group_id, group, self.identity_api.get_group)
+        ref = self.identity_api.update_group(group_id, group)
         return GroupV3.wrap_member(context, ref)
 
     @controller.protected()
     def delete_group(self, context, group_id):
-        domain_id = self._get_domain_id_for_request(context)
-        self.identity_api.delete_group(group_id, domain_scope=domain_id)
-
-
-# TODO(morganfainberg): Remove proxy compat classes once Icehouse is released.
-@six.add_metaclass(DeprecatedMeta)
-class Tenant(assignment_controllers.Tenant):
-    pass
-
-
-@six.add_metaclass(DeprecatedMeta)
-class Role(assignment_controllers.Role):
-    pass
-
-
-@six.add_metaclass(DeprecatedMeta)
-class DomainV3(assignment_controllers.DomainV3):
-    pass
-
-
-@six.add_metaclass(DeprecatedMeta)
-class ProjectV3(assignment_controllers.ProjectV3):
-    pass
-
-
-@six.add_metaclass(DeprecatedMeta)
-class RoleV3(assignment_controllers.RoleV3):
-    pass
-
-
-@six.add_metaclass(DeprecatedMeta)
-class RoleAssignmentV3(assignment_controllers.RoleAssignmentV3):
-    pass
+        self.identity_api.delete_group(group_id)

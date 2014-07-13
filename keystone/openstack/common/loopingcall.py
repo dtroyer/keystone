@@ -20,7 +20,7 @@ import sys
 from eventlet import event
 from eventlet import greenthread
 
-from keystone.openstack.common.gettextutils import _  # noqa
+from keystone.openstack.common.gettextutils import _LE, _LW
 from keystone.openstack.common import log as logging
 from keystone.openstack.common import timeutils
 
@@ -28,19 +28,19 @@ LOG = logging.getLogger(__name__)
 
 
 class LoopingCallDone(Exception):
-    """Exception to break out and stop a LoopingCall.
+    """Exception to break out and stop a LoopingCallBase.
 
-    The poll-function passed to LoopingCall can raise this exception to
+    The poll-function passed to LoopingCallBase can raise this exception to
     break out of the loop normally. This is somewhat analogous to
     StopIteration.
 
     An optional return-value can be included as the argument to the exception;
-    this return-value will be returned by LoopingCall.wait()
+    this return-value will be returned by LoopingCallBase.wait()
 
     """
 
     def __init__(self, retvalue=True):
-        """:param retvalue: Value that LoopingCall.wait() should return."""
+        """:param retvalue: Value that LoopingCallBase.wait() should return."""
         self.retvalue = retvalue
 
 
@@ -79,14 +79,15 @@ class FixedIntervalLoopingCall(LoopingCallBase):
                         break
                     delay = interval - timeutils.delta_seconds(start, end)
                     if delay <= 0:
-                        LOG.warn(_('task run outlasted interval by %s sec') %
-                                 -delay)
+                        LOG.warn(_LW('task %(func_name)s run outlasted '
+                                     'interval by %(delay)s sec'),
+                                 {'func_name': repr(self.f), 'delay': -delay})
                     greenthread.sleep(delay if delay > 0 else 0)
             except LoopingCallDone as e:
                 self.stop()
                 done.send(e.retvalue)
             except Exception:
-                LOG.exception(_('in fixed duration looping call'))
+                LOG.exception(_LE('in fixed duration looping call'))
                 done.send_exception(*sys.exc_info())
                 return
             else:
@@ -96,11 +97,6 @@ class FixedIntervalLoopingCall(LoopingCallBase):
 
         greenthread.spawn_n(_inner)
         return self.done
-
-
-# TODO(mikal): this class name is deprecated in Havana and should be removed
-# in the I release
-LoopingCall = FixedIntervalLoopingCall
 
 
 class DynamicLoopingCall(LoopingCallBase):
@@ -126,14 +122,15 @@ class DynamicLoopingCall(LoopingCallBase):
 
                     if periodic_interval_max is not None:
                         idle = min(idle, periodic_interval_max)
-                    LOG.debug(_('Dynamic looping call sleeping for %.02f '
-                                'seconds'), idle)
+                    LOG.debug('Dynamic looping call %(func_name)s sleeping '
+                              'for %(idle).02f seconds',
+                              {'func_name': repr(self.f), 'idle': idle})
                     greenthread.sleep(idle)
             except LoopingCallDone as e:
                 self.stop()
                 done.send(e.retvalue)
             except Exception:
-                LOG.exception(_('in dynamic looping call'))
+                LOG.exception(_LE('in dynamic looping call'))
                 done.send_exception(*sys.exc_info())
                 return
             else:

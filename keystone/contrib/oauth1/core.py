@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -19,6 +17,7 @@
 from __future__ import absolute_import
 
 import abc
+import string
 
 import oauthlib.common
 from oauthlib import oauth1
@@ -30,6 +29,7 @@ from keystone.common import extension
 from keystone.common import manager
 from keystone import config
 from keystone import exception
+from keystone import notifications
 
 
 RequestValidator = oauth1.RequestValidator
@@ -40,6 +40,11 @@ AuthorizationEndpoint = oauth1.AuthorizationEndpoint
 SIG_HMAC = oauth1.SIGNATURE_HMAC
 RequestTokenEndpoint = oauth1.RequestTokenEndpoint
 oRequest = oauthlib.common.Request
+# The characters used to generate verifiers are limited to alphanumerical
+# values for ease of manual entry. Commonly confused characters are omitted.
+VERIFIER_CHARS = string.ascii_letters + string.digits
+CONFUSED_CHARS = 'jiIl1oO0'
+VERIFIER_CHARS = ''.join(c for c in VERIFIER_CHARS if c not in CONFUSED_CHARS)
 
 
 class Token(object):
@@ -107,17 +112,6 @@ def filter_token(access_token_ref):
     return access_token_ref
 
 
-def rebuild_url(path):
-    endpoint = CONF.public_endpoint % CONF
-
-    # allow a missing trailing slash in the config
-    if endpoint[-1] != '/':
-        endpoint += '/'
-
-    url = endpoint + 'v3'
-    return url + path
-
-
 def get_oauth_headers(headers):
     parameters = {}
 
@@ -150,9 +144,39 @@ class Manager(manager.Manager):
     dynamically calls the backend.
 
     """
+    _ACCESS_TOKEN = "OS-OAUTH1:access_token"
+    _REQUEST_TOKEN = "OS-OAUTH1:request_token"
+    _CONSUMER = "OS-OAUTH1:consumer"
 
     def __init__(self):
         super(Manager, self).__init__(CONF.oauth1.driver)
+
+    @notifications.created(_CONSUMER)
+    def create_consumer(self, consumer_ref):
+        return self.driver.create_consumer(consumer_ref)
+
+    @notifications.updated(_CONSUMER)
+    def update_consumer(self, consumer_id, consumer_ref):
+        return self.driver.update_consumer(consumer_id, consumer_ref)
+
+    @notifications.deleted(_CONSUMER)
+    def delete_consumer(self, consumer_id):
+        return self.driver.delete_consumer(consumer_id)
+
+    @notifications.created(_ACCESS_TOKEN)
+    def create_access_token(self, request_id, access_token_duration):
+        return self.driver.create_access_token(request_id,
+                                               access_token_duration)
+
+    @notifications.deleted(_ACCESS_TOKEN, resource_id_arg_index=2)
+    def delete_access_token(self, user_id, access_token_id):
+        return self.driver.delete_access_token(user_id, access_token_id)
+
+    @notifications.created(_REQUEST_TOKEN, resource_id_arg_index=2)
+    def create_request_token(self, consumer_id, requested_project,
+                             request_token_duration):
+        return self.driver.create_request_token(
+            consumer_id, requested_project, request_token_duration)
 
 
 @six.add_metaclass(abc.ABCMeta)
@@ -175,7 +199,7 @@ class Driver(object):
         """Update consumer.
 
         :param consumer_id: id of consumer to update
-        :type consumer_ref: string
+        :type consumer_id: string
         :param consumer_ref: new consumer ref with consumer name
         :type consumer_ref: dict
         :returns: consumer_ref
@@ -198,7 +222,7 @@ class Driver(object):
         and description.
 
         :param consumer_id: id of consumer to get
-        :type consumer_ref: string
+        :type consumer_id: string
         :returns: consumer_ref
 
         """
@@ -213,7 +237,7 @@ class Driver(object):
         consumer secret is required to verify incoming OAuth requests.
 
         :param consumer_id: id of consumer to get
-        :type consumer_ref: string
+        :type consumer_id: string
         :returns: consumer_ref
 
         """
@@ -224,7 +248,7 @@ class Driver(object):
         """Delete consumer.
 
         :param consumer_id: id of consumer to get
-        :type consumer_ref: string
+        :type consumer_id: string
         :returns: None.
 
         """

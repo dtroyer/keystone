@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
 # a copy of the License at
@@ -12,5 +10,5 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from keystone.contrib.simple_cert.core import *  # flake8: noqa
-from keystone.contrib.simple_cert.routers import SimpleCertExtension
+from keystone.contrib.simple_cert.core import *  # noqa
+from keystone.contrib.simple_cert.routers import SimpleCertExtension  # noqa

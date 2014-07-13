@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -118,5 +116,5 @@ class Driver(object):
                 try:
                     self.credential_api.delete_credential(cr['id'])
                 except exception.CredentialNotFound:
-                    LOG.debug(_('Deletion of credential is not required: %s'),
+                    LOG.debug('Deletion of credential is not required: %s',
                               cr['id'])

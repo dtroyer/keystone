@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -17,14 +15,7 @@
 # NOTE(dolph): please try to avoid additional fixtures if possible; test suite
 #              performance may be negatively affected.
 
-from keystone import config
-
-
-CONF = config.CONF
-
-
 DEFAULT_DOMAIN_ID = 'default'
-
 
 TENANTS = [
     {
@@ -69,7 +60,6 @@ USERS = [
         'name': 'TWO',
         'domain_id': DEFAULT_DOMAIN_ID,
         'password': 'two2',
-        'email': 'two@example.com',
         'enabled': True,
         'default_project_id': 'baz',
         'tenants': ['baz'],
@@ -79,11 +69,10 @@ USERS = [
         'name': 'BadGuy',
         'domain_id': DEFAULT_DOMAIN_ID,
         'password': 'bad',
-        'email': 'bad@guy.com',
         'enabled': False,
         'default_project_id': 'baz',
         'tenants': ['baz'],
-        'email': 'badguy@goodguy.com',
+        'email': 'bad@guy.com',
     }, {
         'id': 'sna',
         'name': 'SNA',

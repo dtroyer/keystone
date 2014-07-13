@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -16,24 +14,37 @@
 import datetime
 import uuid
 
-from keystone import config
+import six
+
 from keystone import exception
-from keystone import identity
 from keystone.openstack.common import timeutils
 from keystone import tests
 from keystone.tests import default_fixtures
+from keystone.tests.ksfixtures import database
 from keystone.tests import test_backend
-
-CONF = config.CONF
 
 
 class KvsIdentity(tests.TestCase, test_backend.IdentityTests):
     def setUp(self):
+        # NOTE(dstanek): setup the database for subsystems that only have a
+        # SQL backend (like credentials)
+        self.useFixture(database.Database())
+
         super(KvsIdentity, self).setUp()
-        identity.CONF.identity.driver = (
-            'keystone.identity.backends.kvs.Identity')
         self.load_backends()
         self.load_fixtures(default_fixtures)
+
+    def config_overrides(self):
+        super(KvsIdentity, self).config_overrides()
+        self.config_fixture.config(
+            group='identity',
+            driver='keystone.identity.backends.kvs.Identity')
+
+    def test_password_hashed(self):
+        driver = self.identity_api._select_identity_driver(
+            self.user_foo['domain_id'])
+        user_ref = driver._get_user(self.user_foo['id'])
+        self.assertNotEqual(user_ref['password'], self.user_foo['password'])
 
     def test_list_projects_for_user_with_grants(self):
         self.skipTest('kvs backend is now deprecated')
@@ -65,25 +76,17 @@ class KvsIdentity(tests.TestCase, test_backend.IdentityTests):
     def test_move_project_between_domains_with_clashing_names_fails(self):
         self.skipTest('Blocked by bug 1119770')
 
-    def test_delete_user_grant_no_user(self):
-        # See bug 1239476, kvs checks if user exists and sql does not.
-        self.assertRaises(
-            exception.UserNotFound,
-            super(KvsIdentity, self).test_delete_user_grant_no_user)
-
-    def test_delete_group_grant_no_group(self):
-        # See bug 1239476, kvs checks if group exists and sql does not.
-        self.assertRaises(
-            exception.GroupNotFound,
-            super(KvsIdentity, self).test_delete_group_grant_no_group)
-
 
 class KvsToken(tests.TestCase, test_backend.TokenTests):
     def setUp(self):
         super(KvsToken, self).setUp()
-        identity.CONF.identity.driver = (
-            'keystone.identity.backends.kvs.Identity')
         self.load_backends()
+
+    def config_overrides(self):
+        super(KvsToken, self).config_overrides()
+        self.config_fixture.config(
+            group='identity',
+            driver='keystone.identity.backends.kvs.Identity')
 
     def test_flush_expired_token(self):
         self.assertRaises(exception.NotImplemented,
@@ -103,7 +106,7 @@ class KvsToken(tests.TestCase, test_backend.TokenTests):
         self.token_api.driver._store.set(user_key, token_list)
 
     def test_cleanup_user_index_on_create(self):
-        user_id = unicode(uuid.uuid4().hex)
+        user_id = six.text_type(uuid.uuid4().hex)
         valid_token_id, data = self.create_token_sample_data(user_id=user_id)
         expired_token_id, expired_data = self.create_token_sample_data(
             user_id=user_id)
@@ -111,8 +114,7 @@ class KvsToken(tests.TestCase, test_backend.TokenTests):
         expire_delta = datetime.timedelta(seconds=86400)
 
         # NOTE(morganfainberg): Directly access the data cache since we need to
-        # get expired tokens as well as valid tokens. token_api.list_tokens()
-        # will not return any expired tokens in the list.
+        # get expired tokens as well as valid tokens.
         user_key = self.token_api.driver._prefix_user_id(user_id)
         user_token_list = self.token_api.driver._store.get(user_key)
         valid_token_ref = self.token_api.get_token(valid_token_id)
@@ -122,7 +124,7 @@ class KvsToken(tests.TestCase, test_backend.TokenTests):
                                                subsecond=True)),
             (expired_token_id, timeutils.isotime(expired_token_ref['expires'],
                                                  subsecond=True))]
-        self.assertEqual(user_token_list, expected_user_token_list)
+        self.assertEqual(expected_user_token_list, user_token_list)
         new_expired_data = (expired_token_id,
                             timeutils.isotime(
                                 (timeutils.utcnow() - expire_delta),
@@ -138,7 +140,7 @@ class KvsToken(tests.TestCase, test_backend.TokenTests):
             (valid_token_id_2, timeutils.isotime(valid_token_ref_2['expires'],
                                                  subsecond=True))]
         user_token_list = self.token_api.driver._store.get(user_key)
-        self.assertEqual(user_token_list, expected_user_token_list)
+        self.assertEqual(expected_user_token_list, user_token_list)
 
         # Test that revoked tokens are removed from the list on create.
         self.token_api.delete_token(valid_token_id_2)
@@ -150,33 +152,45 @@ class KvsToken(tests.TestCase, test_backend.TokenTests):
             (new_token_id, timeutils.isotime(new_token_ref['expires'],
                                              subsecond=True))]
         user_token_list = self.token_api.driver._store.get(user_key)
-        self.assertEqual(user_token_list, expected_user_token_list)
+        self.assertEqual(expected_user_token_list, user_token_list)
 
 
 class KvsTrust(tests.TestCase, test_backend.TrustTests):
     def setUp(self):
         super(KvsTrust, self).setUp()
-        identity.CONF.identity.driver = (
-            'keystone.identity.backends.kvs.Identity')
-        identity.CONF.trust.driver = (
-            'keystone.trust.backends.kvs.Trust')
-        identity.CONF.catalog.driver = (
-            'keystone.catalog.backends.kvs.Catalog')
         self.load_backends()
         self.load_fixtures(default_fixtures)
+
+    def config_overrides(self):
+        super(KvsTrust, self).config_overrides()
+        self.config_fixture.config(
+            group='identity',
+            driver='keystone.identity.backends.kvs.Identity')
+        self.config_fixture.config(
+            group='trust',
+            driver='keystone.trust.backends.kvs.Trust')
+        self.config_fixture.config(
+            group='catalog',
+            driver='keystone.catalog.backends.kvs.Catalog')
 
 
 class KvsCatalog(tests.TestCase, test_backend.CatalogTests):
     def setUp(self):
         super(KvsCatalog, self).setUp()
-        identity.CONF.identity.driver = (
-            'keystone.identity.backends.kvs.Identity')
-        identity.CONF.trust.driver = (
-            'keystone.trust.backends.kvs.Trust')
-        identity.CONF.catalog.driver = (
-            'keystone.catalog.backends.kvs.Catalog')
         self.load_backends()
         self._load_fake_catalog()
+
+    def config_overrides(self):
+        super(KvsCatalog, self).config_overrides()
+        self.config_fixture.config(
+            group='identity',
+            driver='keystone.identity.backends.kvs.Identity')
+        self.config_fixture.config(
+            group='trust',
+            driver='keystone.trust.backends.kvs.Trust')
+        self.config_fixture.config(
+            group='catalog',
+            driver='keystone.catalog.backends.kvs.Catalog')
 
     def _load_fake_catalog(self):
         self.catalog_foobar = self.catalog_api.driver._create_catalog(
@@ -200,12 +214,34 @@ class KvsCatalog(tests.TestCase, test_backend.CatalogTests):
         catalog_ref = self.catalog_api.get_catalog('foo', 'bar')
         self.assertDictEqual(catalog_ref, self.catalog_foobar)
 
+    def test_get_catalog_endpoint_disabled(self):
+        # This test doesn't apply to KVS because with the KVS backend the
+        # application creates the catalog (including the endpoints) for each
+        # user and project. Whether endpoints are enabled or disabled isn't
+        # a consideration.
+        f = super(KvsCatalog, self).test_get_catalog_endpoint_disabled
+        self.assertRaises(exception.NotFound, f)
+
+    def test_get_v3_catalog_endpoint_disabled(self):
+        # There's no need to have disabled endpoints in the kvs catalog. Those
+        # endpoints should just be removed from the store. This just tests
+        # what happens currently when the super impl is called.
+        f = super(KvsCatalog, self).test_get_v3_catalog_endpoint_disabled
+        self.assertRaises(exception.NotFound, f)
+
 
 class KvsTokenCacheInvalidation(tests.TestCase,
                                 test_backend.TokenCacheInvalidation):
     def setUp(self):
         super(KvsTokenCacheInvalidation, self).setUp()
-        CONF.identity.driver = 'keystone.identity.backends.kvs.Identity'
-        CONF.token.driver = 'keystone.token.backends.kvs.Token'
         self.load_backends()
         self._create_test_data()
+
+    def config_overrides(self):
+        super(KvsTokenCacheInvalidation, self).config_overrides()
+        self.config_fixture.config(
+            group='identity',
+            driver='keystone.identity.backends.kvs.Identity')
+        self.config_fixture.config(
+            group='token',
+            driver='keystone.token.backends.kvs.Token')

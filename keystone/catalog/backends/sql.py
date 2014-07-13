@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#
 # Copyright 2012 OpenStack Foundation
 # Copyright 2012 Canonical Ltd.
 #
@@ -16,11 +14,11 @@
 # under the License.
 
 import six
+import sqlalchemy
 
 from keystone import catalog
 from keystone.catalog import core
 from keystone.common import sql
-from keystone.common.sql import migration
 from keystone import config
 from keystone import exception
 
@@ -32,7 +30,7 @@ class Region(sql.ModelBase, sql.DictBase):
     __tablename__ = 'region'
     attributes = ['id', 'description', 'parent_region_id']
     id = sql.Column(sql.String(64), primary_key=True)
-    description = sql.Column(sql.String(255))
+    description = sql.Column(sql.String(255), nullable=False)
     # NOTE(jaypipes): Right now, using an adjacency list model for
     #                 storing the hierarchy of regions is fine, since
     #                 the API does not support any kind of querying for
@@ -55,17 +53,19 @@ class Region(sql.ModelBase, sql.DictBase):
 
 class Service(sql.ModelBase, sql.DictBase):
     __tablename__ = 'service'
-    attributes = ['id', 'type']
+    attributes = ['id', 'type', 'enabled']
     id = sql.Column(sql.String(64), primary_key=True)
     type = sql.Column(sql.String(255))
+    enabled = sql.Column(sql.Boolean, nullable=False, default=True,
+                         server_default=sqlalchemy.sql.expression.true())
     extra = sql.Column(sql.JsonBlob())
-    endpoints = sql.relationship("Endpoint", backref="service")
+    endpoints = sqlalchemy.orm.relationship("Endpoint", backref="service")
 
 
 class Endpoint(sql.ModelBase, sql.DictBase):
     __tablename__ = 'endpoint'
     attributes = ['id', 'interface', 'region', 'service_id', 'url',
-                  'legacy_endpoint_id']
+                  'legacy_endpoint_id', 'enabled']
     id = sql.Column(sql.String(64), primary_key=True)
     legacy_endpoint_id = sql.Column(sql.String(64))
     interface = sql.Column(sql.String(8), nullable=False)
@@ -74,16 +74,16 @@ class Endpoint(sql.ModelBase, sql.DictBase):
                             sql.ForeignKey('service.id'),
                             nullable=False)
     url = sql.Column(sql.Text(), nullable=False)
+    enabled = sql.Column(sql.Boolean, nullable=False, default=True,
+                         server_default=sqlalchemy.sql.expression.true())
     extra = sql.Column(sql.JsonBlob())
 
 
-class Catalog(sql.Base, catalog.Driver):
-    def db_sync(self, version=None):
-        migration.db_sync(version=version)
+class Catalog(catalog.Driver):
 
     # Regions
     def list_regions(self):
-        session = self.get_session()
+        session = sql.get_session()
         regions = session.query(Region).all()
         return [s.to_dict() for s in list(regions)]
 
@@ -117,29 +117,27 @@ class Catalog(sql.Base, catalog.Driver):
             self._get_region(session, parent_region_id)
 
     def get_region(self, region_id):
-        session = self.get_session()
+        session = sql.get_session()
         return self._get_region(session, region_id).to_dict()
 
     def delete_region(self, region_id):
-        session = self.get_session()
+        session = sql.get_session()
         with session.begin():
             ref = self._get_region(session, region_id)
             self._delete_child_regions(session, region_id)
-            session.query(Region).filter_by(id=region_id).delete()
             session.delete(ref)
-            session.flush()
 
-    def create_region(self, region_id, region_ref):
-        session = self.get_session()
+    @sql.handle_conflicts(conflict_type='region')
+    def create_region(self, region_ref):
+        session = sql.get_session()
         with session.begin():
             self._check_parent_region(session, region_ref)
             region = Region.from_dict(region_ref)
             session.add(region)
-            session.flush()
         return region.to_dict()
 
     def update_region(self, region_id, region_ref):
-        session = self.get_session()
+        session = sql.get_session()
         with session.begin():
             self._check_parent_region(session, region_ref)
             ref = self._get_region(session, region_id)
@@ -149,13 +147,14 @@ class Catalog(sql.Base, catalog.Driver):
             for attr in Region.attributes:
                 if attr != 'id':
                     setattr(ref, attr, getattr(new_region, attr))
-            session.flush()
         return ref.to_dict()
 
     # Services
-    def list_services(self):
-        session = self.get_session()
-        services = session.query(Service).all()
+    @sql.truncated
+    def list_services(self, hints):
+        session = sql.get_session()
+        services = session.query(Service)
+        services = sql.filter_limit_query(Service, services, hints)
         return [s.to_dict() for s in list(services)]
 
     def _get_service(self, session, service_id):
@@ -165,25 +164,25 @@ class Catalog(sql.Base, catalog.Driver):
         return ref
 
     def get_service(self, service_id):
-        session = self.get_session()
+        session = sql.get_session()
         return self._get_service(session, service_id).to_dict()
 
     def delete_service(self, service_id):
-        session = self.get_session()
+        session = sql.get_session()
         with session.begin():
             ref = self._get_service(session, service_id)
             session.query(Endpoint).filter_by(service_id=service_id).delete()
             session.delete(ref)
 
     def create_service(self, service_id, service_ref):
-        session = self.get_session()
+        session = sql.get_session()
         with session.begin():
             service = Service.from_dict(service_ref)
             session.add(service)
         return service.to_dict()
 
     def update_service(self, service_id, service_ref):
-        session = self.get_session()
+        session = sql.get_session()
         with session.begin():
             ref = self._get_service(session, service_id)
             old_dict = ref.to_dict()
@@ -197,7 +196,7 @@ class Catalog(sql.Base, catalog.Driver):
 
     # Endpoints
     def create_endpoint(self, endpoint_id, endpoint_ref):
-        session = self.get_session()
+        session = sql.get_session()
         self.get_service(endpoint_ref['service_id'])
         new_endpoint = Endpoint.from_dict(endpoint_ref)
         with session.begin():
@@ -205,7 +204,7 @@ class Catalog(sql.Base, catalog.Driver):
         return new_endpoint.to_dict()
 
     def delete_endpoint(self, endpoint_id):
-        session = self.get_session()
+        session = sql.get_session()
         with session.begin():
             ref = self._get_endpoint(session, endpoint_id)
             session.delete(ref)
@@ -217,16 +216,18 @@ class Catalog(sql.Base, catalog.Driver):
             raise exception.EndpointNotFound(endpoint_id=endpoint_id)
 
     def get_endpoint(self, endpoint_id):
-        session = self.get_session()
+        session = sql.get_session()
         return self._get_endpoint(session, endpoint_id).to_dict()
 
-    def list_endpoints(self):
-        session = self.get_session()
+    @sql.truncated
+    def list_endpoints(self, hints):
+        session = sql.get_session()
         endpoints = session.query(Endpoint)
+        endpoints = sql.filter_limit_query(Endpoint, endpoints, hints)
         return [e.to_dict() for e in list(endpoints)]
 
     def update_endpoint(self, endpoint_id, endpoint_ref):
-        session = self.get_session()
+        session = sql.get_session()
         with session.begin():
             ref = self._get_endpoint(session, endpoint_id)
             old_dict = ref.to_dict()
@@ -243,14 +244,22 @@ class Catalog(sql.Base, catalog.Driver):
         d.update({'tenant_id': tenant_id,
                   'user_id': user_id})
 
-        session = self.get_session()
+        session = sql.get_session()
+        t = True  # variable for singleton for PEP8, E712.
         endpoints = (session.query(Endpoint).
                      options(sql.joinedload(Endpoint.service)).
-                     all())
+                     filter(Endpoint.enabled == t).all())
 
         catalog = {}
 
         for endpoint in endpoints:
+            if not endpoint.service['enabled']:
+                continue
+            try:
+                url = core.format_url(endpoint['url'], d)
+            except exception.MalformedEndpoint:
+                continue  # this failure is already logged in format_url()
+
             region = endpoint['region']
             service_type = endpoint.service['type']
             default_service = {
@@ -260,7 +269,6 @@ class Catalog(sql.Base, catalog.Driver):
             }
             catalog.setdefault(region, {})
             catalog[region].setdefault(service_type, default_service)
-            url = core.format_url(endpoint['url'], d)
             interface_url = '%sURL' % endpoint['interface']
             catalog[region][service_type][interface_url] = url
 
@@ -271,19 +279,30 @@ class Catalog(sql.Base, catalog.Driver):
         d.update({'tenant_id': tenant_id,
                   'user_id': user_id})
 
-        session = self.get_session()
-        services = (session.query(Service).
+        session = sql.get_session()
+        t = True  # variable for singleton for PEP8, E712.
+        services = (session.query(Service).filter(Service.enabled == t).
                     options(sql.joinedload(Service.endpoints)).
                     all())
 
-        def make_v3_endpoint(endpoint):
-            del endpoint['service_id']
-            endpoint['url'] = core.format_url(endpoint['url'], d)
-            return endpoint
+        def make_v3_endpoints(endpoints):
+            for endpoint in (ep.to_dict() for ep in endpoints if ep.enabled):
+                del endpoint['service_id']
+                del endpoint['legacy_endpoint_id']
+                del endpoint['enabled']
+                try:
+                    endpoint['url'] = core.format_url(endpoint['url'], d)
+                except exception.MalformedEndpoint:
+                    continue  # this failure is already logged in format_url()
 
-        catalog = [{'endpoints': [make_v3_endpoint(ep.to_dict())
-                                  for ep in svc.endpoints],
-                    'id': svc.id,
-                    'type': svc.type} for svc in services]
+                yield endpoint
 
-        return catalog
+        def make_v3_service(svc):
+            eps = list(make_v3_endpoints(svc.endpoints))
+            service = {'endpoints': eps, 'id': svc.id, 'type': svc.type}
+            name = svc.extra.get('name')
+            if name:
+                service['name'] = name
+            return service
+
+        return [make_v3_service(svc) for svc in services]

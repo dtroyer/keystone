@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 Red Hat, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -95,9 +93,13 @@ and consumption of PEM formatted data including:
 """
 
 import base64
-import io
-from keystone.common import base64utils
 import re
+
+import six
+
+from keystone.common import base64utils
+from keystone.openstack.common.gettextutils import _
+
 
 PEM_TYPE_TO_HEADER = {
     u'cms': u'CMS',
@@ -248,8 +250,6 @@ class PEMParseResult(object):
             self._pem_type = pem_type
             self._pem_header = pem_header
 
-#------------------------------------------------------------------------------
-
 
 def pem_search(text, start=0):
     """Search for a block of PEM formatted data
@@ -319,7 +319,7 @@ def parse_pem(text, pem_type=None, max_items=None):
     """Scan text for PEM data, return list of PEM items
 
     The input text is scanned for PEM blocks, for each one found a
-    PEMParseResult is contructed and added to the return list.
+    PEMParseResult is constructed and added to the return list.
 
     pem_type operates as a filter on the type of PEM desired. If
     pem_type is specified only those PEM blocks which match will be
@@ -390,7 +390,7 @@ def parse_pem(text, pem_type=None, max_items=None):
                   '%(position)d: %(err_msg)s') %
                 {'pem_type': block.pem_type,
                  'position': block.pem_start,
-                 'err_msg': str(e)})
+                 'err_msg': six.text_type(e)})
         else:
             block.binary_data = binary_data
 
@@ -468,7 +468,7 @@ def base64_to_pem(base64_text, pem_type='cert'):
 
     """
     pem_header = PEM_TYPE_TO_HEADER[pem_type]
-    buf = io.StringIO()
+    buf = six.StringIO()
 
     buf.write(u'-----BEGIN %s-----' % pem_header)
     buf.write(u'\n')

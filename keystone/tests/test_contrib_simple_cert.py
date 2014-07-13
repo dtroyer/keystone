@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
 # a copy of the License at
@@ -35,7 +33,7 @@ class TestSimpleCert(BaseTestCase):
                                 headers={'Accept': content_type},
                                 expected_status=200)
 
-        self.assertEqual(response.content_type.lower(), content_type)
+        self.assertEqual(content_type, response.content_type.lower())
         self.assertIn('---BEGIN', response.body)
 
         return response
@@ -48,28 +46,12 @@ class TestSimpleCert(BaseTestCase):
 
     def test_missing_file(self):
         # these files do not exist
-        self.opt_in_group('signing',
-                          ca_certs=uuid.uuid4().hex,
-                          certfile=uuid.uuid4().hex)
+        self.config_fixture.config(group='signing',
+                                   ca_certs=uuid.uuid4().hex,
+                                   certfile=uuid.uuid4().hex)
 
         for path in [self.CA_PATH, self.CERT_PATH]:
             self.request(app=self.public_app,
                          method='GET',
                          path=path,
                          expected_status=500)
-
-
-class UUIDSimpleCertTests(BaseTestCase):
-
-    def setUp(self):
-        uuid_provider = 'keystone.token.providers.uuid.Provider'
-        self.opt_in_group('token', provider=uuid_provider)
-
-        super(UUIDSimpleCertTests, self).setUp()
-
-    def test_using_uuid_controller(self):
-        for path in [self.CA_PATH, self.CERT_PATH]:
-            self.request(app=self.public_app,
-                         method='GET',
-                         path=path,
-                         expected_status=403)

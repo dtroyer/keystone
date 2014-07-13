@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -24,9 +22,6 @@ CONF = config.CONF
 class SqlFederation(test_backend_sql.SqlModels):
     """Set of tests for checking SQL Federation."""
 
-    def setUp(self):
-        super(SqlFederation, self).setUp()
-
     def test_identity_provider(self):
         cols = (('id', sql.String, 64),
                 ('enabled', sql.Boolean, None),
@@ -38,3 +33,8 @@ class SqlFederation(test_backend_sql.SqlModels):
                 ('idp_id', sql.String, 64),
                 ('mapping_id', sql.String, 64))
         self.assertExpectedSchema('federation_protocol', cols)
+
+    def test_mapping(self):
+        cols = (('id', sql.String, 64),
+                ('rules', sql.JsonBlob, None))
+        self.assertExpectedSchema('mapping', cols)

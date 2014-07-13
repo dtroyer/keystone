@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#
 # Copyright (C) 2011 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -163,7 +161,7 @@ class Trust(Model):
     """
 
     required_keys = ('id', 'trustor_user_id', 'trustee_user_id', 'project_id')
-    optional_keys = tuple('expires_at')
+    optional_keys = ('expires_at',)
 
 
 class Domain(Model):

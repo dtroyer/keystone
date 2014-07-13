@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -52,7 +50,7 @@ def append_v3_routers(mapper, routers):
     mapper.connect('/groups/{group_id}/users/{user_id}',
                    controller=user_controller,
                    action='check_user_in_group',
-                   conditions=dict(method=['HEAD']))
+                   conditions=dict(method=['GET', 'HEAD']))
 
     mapper.connect('/groups/{group_id}/users/{user_id}',
                    controller=user_controller,

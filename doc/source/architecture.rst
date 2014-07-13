@@ -128,7 +128,7 @@ implementations. The drivers for the services are:
 
 If you implement a backend driver for one of the keystone services, you're
 expected to subclass from these classes. The default response for the defined
-apis in these Drivers is to raise a :mod:`keystone.service.TokenController`.
+APIs in these Drivers is to raise a :mod:`keystone.service.TokenController`.
 
 
 SQL Backend
@@ -183,7 +183,7 @@ more data than they know what to do with and pass them on to a backend.
 There are a few main data types:
 
  * **User**: has account credentials, is associated with one or more tenants
- * **Tenant**: unit of ownership in openstack, contains one or more users
+ * **Tenant**: unit of ownership in OpenStack, contains one or more users
  * **Role**: a first-class piece of metadata associated with many user-tenant pairs.
  * **Token**: identifying credential associated with a user or user and tenant
  * **Extras**: bucket of key-value metadata associated with a user-tenant pair.
@@ -231,7 +231,9 @@ Rules
 -----
 
 Given a list of matches to check for, simply verify that the credentials
-contain the matches. For example::
+contain the matches. For example:
+
+.. code:: python
 
   credentials = {'user_id': 'foo', 'is_admin': 1, 'roles': ['nova:netadmin']}
 
@@ -255,7 +257,9 @@ Capability RBAC
 (Not yet implemented.)
 
 Another approach to authorization can be action-based, with a mapping of roles
-to which capabilities are allowed for that role. For example::
+to which capabilities are allowed for that role. For example:
+
+.. code:: python
 
   credentials = {'user_id': 'foo', 'is_admin': 1, 'roles': ['nova:netadmin']}
 
@@ -265,4 +269,4 @@ to which capabilities are allowed for that role. For example::
   policy_api.enforce(('action:nova:add_network',), credentials)
 
 In the backend this would look up the policy for 'action:nova:add_network' and
-then do what is effectively a 'Simple Match' style match against the creds.
+then do what is effectively a 'Simple Match' style match against the credentials.

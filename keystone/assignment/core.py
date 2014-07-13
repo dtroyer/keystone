@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -28,6 +26,7 @@ from keystone.common import manager
 from keystone import config
 from keystone import exception
 from keystone import notifications
+from keystone.openstack.common.gettextutils import _
 from keystone.openstack.common import log
 
 
@@ -49,6 +48,7 @@ def calc_default_domain():
 
 
 @dependency.provider('assignment_api')
+@dependency.optional('revoke_api')
 @dependency.requires('credential_api', 'identity_api', 'token_api')
 class Manager(manager.Manager):
     """Default pivot point for the Assignment backend.
@@ -59,6 +59,7 @@ class Manager(manager.Manager):
     The late import works around this.  The if block prevents creation of the
     api object by both managers.
     """
+    _PROJECT = 'project'
 
     def __init__(self):
         assignment_driver = CONF.assignment.driver
@@ -69,7 +70,7 @@ class Manager(manager.Manager):
 
         super(Manager, self).__init__(assignment_driver)
 
-    @notifications.created('project')
+    @notifications.created(_PROJECT)
     def create_project(self, tenant_id, tenant):
         tenant = tenant.copy()
         tenant.setdefault('enabled', True)
@@ -82,22 +83,28 @@ class Manager(manager.Manager):
                                          ret['domain_id'])
         return ret
 
-    @notifications.updated('project')
+    @notifications.disabled(_PROJECT, public=False)
+    def _disable_project(self, tenant_id):
+        return self.token_api.delete_tokens_for_users(
+            self.list_user_ids_for_project(tenant_id),
+            project_id=tenant_id)
+
+    @notifications.updated(_PROJECT)
     def update_project(self, tenant_id, tenant):
+        original_tenant = self.driver.get_project(tenant_id)
         tenant = tenant.copy()
         if 'enabled' in tenant:
             tenant['enabled'] = clean.project_enabled(tenant['enabled'])
-        if not tenant.get('enabled', True):
-            self.token_api.delete_tokens_for_users(
-                self.list_user_ids_for_project(tenant_id),
-                project_id=tenant_id)
+        if (original_tenant.get('enabled', True) and
+                not tenant.get('enabled', True)):
+            self._disable_project(tenant_id)
         ret = self.driver.update_project(tenant_id, tenant)
         self.get_project.invalidate(self, tenant_id)
-        self.get_project_by_name.invalidate(self, ret['name'],
-                                            ret['domain_id'])
+        self.get_project_by_name.invalidate(self, original_tenant['name'],
+                                            original_tenant['domain_id'])
         return ret
 
-    @notifications.deleted('project')
+    @notifications.deleted(_PROJECT)
     def delete_project(self, tenant_id):
         project = self.driver.get_project(tenant_id)
         user_ids = self.list_user_ids_for_project(tenant_id)
@@ -240,7 +247,7 @@ class Manager(manager.Manager):
             role = {'id': CONF.member_role_id,
                     'name': CONF.member_role_name}
             self.driver.create_role(config.CONF.member_role_id, role)
-            #now that default role exists, the add should succeed
+            # now that default role exists, the add should succeed
             self.driver.add_role_to_user_and_project(
                 user_id,
                 tenant_id,
@@ -261,11 +268,16 @@ class Manager(manager.Manager):
                 self.driver.remove_role_from_user_and_project(user_id,
                                                               tenant_id,
                                                               role_id)
+                if self.revoke_api:
+                    self.revoke_api.revoke_by_grant(role_id, user_id=user_id,
+                                                    project_id=tenant_id)
+
             except exception.RoleNotFound:
-                LOG.debug(_("Removing role %s failed because it does not "
-                            "exist."),
+                LOG.debug("Removing role %s failed because it does not exist.",
                           role_id)
 
+    # TODO(henry-nash): We might want to consider list limiting this at some
+    # point in the future.
     def list_projects_for_user(self, user_id, hints=None):
         # NOTE(henry-nash): In order to get a complete list of user projects,
         # the driver will need to look at group assignments.  To avoid cross
@@ -289,26 +301,40 @@ class Manager(manager.Manager):
     def get_domain_by_name(self, domain_name):
         return self.driver.get_domain_by_name(domain_name)
 
+    @notifications.created('domain')
     def create_domain(self, domain_id, domain):
+        domain.setdefault('enabled', True)
+        domain['enabled'] = clean.domain_enabled(domain['enabled'])
         ret = self.driver.create_domain(domain_id, domain)
         if SHOULD_CACHE(ret):
             self.get_domain.set(ret, self, domain_id)
             self.get_domain_by_name.set(ret, self, ret['name'])
         return ret
 
+    @manager.response_truncated
     def list_domains(self, hints=None):
         return self.driver.list_domains(hints or driver_hints.Hints())
 
+    @notifications.disabled('domain', public=False)
+    def _disable_domain(self, domain_id):
+        self.token_api.delete_tokens_for_domain(domain_id)
+
+    @notifications.updated('domain')
     def update_domain(self, domain_id, domain):
+        original_domain = self.driver.get_domain(domain_id)
+        if 'enabled' in domain:
+            domain['enabled'] = clean.domain_enabled(domain['enabled'])
         ret = self.driver.update_domain(domain_id, domain)
         # disable owned users & projects when the API user specifically set
         #     enabled=False
-        if not domain.get('enabled', True):
-            self.token_api.delete_tokens_for_domain(domain_id)
+        if (original_domain.get('enabled', True) and
+                not domain.get('enabled', True)):
+            self._disable_domain(domain_id)
         self.get_domain.invalidate(self, domain_id)
-        self.get_domain_by_name.invalidate(self, ret['name'])
+        self.get_domain_by_name.invalidate(self, original_domain['name'])
         return ret
 
+    @notifications.deleted('domain')
     def delete_domain(self, domain_id):
         # explicitly forbid deleting the default domain (this should be a
         # carefully orchestrated manual process involving configuration
@@ -325,7 +351,8 @@ class Manager(manager.Manager):
         # to get a valid token to issue this delete.
         if domain['enabled']:
             raise exception.ForbiddenAction(
-                action=_('delete a domain that is not disabled'))
+                action=_('cannot delete a domain that is enabled, '
+                         'please disable it first.'))
 
         self._delete_domain_contents(domain_id)
         self.driver.delete_domain(domain_id)
@@ -351,9 +378,9 @@ class Manager(manager.Manager):
         Users: Reference domains for grants
 
         """
-        user_refs = self.identity_api.list_users()
+        user_refs = self.identity_api.list_users(domain_scope=domain_id)
         proj_refs = self.list_projects()
-        group_refs = self.identity_api.list_groups()
+        group_refs = self.identity_api.list_groups(domain_scope=domain_id)
 
         # First delete the projects themselves
         for project in proj_refs:
@@ -361,9 +388,9 @@ class Manager(manager.Manager):
                 try:
                     self.delete_project(project['id'])
                 except exception.ProjectNotFound:
-                    LOG.debug(_('Project %(projectid)s not found when '
-                                'deleting domain contents for %(domainid)s, '
-                                'continuing with cleanup.'),
+                    LOG.debug(('Project %(projectid)s not found when '
+                               'deleting domain contents for %(domainid)s, '
+                               'continuing with cleanup.'),
                               {'projectid': project['id'],
                                'domainid': domain_id})
 
@@ -371,27 +398,26 @@ class Manager(manager.Manager):
             # Cleanup any existing groups.
             if group['domain_id'] == domain_id:
                 try:
-                    self.identity_api.delete_group(group['id'],
-                                                   domain_scope=domain_id)
+                    self.identity_api.delete_group(group['id'])
                 except exception.GroupNotFound:
-                    LOG.debug(_('Group %(groupid)s not found when deleting '
-                                'domain contents for %(domainid)s, continuing '
-                                'with cleanup.'),
+                    LOG.debug(('Group %(groupid)s not found when deleting '
+                               'domain contents for %(domainid)s, continuing '
+                               'with cleanup.'),
                               {'groupid': group['id'], 'domainid': domain_id})
 
         # And finally, delete the users themselves
         for user in user_refs:
             if user['domain_id'] == domain_id:
                 try:
-                    self.identity_api.delete_user(user['id'],
-                                                  domain_scope=domain_id)
+                    self.identity_api.delete_user(user['id'])
                 except exception.UserNotFound:
-                    LOG.debug(_('User %(userid)s not found when '
-                                'deleting domain contents for %(domainid)s, '
-                                'continuing with cleanup.'),
+                    LOG.debug(('User %(userid)s not found when '
+                               'deleting domain contents for %(domainid)s, '
+                               'continuing with cleanup.'),
                               {'userid': user['id'],
                                'domainid': domain_id})
 
+    @manager.response_truncated
     def list_projects(self, hints=None):
         return self.driver.list_projects(hints or driver_hints.Hints())
 
@@ -427,6 +453,7 @@ class Manager(manager.Manager):
             self.get_role.set(ret, self, role_id)
         return ret
 
+    @manager.response_truncated
     def list_roles(self, hints=None):
         return self.driver.list_roles(hints or driver_hints.Hints())
 
@@ -467,22 +494,36 @@ class Manager(manager.Manager):
     def remove_role_from_user_and_project(self, user_id, tenant_id, role_id):
         self.driver.remove_role_from_user_and_project(user_id, tenant_id,
                                                       role_id)
-        self.token_api.delete_tokens_for_user(user_id)
+        if CONF.token.revoke_by_id:
+            self.token_api.delete_tokens_for_user(user_id)
+        if self.revoke_api:
+            self.revoke_api.revoke_by_grant(role_id, user_id=user_id,
+                                            project_id=tenant_id)
 
     def delete_grant(self, role_id, user_id=None, group_id=None,
                      domain_id=None, project_id=None,
                      inherited_to_projects=False):
         user_ids = []
-        if group_id is not None:
-            # NOTE(morganfainberg): The user ids are the important part for
-            # invalidating tokens below, so extract them here.
+        if group_id is None:
+            if self.revoke_api:
+                self.revoke_api.revoke_by_grant(user_id=user_id,
+                                                role_id=role_id,
+                                                domain_id=domain_id,
+                                                project_id=project_id)
+        else:
             try:
+                # NOTE(morganfainberg): The user ids are the important part
+                # for invalidating tokens below, so extract them here.
                 for user in self.identity_api.list_users_in_group(group_id,
                                                                   domain_id):
                     if user['id'] != user_id:
                         user_ids.append(user['id'])
+                        if self.revoke_api:
+                            self.revoke_api.revoke_by_grant(
+                                user_id=user['id'], role_id=role_id,
+                                domain_id=domain_id, project_id=project_id)
             except exception.GroupNotFound:
-                LOG.debug(_('Group %s not found, no tokens to invalidate.'),
+                LOG.debug('Group %s not found, no tokens to invalidate.',
                           group_id)
 
         self.driver.delete_grant(role_id, user_id, group_id, domain_id,
@@ -525,8 +566,8 @@ class Manager(manager.Manager):
                         target = _('Domain (%s)') % assignment['domain_id']
                     else:
                         target = _('Unknown Target')
-                    msg = _('Group (%(group)s), referenced in assignment '
-                            'for %(target)s, not found - ignoring.')
+                    msg = ('Group (%(group)s), referenced in assignment '
+                           'for %(target)s, not found - ignoring.')
                     LOG.debug(msg, {'group': assignment['group_id'],
                                     'target': target})
                     continue
@@ -589,6 +630,9 @@ class Driver(object):
         role_set.remove(frozenset(self._role_to_dict(role_id,
                                                      inherited).items()))
         return [dict(r) for r in role_set]
+
+    def _get_list_limit(self):
+        return CONF.assignment.list_limit or CONF.list_limit
 
     @abc.abstractmethod
     def get_project_by_name(self, tenant_name, domain_id):
@@ -810,6 +854,47 @@ class Driver(object):
         raise exception.NotImplemented()
 
     @abc.abstractmethod
+    def get_roles_for_groups(self, group_ids, project_id=None, domain_id=None):
+        """List all the roles assigned to groups on either domain or
+        project.
+
+        If the project_id is not None, this value will be used, no matter what
+        was specified in the domain_id.
+
+        :param group_ids: iterable with group ids
+        :param project_id: id of the project
+        :param domain_id: id of the domain
+
+        :raises: AttributeError: In case both project_id and domain_id are set
+                                 to None
+
+        :returns: a list of Role entities matching groups and
+                  project_id or domain_id
+
+        """
+        raise exception.NotImplemented()
+
+    @abc.abstractmethod
+    def list_projects_for_groups(self, group_ids):
+        """List projects accessible to specified groups.
+
+        :param group_ids: List of group ids.
+        :returns: List of projects accessible to specified groups.
+
+        """
+        raise exception.NotImplemented()
+
+    @abc.abstractmethod
+    def list_domains_for_groups(self, group_ids):
+        """List domains accessible to specified groups.
+
+        :param group_ids: List of group ids.
+        :returns: List of domains accessible to specified groups.
+
+        """
+        raise exception.NotImplemented()
+
+    @abc.abstractmethod
     def get_project(self, project_id):
         """Get a project by ID.
 
@@ -838,7 +923,6 @@ class Driver(object):
         """
         raise exception.NotImplemented()
 
-    """Interface description for an assignment driver."""
     # role crud
 
     @abc.abstractmethod
@@ -891,7 +975,7 @@ class Driver(object):
         """
         raise exception.NotImplemented()
 
-#TODO(ayoung): determine what else these two functions raise
+# TODO(ayoung): determine what else these two functions raise
     @abc.abstractmethod
     def delete_user(self, user_id):
         """Deletes all assignments for a user.
@@ -910,9 +994,9 @@ class Driver(object):
         """
         raise exception.NotImplemented()
 
-    #domain management functions for backends that only allow a single domain.
-    #currently, this is only LDAP, but might be used by PAM or other backends
-    #as well.  This is used by both identity and assignment drivers.
+    # domain management functions for backends that only allow a single
+    # domain.  currently, this is only LDAP, but might be used by PAM or other
+    # backends as well.  This is used by both identity and assignment drivers.
     def _set_default_domain(self, ref):
         """If the domain ID has not been set, set it to the default."""
         if isinstance(ref, dict):

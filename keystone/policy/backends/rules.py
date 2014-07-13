@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 OpenStack, LLC.
 # All Rights Reserved.
 #
@@ -97,7 +95,7 @@ def enforce(credentials, action, target, do_raise=True):
 
 class Policy(policy.Driver):
     def enforce(self, credentials, action, target):
-        LOG.debug(_('enforce %(action)s: %(credentials)s'), {
+        LOG.debug('enforce %(action)s: %(credentials)s', {
             'action': action,
             'credentials': credentials})
         enforce(credentials, action, target)

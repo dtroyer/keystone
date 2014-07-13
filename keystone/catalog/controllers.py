@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 # Copyright 2012 Canonical Ltd.
 #
@@ -21,7 +19,9 @@ import six
 
 from keystone.common import controller
 from keystone.common import dependency
+from keystone.common import wsgi
 from keystone import exception
+from keystone.openstack.common.gettextutils import _
 
 
 INTERFACES = ['public', 'internal', 'admin']
@@ -143,17 +143,34 @@ class RegionV3(controller.V3Controller):
     collection_name = 'regions'
     member_name = 'region'
 
-    def __init__(self):
-        super(RegionV3, self).__init__()
-        self.get_member_from_driver = self.catalog_api.get_region
+    def create_region_with_id(self, context, region_id, region):
+        """Create a region with a user-specified ID.
+
+        This method is unprotected because it depends on ``self.create_region``
+        to enforce policy.
+        """
+        if 'id' in region and region_id != region['id']:
+            raise exception.ValidationError(
+                _('Conflicting region IDs specified: '
+                  '"%(url_id)s" != "%(ref_id)s"') % {
+                      'url_id': region_id,
+                      'ref_id': region['id']})
+        region['id'] = region_id
+        return self.create_region(context, region)
 
     @controller.protected()
     def create_region(self, context, region):
-        ref = self._assign_unique_id(self._normalize_dict(region))
+        ref = self._normalize_dict(region)
 
-        ref = self.catalog_api.create_region(ref['id'], ref)
-        return RegionV3.wrap_member(context, ref)
+        if 'id' not in ref:
+            ref = self._assign_unique_id(ref)
 
+        ref = self.catalog_api.create_region(ref)
+        return wsgi.render_response(
+            RegionV3.wrap_member(context, ref),
+            status=(201, 'Created'))
+
+    @controller.protected()
     def list_regions(self, context):
         refs = self.catalog_api.list_regions()
         return RegionV3.wrap_collection(context, refs)
@@ -184,8 +201,15 @@ class ServiceV3(controller.V3Controller):
         super(ServiceV3, self).__init__()
         self.get_member_from_driver = self.catalog_api.get_service
 
+    def _validate_service(self, service):
+        if 'enabled' in service and not isinstance(service['enabled'], bool):
+            msg = _('Enabled field must be a boolean')
+            raise exception.ValidationError(message=msg)
+
     @controller.protected()
     def create_service(self, context, service):
+        self._validate_service(service)
+
         ref = self._assign_unique_id(self._normalize_dict(service))
         self._require_attribute(ref, 'type')
 
@@ -195,7 +219,7 @@ class ServiceV3(controller.V3Controller):
     @controller.filterprotected('type')
     def list_services(self, context, filters):
         hints = ServiceV3.build_driver_hints(context, filters)
-        refs = self.catalog_api.list_services()
+        refs = self.catalog_api.list_services(hints=hints)
         return ServiceV3.wrap_collection(context, refs, hints=hints)
 
     @controller.protected()
@@ -206,6 +230,7 @@ class ServiceV3(controller.V3Controller):
     @controller.protected()
     def update_service(self, context, service_id, service):
         self._require_matching_id(service_id, service)
+        self._validate_service(service)
 
         ref = self.catalog_api.update_service(service_id, service)
         return ServiceV3.wrap_member(context, ref)
@@ -235,11 +260,19 @@ class EndpointV3(controller.V3Controller):
         ref = cls.filter_endpoint(ref)
         return super(EndpointV3, cls).wrap_member(context, ref)
 
+    def _validate_endpoint(self, endpoint):
+        if 'enabled' in endpoint and not isinstance(endpoint['enabled'], bool):
+            msg = _('Enabled field must be a boolean')
+            raise exception.ValidationError(message=msg)
+
     @controller.protected()
     def create_endpoint(self, context, endpoint):
+        self._validate_endpoint(endpoint)
+
         ref = self._assign_unique_id(self._normalize_dict(endpoint))
         self._require_attribute(ref, 'service_id')
         self._require_attribute(ref, 'interface')
+        self._require_attribute(ref, 'url')
         self.catalog_api.get_service(ref['service_id'])
 
         ref = self.catalog_api.create_endpoint(ref['id'], ref)
@@ -248,7 +281,7 @@ class EndpointV3(controller.V3Controller):
     @controller.filterprotected('interface', 'service_id')
     def list_endpoints(self, context, filters):
         hints = EndpointV3.build_driver_hints(context, filters)
-        refs = self.catalog_api.list_endpoints()
+        refs = self.catalog_api.list_endpoints(hints=hints)
         return EndpointV3.wrap_collection(context, refs, hints=hints)
 
     @controller.protected()
@@ -259,6 +292,7 @@ class EndpointV3(controller.V3Controller):
     @controller.protected()
     def update_endpoint(self, context, endpoint_id, endpoint):
         self._require_matching_id(endpoint_id, endpoint)
+        self._validate_endpoint(endpoint)
 
         if 'service_id' in endpoint:
             self.catalog_api.get_service(endpoint['service_id'])

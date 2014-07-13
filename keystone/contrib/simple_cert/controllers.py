@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
 # a copy of the License at
@@ -18,7 +16,6 @@ import webob
 from keystone.common import controller
 from keystone.common import dependency
 from keystone import exception
-from keystone.token.providers import pki
 
 CONF = cfg.CONF
 
@@ -27,10 +24,6 @@ CONF = cfg.CONF
 class SimpleCert(controller.V3Controller):
 
     def _get_certificate(self, name):
-        # If we aren't using the PKI Provider then we should return a 403
-        if not isinstance(self.token_provider_api.driver, pki.Provider):
-            raise exception.PKITokenExpected()
-
         try:
             with open(name, 'r') as f:
                 body = f.read()

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -25,13 +23,23 @@ CONF = config.CONF
 
 
 class ConfigTestCase(tests.TestCase):
+
+    def config_files(self):
+        config_files = super(ConfigTestCase, self).config_files()
+        # Insert the keystone sample as the first config file to be loaded
+        # since it is used in one of the code paths to determine the paste-ini
+        # location.
+        config_files.insert(0, tests.dirs.etc('keystone.conf.sample'))
+        return config_files
+
     def test_paste_config(self):
         self.assertEqual(config.find_paste_config(),
                          tests.dirs.etc('keystone-paste.ini'))
-        self.opt_in_group('paste_deploy', config_file=uuid.uuid4().hex)
+        self.config_fixture.config(group='paste_deploy',
+                                   config_file=uuid.uuid4().hex)
         self.assertRaises(exception.ConfigFileNotFound,
                           config.find_paste_config)
-        self.opt_in_group('paste_deploy', config_file='')
+        self.config_fixture.config(group='paste_deploy', config_file='')
         self.assertEqual(config.find_paste_config(),
                          tests.dirs.etc('keystone.conf.sample'))
 
@@ -45,32 +53,30 @@ class ConfigTestCase(tests.TestCase):
 class DeprecatedTestCase(tests.TestCase):
     """Test using the original (deprecated) name for renamed options."""
 
-    def setUp(self):
-        super(DeprecatedTestCase, self).setUp()
-        self.config([tests.dirs.etc('keystone.conf.sample'),
-                     tests.dirs.tests('test_overrides.conf'),
-                     tests.dirs.tests('deprecated.conf'), ])
+    def config_files(self):
+        config_files = super(DeprecatedTestCase, self).config_files()
+        config_files.append(tests.dirs.tests_conf('deprecated.conf'))
+        return config_files
 
     def test_sql(self):
         # Options in [sql] were moved to [database] in Icehouse for the change
         # to use oslo-incubator's db.sqlalchemy.sessions.
 
-        self.assertEqual(CONF.database.connection, 'sqlite://deprecated')
-        self.assertEqual(CONF.database.idle_timeout, 54321)
+        self.assertEqual('sqlite://deprecated', CONF.database.connection)
+        self.assertEqual(54321, CONF.database.idle_timeout)
 
 
 class DeprecatedOverrideTestCase(tests.TestCase):
     """Test using the deprecated AND new name for renamed options."""
 
-    def setUp(self):
-        super(DeprecatedOverrideTestCase, self).setUp()
-        self.config([tests.dirs.etc('keystone.conf.sample'),
-                     tests.dirs.tests('test_overrides.conf'),
-                     tests.dirs.tests('deprecated_override.conf'), ])
+    def config_files(self):
+        config_files = super(DeprecatedOverrideTestCase, self).config_files()
+        config_files.append(tests.dirs.tests_conf('deprecated_override.conf'))
+        return config_files
 
     def test_sql(self):
         # Options in [sql] were moved to [database] in Icehouse for the change
         # to use oslo-incubator's db.sqlalchemy.sessions.
 
-        self.assertEqual(CONF.database.connection, 'sqlite://new')
-        self.assertEqual(CONF.database.idle_timeout, 65432)
+        self.assertEqual('sqlite://new', CONF.database.connection)
+        self.assertEqual(65432, CONF.database.idle_timeout)

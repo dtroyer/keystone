@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -15,26 +13,30 @@
 # under the License.
 
 from keystone import auth
+from keystone.common import controller
 from keystone.common import dependency
-from keystone.contrib import oauth1
 from keystone.contrib.oauth1 import core as oauth
 from keystone.contrib.oauth1 import validator
 from keystone import exception
+from keystone.openstack.common.gettextutils import _
 from keystone.openstack.common import log
 from keystone.openstack.common import timeutils
 
 
-METHOD_NAME = 'oauth1'
 LOG = log.getLogger(__name__)
 
 
-@dependency.requires('oauth_api')
+@dependency.optional('oauth_api')
 class OAuth(auth.AuthMethodHandler):
-    def __init__(self):
-        self.oauth_api = oauth1.Manager()
+
+    method = 'oauth1'
 
     def authenticate(self, context, auth_info, auth_context):
         """Turn a signed request with an access key into a keystone token."""
+
+        if not self.oauth_api:
+            raise exception.Unauthorized(_('%s not supported') % self.method)
+
         headers = context['headers']
         oauth_headers = oauth.get_oauth_headers(headers)
         access_token_id = oauth_headers.get('oauth_token')
@@ -53,7 +55,7 @@ class OAuth(auth.AuthMethodHandler):
             if now > expires:
                 raise exception.Unauthorized(_('Access token is expired'))
 
-        url = oauth.rebuild_url(context['path'])
+        url = controller.V3Controller.base_url(context, context['path'])
         access_verifier = oauth.ResourceEndpoint(
             request_validator=validator.OAuthValidator(),
             token_generator=oauth.token_generator)

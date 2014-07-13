@@ -1,6 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-#
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
 # a copy of the License at
@@ -36,15 +33,17 @@ EXTENSION_DATA = {
     'alias': 'OS-FEDERATION',
     'updated': '2013-12-17T12:00:0-00:00',
     'description': 'OpenStack Identity Providers Mechanism.',
-    'links': [
-            {
-            'rel': 'describedby',
-            'type': 'text/html',
-            'href': 'https://github.com/openstack/identity-api'
-            }
-    ]}
+    'links': [{
+        'rel': 'describedby',
+        'type': 'text/html',
+        'href': 'https://github.com/openstack/identity-api'
+    }]}
 extension.register_admin_extension(EXTENSION_DATA['alias'], EXTENSION_DATA)
 extension.register_public_extension(EXTENSION_DATA['alias'], EXTENSION_DATA)
+
+FEDERATION = 'OS-FEDERATION'
+IDENTITY_PROVIDER = 'OS-FEDERATION:identity_provider'
+PROTOCOL = 'OS-FEDERATION:protocol'
 
 
 @dependency.provider('federation_api')
@@ -62,6 +61,7 @@ class Manager(manager.Manager):
 @six.add_metaclass(abc.ABCMeta)
 class Driver(object):
 
+    @abc.abstractmethod
     def create_idp(self, idp_id, idp):
         """Create an identity provider.
 
@@ -70,6 +70,7 @@ class Driver(object):
         """
         raise exception.NotImplemented()
 
+    @abc.abstractmethod
     def delete_idp(self, idp_id):
         """Delete an identity provider.
 
@@ -78,6 +79,7 @@ class Driver(object):
         """
         raise exception.NotImplemented()
 
+    @abc.abstractmethod
     def list_idps(self):
         """List all identity providers.
 
@@ -86,6 +88,7 @@ class Driver(object):
         """
         raise exception.NotImplemented()
 
+    @abc.abstractmethod
     def get_idp(self, idp_id):
         """Get an identity provider by ID.
 
@@ -94,6 +97,7 @@ class Driver(object):
         """
         raise exception.NotImplemented()
 
+    @abc.abstractmethod
     def update_idp(self, idp_id, idp):
         """Update an identity provider by ID.
 
@@ -102,6 +106,7 @@ class Driver(object):
         """
         raise exception.NotImplemented()
 
+    @abc.abstractmethod
     def create_protocol(self, idp_id, protocol_id, protocol):
         """Add an IdP-Protocol configuration.
 
@@ -110,6 +115,7 @@ class Driver(object):
         """
         raise exception.NotImplemented()
 
+    @abc.abstractmethod
     def update_protocol(self, idp_id, protocol_id, protocol):
         """Change an IdP-Protocol configuration.
 
@@ -119,6 +125,7 @@ class Driver(object):
         """
         raise exception.NotImplemented()
 
+    @abc.abstractmethod
     def get_protocol(self, idp_id, protocol_id):
         """Get an IdP-Protocol configuration.
 
@@ -128,6 +135,7 @@ class Driver(object):
         """
         raise exception.NotImplemented()
 
+    @abc.abstractmethod
     def list_protocols(self, idp_id):
         """List an IdP's supported protocols.
 
@@ -136,6 +144,7 @@ class Driver(object):
         """
         raise exception.NotImplemented()
 
+    @abc.abstractmethod
     def delete_protocol(self, idp_id, protocol_id):
         """Delete an IdP-Protocol configuration.
 
@@ -196,6 +205,21 @@ class Driver(object):
 
         :param mapping_id: id of mapping to get
         :type mapping_ref: string
+        :returns: mapping_ref
+
+        """
+        raise exception.NotImplemented()
+
+    @abc.abstractmethod
+    def get_mapping_from_idp_and_protocol(self, idp_id, protocol_id):
+        """Get mapping based on idp_id and protocol_id.
+
+        :param idp_id: id of the identity provider
+        :type idp_id: string
+        :param protocol_id: id of the protocol
+        :type protocol_id: string
+        :raises: keystone.exception.IdentityProviderNotFound,
+                 keystone.exception.FederatedProtocolNotFound,
         :returns: mapping_ref
 
         """

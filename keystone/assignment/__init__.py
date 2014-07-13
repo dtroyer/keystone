@@ -1,6 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-# flake8: noqa
-
 # Copyright 2013 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -15,6 +12,6 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from keystone.assignment import controllers
-from keystone.assignment.core import *
-from keystone.assignment import routers
+from keystone.assignment import controllers  # noqa
+from keystone.assignment.core import *  # noqa
+from keystone.assignment import routers  # noqa

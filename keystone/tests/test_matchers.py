@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -16,13 +14,13 @@
 
 import textwrap
 
-import testtools
 from testtools.tests.matchers import helpers
 
+from keystone import tests
 from keystone.tests import matchers
 
 
-class TestXMLEquals(testtools.TestCase, helpers.TestMatchersInterface):
+class TestXMLEquals(tests.BaseTestCase, helpers.TestMatchersInterface):
     matches_xml = """
         <?xml version="1.0" encoding="UTF-8"?>
         <test xmlns="http://docs.openstack.org/identity/api/v2.0">

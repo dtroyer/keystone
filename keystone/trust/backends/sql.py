@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -23,16 +21,18 @@ from keystone import trust
 class TrustModel(sql.ModelBase, sql.DictBase):
     __tablename__ = 'trust'
     attributes = ['id', 'trustor_user_id', 'trustee_user_id',
-                  'project_id', 'impersonation', 'expires_at']
+                  'project_id', 'impersonation', 'expires_at',
+                  'remaining_uses']
     id = sql.Column(sql.String(64), primary_key=True)
-    #user id Of owner
+    # user id of owner
     trustor_user_id = sql.Column(sql.String(64), nullable=False,)
-    #user_id of user allowed to consume this preauth
+    # user_id of user allowed to consume this preauth
     trustee_user_id = sql.Column(sql.String(64), nullable=False)
     project_id = sql.Column(sql.String(64))
     impersonation = sql.Column(sql.Boolean, nullable=False)
     deleted_at = sql.Column(sql.DateTime)
     expires_at = sql.Column(sql.DateTime)
+    remaining_uses = sql.Column(sql.Integer, nullable=True)
     extra = sql.Column(sql.JsonBlob())
 
 
@@ -43,11 +43,10 @@ class TrustRole(sql.ModelBase):
     role_id = sql.Column(sql.String(64), primary_key=True, nullable=False)
 
 
-class Trust(sql.Base, trust.Driver):
+class Trust(trust.Driver):
     @sql.handle_conflicts(conflict_type='trust')
     def create_trust(self, trust_id, trust, roles):
-        session = self.get_session()
-        with session.begin():
+        with sql.transaction() as session:
             ref = TrustModel.from_dict(trust)
             ref['id'] = trust_id
             if ref.get('expires_at') and ref['expires_at'].tzinfo is not None:
@@ -71,8 +70,24 @@ class Trust(sql.Base, trust.Driver):
         trust_dict['roles'] = roles
 
     @sql.handle_conflicts(conflict_type='trust')
+    def consume_use(self, trust_id):
+        with sql.transaction() as session:
+            ref = (session.query(TrustModel).
+                   with_lockmode('update').
+                   filter_by(deleted_at=None).
+                   filter_by(id=trust_id).first())
+            if ref is None:
+                raise exception.TrustNotFound(trust_id=trust_id)
+            if ref.remaining_uses is None:
+                # unlimited uses, do nothing
+                pass
+            elif ref.remaining_uses > 0:
+                ref.remaining_uses -= 1
+            else:
+                raise exception.TrustUseLimitReached(trust_id=trust_id)
+
     def get_trust(self, trust_id):
-        session = self.get_session()
+        session = sql.get_session()
         ref = (session.query(TrustModel).
                filter_by(deleted_at=None).
                filter_by(id=trust_id).first())
@@ -82,6 +97,10 @@ class Trust(sql.Base, trust.Driver):
             now = timeutils.utcnow()
             if now > ref.expires_at:
                 return None
+        # Do not return trusts that can't be used anymore
+        if ref.remaining_uses is not None:
+            if ref.remaining_uses <= 0:
+                return None
         trust_dict = ref.to_dict()
 
         self._add_roles(trust_id, session, trust_dict)
@@ -89,13 +108,13 @@ class Trust(sql.Base, trust.Driver):
 
     @sql.handle_conflicts(conflict_type='trust')
     def list_trusts(self):
-        session = self.get_session()
+        session = sql.get_session()
         trusts = session.query(TrustModel).filter_by(deleted_at=None)
         return [trust_ref.to_dict() for trust_ref in trusts]
 
     @sql.handle_conflicts(conflict_type='trust')
     def list_trusts_for_trustee(self, trustee_user_id):
-        session = self.get_session()
+        session = sql.get_session()
         trusts = (session.query(TrustModel).
                   filter_by(deleted_at=None).
                   filter_by(trustee_user_id=trustee_user_id))
@@ -103,7 +122,7 @@ class Trust(sql.Base, trust.Driver):
 
     @sql.handle_conflicts(conflict_type='trust')
     def list_trusts_for_trustor(self, trustor_user_id):
-        session = self.get_session()
+        session = sql.get_session()
         trusts = (session.query(TrustModel).
                   filter_by(deleted_at=None).
                   filter_by(trustor_user_id=trustor_user_id))
@@ -111,8 +130,7 @@ class Trust(sql.Base, trust.Driver):
 
     @sql.handle_conflicts(conflict_type='trust')
     def delete_trust(self, trust_id):
-        session = self.get_session()
-        with session.begin():
+        with sql.transaction() as session:
             trust_ref = session.query(TrustModel).get(trust_id)
             if not trust_ref:
                 raise exception.TrustNotFound(trust_id=trust_id)
