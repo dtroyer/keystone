@@ -18,6 +18,9 @@
 
 """Utility methods for working with WSGI servers."""
 
+import copy
+
+from oslo import i18n
 import routes.middleware
 import six
 import webob.dec
@@ -27,8 +30,8 @@ from keystone.common import config
 from keystone.common import dependency
 from keystone.common import utils
 from keystone import exception
-from keystone.openstack.common import gettextutils
-from keystone.openstack.common.gettextutils import _
+from keystone.i18n import _
+from keystone.models import token_model
 from keystone.openstack.common import importutils
 from keystone.openstack.common import jsonutils
 from keystone.openstack.common import log
@@ -51,7 +54,11 @@ def validate_token_bind(context, token_ref):
     if bind_mode == 'disabled':
         return
 
-    bind = token_ref.get('bind', {})
+    if not isinstance(token_ref, token_model.KeystoneToken):
+        raise exception.UnexpectedError(_('token reference must be a '
+                                          'KeystoneToken type, got: %s') %
+                                        type(token_ref))
+    bind = token_ref.bind
 
     # permissive and strict modes don't require there to be a bind
     permissive = bind_mode in ('permissive', 'strict')
@@ -103,7 +110,7 @@ def best_match_language(req):
     if not req.accept_language:
         return None
     return req.accept_language.best_match(
-        gettextutils.get_available_languages('keystone'))
+        i18n.get_available_languages('keystone'))
 
 
 class BaseApplication(object):
@@ -171,7 +178,7 @@ class BaseApplication(object):
         raise NotImplementedError('You must implement __call__')
 
 
-@dependency.requires('assignment_api', 'policy_api', 'token_api')
+@dependency.requires('assignment_api', 'policy_api', 'token_provider_api')
 class Application(BaseApplication):
     @webob.dec.wsgify()
     def __call__(self, req):
@@ -191,6 +198,7 @@ class Application(BaseApplication):
         # values by the container and processed by the pipeline.  the complete
         # set is not yet know.
         context['environment'] = req.environ
+        context['accept_header'] = req.accept
         req.environ = None
 
         params.update(arg_dict)
@@ -262,28 +270,29 @@ class Application(BaseApplication):
     def assert_admin(self, context):
         if not context['is_admin']:
             try:
-                user_token_ref = self.token_api.get_token(context['token_id'])
+                user_token_ref = token_model.KeystoneToken(
+                    token_id=context['token_id'],
+                    token_data=self.token_provider_api.validate_token(
+                        context['token_id']))
             except exception.TokenNotFound as e:
                 raise exception.Unauthorized(e)
 
             validate_token_bind(context, user_token_ref)
-            creds = user_token_ref['metadata'].copy()
+            creds = copy.deepcopy(user_token_ref.metadata)
 
             try:
-                creds['user_id'] = user_token_ref['user'].get('id')
-            except AttributeError:
+                creds['user_id'] = user_token_ref.user_id
+            except exception.UnexpectedError:
                 LOG.debug('Invalid user')
                 raise exception.Unauthorized()
 
-            try:
-                creds['tenant_id'] = user_token_ref['tenant'].get('id')
-            except AttributeError:
+            if user_token_ref.project_scoped:
+                creds['tenant_id'] = user_token_ref.project_id
+            else:
                 LOG.debug('Invalid tenant')
                 raise exception.Unauthorized()
 
-            # NOTE(vish): this is pretty inefficient
-            creds['roles'] = [self.assignment_api.get_role(role)['name']
-                              for role in creds.get('roles', [])]
+            creds['roles'] = user_token_ref.role_names
             # Accept either is_admin or the admin role
             self.policy_api.enforce(creds, 'admin_required', {})
 
@@ -327,12 +336,15 @@ class Application(BaseApplication):
             return None
 
         try:
-            token_ref = self.token_api.get_token(context['token_id'])
+            token_data = self.token_provider_api.validate_token(
+                context['token_id'])
         except exception.TokenNotFound:
             LOG.warning(_('Invalid token in _get_trust_id_for_request'))
             raise exception.Unauthorized()
 
-        return token_ref.get('trust_id')
+        token_ref = token_model.KeystoneToken(token_id=context['token_id'],
+                                              token_data=token_data)
+        return token_ref.trust_id
 
     @classmethod
     def base_url(cls, context, endpoint_type):
@@ -604,6 +616,96 @@ class ExtensionRouter(Router):
         return _factory
 
 
+class RoutersBase(object):
+    """Base class for Routers."""
+
+    def __init__(self):
+        self.v3_resources = []
+
+    def append_v3_routers(self, mapper, routers):
+        """Append v3 routers.
+
+        Subclasses should override this method to map its routes.
+
+        Use self._add_resource() to map routes for a resource.
+        """
+
+    def _add_resource(self, mapper, controller, path,
+                      get_action=None, head_action=None, get_head_action=None,
+                      put_action=None, post_action=None, patch_action=None,
+                      delete_action=None, get_post_action=None, rel=None,
+                      path_vars=None):
+        if get_head_action:
+            mapper.connect(path, controller=controller, action=get_head_action,
+                           conditions=dict(method=['GET', 'HEAD']))
+        if get_action:
+            mapper.connect(path, controller=controller, action=get_action,
+                           conditions=dict(method=['GET']))
+        if head_action:
+            mapper.connect(path, controller=controller, action=head_action,
+                           conditions=dict(method=['HEAD']))
+        if put_action:
+            mapper.connect(path, controller=controller, action=put_action,
+                           conditions=dict(method=['PUT']))
+        if post_action:
+            mapper.connect(path, controller=controller, action=post_action,
+                           conditions=dict(method=['POST']))
+        if patch_action:
+            mapper.connect(path, controller=controller, action=patch_action,
+                           conditions=dict(method=['PATCH']))
+        if delete_action:
+            mapper.connect(path, controller=controller, action=delete_action,
+                           conditions=dict(method=['DELETE']))
+        if get_post_action:
+            mapper.connect(path, controller=controller, action=get_post_action,
+                           conditions=dict(method=['GET', 'POST']))
+
+        if rel:
+            resource_data = dict()
+
+            if path_vars:
+                resource_data['href-template'] = path
+                resource_data['href-vars'] = path_vars
+            else:
+                resource_data['href'] = path
+
+            self.v3_resources.append((rel, resource_data))
+
+
+class V3ExtensionRouter(ExtensionRouter, RoutersBase):
+    """Base class for V3 extension router."""
+
+    def __init__(self, application, mapper=None):
+        self.v3_resources = list()
+        super(V3ExtensionRouter, self).__init__(application, mapper)
+
+    def _update_version_response(self, response_data):
+        response_data['resources'].update(self.v3_resources)
+
+    @webob.dec.wsgify()
+    def __call__(self, request):
+        if request.path_info != '/':
+            # Not a request for version info so forward to super.
+            return super(V3ExtensionRouter, self).__call__(request)
+
+        response = request.get_response(self.application)
+
+        if response.status_code != 200:
+            # The request failed, so don't update the response.
+            return response
+
+        if response.headers['Content-Type'] != 'application/json-home':
+            # Not a request for JSON Home document, so don't update the
+            # response.
+            return response
+
+        response_data = jsonutils.loads(response.body)
+        self._update_version_response(response_data)
+        response.body = jsonutils.dumps(response_data,
+                                        cls=utils.SmarterEncoder)
+        return response
+
+
 def render_response(body=None, status=None, headers=None, method=None):
     """Forms a WSGI response."""
     if headers is None:
@@ -621,7 +723,10 @@ def render_response(body=None, status=None, headers=None, method=None):
             content_type = content_types[0]
         else:
             content_type = None
-        if content_type is None or content_type == 'application/json':
+
+        JSON_ENCODE_CONTENT_TYPES = ('application/json',
+                                     'application/json-home',)
+        if content_type is None or content_type in JSON_ENCODE_CONTENT_TYPES:
             body = jsonutils.dumps(body, cls=utils.SmarterEncoder)
             if content_type is None:
                 headers.append(('Content-Type', 'application/json'))
@@ -652,7 +757,7 @@ def render_exception(error, context=None, request=None, user_locale=None):
     """Forms a WSGI response based on the current error."""
 
     error_message = error.args[0]
-    message = gettextutils.translate(error_message, desired_locale=user_locale)
+    message = i18n.translate(error_message, desired_locale=user_locale)
     if message is error_message:
         # translate() didn't do anything because it wasn't a Message,
         # convert to a string.

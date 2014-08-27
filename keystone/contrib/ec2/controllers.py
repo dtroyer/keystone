@@ -33,24 +33,24 @@ Glance to list images needed to perform the requested task.
 """
 
 import abc
+import sys
 import uuid
 
-import six
-
 from keystoneclient.contrib.ec2 import utils as ec2_utils
+import six
 
 from keystone.common import controller
 from keystone.common import dependency
 from keystone.common import utils
 from keystone.common import wsgi
 from keystone import exception
-from keystone.openstack.common.gettextutils import _
+from keystone.i18n import _
+from keystone.models import token_model
 from keystone.openstack.common import jsonutils
-from keystone import token
 
 
 @dependency.requires('assignment_api', 'catalog_api', 'credential_api',
-                     'identity_api', 'token_api')
+                     'identity_api', 'token_provider_api')
 @six.add_metaclass(abc.ABCMeta)
 class Ec2ControllerCommon(object):
     def check_signature(self, creds_ref, credentials):
@@ -125,7 +125,16 @@ class Ec2ControllerCommon(object):
             metadata_ref['trustee_user_id'] = user_ref['id']
 
         # Validate that the auth info is valid and nothing is disabled
-        token.validate_auth_info(self, user_ref, tenant_ref)
+        try:
+            self.identity_api.assert_user_enabled(
+                user_id=user_ref['id'], user=user_ref)
+            self.assignment_api.assert_domain_enabled(
+                domain_id=user_ref['domain_id'])
+            self.assignment_api.assert_project_enabled(
+                project_id=tenant_ref['id'], project=tenant_ref)
+        except AssertionError as e:
+            six.reraise(exception.Unauthorized, exception.Unauthorized(e),
+                        sys.exc_info()[2])
 
         roles = metadata_ref.get('roles', [])
         if not roles:
@@ -173,8 +182,8 @@ class Ec2ControllerCommon(object):
         """
 
         self.identity_api.get_user(user_id)
-        credential_refs = self.credential_api.list_credentials(
-            user_id=user_id)
+        credential_refs = self.credential_api.list_credentials_for_user(
+            user_id)
         return {'credentials':
                 [self._convert_v3_to_ec2_credential(credential)
                     for credential in credential_refs]}
@@ -297,11 +306,15 @@ class Ec2Controller(Ec2ControllerCommon, controller.V2Controller):
 
         """
         try:
-            token_ref = self.token_api.get_token(context['token_id'])
+            token_data = self.token_provider_api.validate_token(
+                context['token_id'])
         except exception.TokenNotFound as e:
             raise exception.Unauthorized(e)
 
-        if token_ref['user'].get('id') != user_id:
+        token_ref = token_model.KeystoneToken(token_id=context['token_id'],
+                                              token_data=token_data)
+
+        if token_ref.user_id != user_id:
             raise exception.Forbidden(_('Token belongs to another user'))
 
     def _is_admin(self, context):

@@ -16,14 +16,14 @@ import datetime
 import random
 import uuid
 
+from oslo.utils import timeutils
 import six
 
 from keystone.common import sql
 from keystone.contrib.oauth1 import core
 from keystone import exception
-from keystone.openstack.common.gettextutils import _
+from keystone.i18n import _
 from keystone.openstack.common import jsonutils
-from keystone.openstack.common import timeutils
 
 
 class Consumer(sql.ModelBase, sql.DictBase):

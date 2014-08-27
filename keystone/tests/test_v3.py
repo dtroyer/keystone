@@ -16,6 +16,7 @@ import datetime
 import uuid
 
 from lxml import etree
+from oslo.utils import timeutils
 import six
 from testtools import matchers
 
@@ -26,7 +27,7 @@ from keystone.common import serializer
 from keystone import config
 from keystone import exception
 from keystone import middleware
-from keystone.openstack.common import timeutils
+from keystone.openstack.common import jsonutils
 from keystone.policy.backends import rules
 from keystone import tests
 from keystone.tests.ksfixtures import database
@@ -325,6 +326,9 @@ class RestfulTestCase(tests.SQLDriverOverrides, rest.RestfulTestCase,
 
     def new_role_ref(self):
         ref = self.new_ref()
+        # Roles don't have a description or the enabled flag
+        del ref['description']
+        del ref['enabled']
         return ref
 
     def new_policy_ref(self):
@@ -423,11 +427,14 @@ class RestfulTestCase(tests.SQLDriverOverrides, rest.RestfulTestCase,
     def get_requested_token(self, auth):
         """Request the specific token we want."""
 
-        r = self.admin_request(
-            method='POST',
-            path='/v3/auth/tokens',
-            body=auth)
+        r = self.v3_authenticate_token(auth)
         return r.headers.get('X-Subject-Token')
+
+    def v3_authenticate_token(self, auth, expected_status=201):
+        return self.admin_request(method='POST',
+                                  path='/v3/auth/tokens',
+                                  body=auth,
+                                  expected_status=expected_status)
 
     def v3_noauth_request(self, path, **kwargs):
         # request does not require auth token header
@@ -435,9 +442,6 @@ class RestfulTestCase(tests.SQLDriverOverrides, rest.RestfulTestCase,
         return self.admin_request(path=path, **kwargs)
 
     def v3_request(self, path, **kwargs):
-        # TODO(gyee): need to fix all the v3 auth tests. They should not
-        # require the token header.
-
         # check to see if caller requires token for the API call.
         if kwargs.pop('noauth', None):
             return self.v3_noauth_request(path, **kwargs)
@@ -503,10 +507,13 @@ class RestfulTestCase(tests.SQLDriverOverrides, rest.RestfulTestCase,
         self.assertIsNotNone(resp['error'].get('message'))
         self.assertEqual(int(resp['error']['code']), r.status_code)
 
-    def assertValidListLinks(self, links):
+    def assertValidListLinks(self, links, resource_url=None):
         self.assertIsNotNone(links)
         self.assertIsNotNone(links.get('self'))
         self.assertThat(links['self'], matchers.StartsWith('http://localhost'))
+
+        if resource_url:
+            self.assertThat(links['self'], matchers.EndsWith(resource_url))
 
         self.assertIn('next', links)
         if links['next'] is not None:
@@ -519,7 +526,8 @@ class RestfulTestCase(tests.SQLDriverOverrides, rest.RestfulTestCase,
                             matchers.StartsWith('http://localhost'))
 
     def assertValidListResponse(self, resp, key, entity_validator, ref=None,
-                                expected_length=None, keys_to_check=None):
+                                expected_length=None, keys_to_check=None,
+                                resource_url=None):
         """Make assertions common to all API list responses.
 
         If a reference is provided, it's ID will be searched for in the
@@ -536,7 +544,8 @@ class RestfulTestCase(tests.SQLDriverOverrides, rest.RestfulTestCase,
             self.assertNotEmpty(entities)
 
         # collections should have relational links
-        self.assertValidListLinks(resp.result.get('links'))
+        self.assertValidListLinks(resp.result.get('links'),
+                                  resource_url=resource_url)
 
         for entity in entities:
             self.assertIsNotNone(entity)
@@ -724,6 +733,35 @@ class RestfulTestCase(tests.SQLDriverOverrides, rest.RestfulTestCase,
         self.assertCloseEnoughForGovernmentWork(a_issued_at, b_issued_at)
 
         return self.assertDictEqual(normalize(a), normalize(b))
+
+    # catalog validation
+
+    def assertValidCatalogResponse(self, resp, *args, **kwargs):
+        self.assertEqual(['catalog', 'links'], resp.json.keys())
+        self.assertValidCatalog(resp.json['catalog'])
+        self.assertIn('links', resp.json)
+        self.assertIsInstance(resp.json['links'], dict)
+        self.assertEqual(['self'], resp.json['links'].keys())
+        self.assertEqual(
+            'http://localhost/v3/auth/catalog',
+            resp.json['links']['self'])
+
+    def assertValidCatalog(self, entity):
+        self.assertIsInstance(entity, list)
+        self.assertTrue(len(entity) > 0)
+        for service in entity:
+            self.assertIsNotNone(service.get('id'))
+            self.assertIsNotNone(service.get('name'))
+            self.assertIsNotNone(service.get('type'))
+            self.assertNotIn('enabled', service)
+            self.assertTrue(len(service['endpoints']) > 0)
+            for endpoint in service['endpoints']:
+                self.assertIsNotNone(endpoint.get('id'))
+                self.assertIsNotNone(endpoint.get('interface'))
+                self.assertIsNotNone(endpoint.get('url'))
+                self.assertNotIn('enabled', endpoint)
+                self.assertNotIn('legacy_endpoint_id', endpoint)
+                self.assertNotIn('service_id', endpoint)
 
     # region validation
 
@@ -974,7 +1012,8 @@ class RestfulTestCase(tests.SQLDriverOverrides, rest.RestfulTestCase,
         return entity
 
     def assertValidRoleAssignmentListResponse(self, resp, ref=None,
-                                              expected_length=None):
+                                              expected_length=None,
+                                              resource_url=None):
 
         entities = resp.result.get('role_assignments')
 
@@ -985,7 +1024,8 @@ class RestfulTestCase(tests.SQLDriverOverrides, rest.RestfulTestCase,
             self.assertNotEmpty(entities)
 
         # collections should have relational links
-        self.assertValidListLinks(resp.result.get('links'))
+        self.assertValidListLinks(resp.result.get('links'),
+                                  resource_url=resource_url)
 
         for entity in entities:
             self.assertIsNotNone(entity)
@@ -1118,7 +1158,7 @@ class RestfulTestCase(tests.SQLDriverOverrides, rest.RestfulTestCase,
         else:
             for role in entity['roles']:
                 self.assertIsNotNone(role)
-                self.assertValidEntity(role)
+                self.assertValidEntity(role, keys_to_check=['name'])
                 self.assertValidRole(role)
 
             self.assertValidListLinks(entity.get('roles_links'))
@@ -1207,3 +1247,27 @@ class AuthContextMiddlewareTestCase(RestfulTestCase):
         middleware.AuthContextMiddleware(application).process_request(req)
         self.assertDictEqual(req.environ.get(authorization.AUTH_CONTEXT_ENV),
                              {})
+
+
+class JsonHomeTestMixin(object):
+    """JSON Home test
+
+    Mixin this class to provide a test for the JSON-Home response for an
+    extension.
+
+    The base class must set JSON_HOME_DATA to a dict of relationship URLs
+    (rels) to the JSON-Home data for the relationship. The rels and associated
+    data must be in the response.
+
+    """
+    def test_get_json_home(self):
+        resp = self.get('/', convert=False,
+                        headers={'Accept': 'application/json-home'})
+        self.assertThat(resp.headers['Content-Type'],
+                        matchers.Equals('application/json-home'))
+        resp_data = jsonutils.loads(resp.body)
+
+        # Check that the example relationships are present.
+        for rel in self.JSON_HOME_DATA:
+            self.assertThat(resp_data['resources'][rel],
+                            matchers.Equals(self.JSON_HOME_DATA[rel]))

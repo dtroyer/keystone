@@ -78,6 +78,17 @@ class CatalogTestCase(test_v3.RestfulTestCase):
                 'region_id': ref['id']})
         self.assertValidRegionResponse(r, ref)
 
+    def test_create_region_with_empty_id(self):
+        """Call ``POST /regions`` with an empty ID in the request body."""
+        ref = self.new_region_ref()
+        ref['id'] = ''
+
+        r = self.post(
+            '/regions',
+            body={'region': ref}, expected_status=201)
+        self.assertValidRegionResponse(r, ref)
+        self.assertNotEmpty(r.result['region'].get('id'))
+
     def test_create_region_without_id(self):
         """Call ``POST /regions`` without an ID in the request body."""
         ref = self.new_region_ref()
@@ -178,6 +189,26 @@ class CatalogTestCase(test_v3.RestfulTestCase):
         r = self.get('/regions')
         self.assertValidRegionListResponse(r, ref=self.region)
 
+    def _create_region_with_parent_id(self, parent_id=None):
+        ref = self.new_region_ref()
+        ref['parent_region_id'] = parent_id
+        return self.post(
+            '/regions',
+            body={'region': ref})
+
+    def test_list_regions_filtered_by_parent_region_id(self):
+        """Call ``GET /regions?parent_region_id={parent_region_id}``."""
+        new_region = self._create_region_with_parent_id()
+        parent_id = new_region.result['region']['id']
+
+        new_region = self._create_region_with_parent_id(parent_id)
+        new_region = self._create_region_with_parent_id(parent_id)
+
+        r = self.get('/regions?parent_region_id=%s' % parent_id)
+
+        for region in r.result['regions']:
+            self.assertEqual(parent_id, region['parent_region_id'])
+
     def test_list_regions_xml(self):
         """Call ``GET /regions (xml data)``."""
         r = self.get('/regions', content_type='xml')
@@ -202,6 +233,48 @@ class CatalogTestCase(test_v3.RestfulTestCase):
         """Call ``DELETE /regions/{region_id}``."""
         self.delete('/regions/%(region_id)s' % {
             'region_id': self.region_id})
+
+    def test_create_region_with_url(self):
+        """Call ``POST /regions`` with a custom url field."""
+        ref = self.new_region_ref()
+        ref['url'] = 'http://beta.com:5000/v3'
+
+        r = self.post(
+            '/regions',
+            body={'region': ref},
+            expected_status=201)
+
+        self.assertEqual(ref['url'], r.json['region']['url'])
+        self.assertValidRegionResponse(r, ref)
+
+        r = self.get(
+            '/regions/%(region_id)s' % {
+                'region_id': ref['id']})
+        self.assertEqual(ref['url'], r.json['region']['url'])
+        self.assertValidRegionResponse(r, ref)
+
+    def test_update_region_with_url(self):
+        """Call ``PUT /regions`` with a custom url field."""
+        ref = self.new_region_ref()
+
+        r = self.post(
+            '/regions',
+            body={'region': ref},
+            expected_status=201)
+
+        self.assertIsNone(r.json['region']['url'])
+        self.assertValidRegionResponse(r, ref)
+
+        region_id = r.json['region']['id']
+        ref = self.new_region_ref()
+        del ref['id']
+        ref['url'] = 'http://beta.com:5000/v3'
+
+        r = self.patch('/regions/%(region_id)s' % {
+            'region_id': region_id},
+            body={'region': ref})
+        self.assertEqual(ref['url'], r.json['region']['url'])
+        self.assertValidRegionResponse(r, ref)
 
     # service crud tests
 
@@ -358,9 +431,6 @@ class CatalogTestCase(test_v3.RestfulTestCase):
             body={'endpoint': ref},
             expected_status=400)
 
-    def assertValidErrorResponse(self, response):
-        self.assertIn(response.status_code, [400, 409])
-
     def test_create_endpoint_400(self):
         """Call ``POST /endpoints``."""
         ref = self.new_endpoint_ref(service_id=self.service_id)
@@ -464,21 +534,21 @@ class CatalogTestCase(test_v3.RestfulTestCase):
         # test the endpoint on v3
         r = self.get('/endpoints')
         endpoints = self.assertValidEndpointListResponse(r)
-        self.assertEqual(len(endpoints), 1)
+        self.assertEqual(1, len(endpoints))
         endpoint_v3 = endpoints.pop()
 
         # these attributes are identical between both APIs
-        self.assertEqual(endpoint_v3['region'], ref['region'])
-        self.assertEqual(endpoint_v3['service_id'], ref['service_id'])
-        self.assertEqual(endpoint_v3['description'], ref['description'])
+        self.assertEqual(ref['region'], endpoint_v3['region'])
+        self.assertEqual(ref['service_id'], endpoint_v3['service_id'])
+        self.assertEqual(ref['description'], endpoint_v3['description'])
 
         # a v2 endpoint is not quite the same concept as a v3 endpoint, so they
         # receive different identifiers
         self.assertNotEqual(endpoint_v2['id'], endpoint_v3['id'])
 
         # v2 has a publicurl; v3 has a url + interface type
-        self.assertEqual(endpoint_v3['url'], ref['publicurl'])
-        self.assertEqual(endpoint_v3['interface'], 'public')
+        self.assertEqual(ref['publicurl'], endpoint_v3['url'])
+        self.assertEqual('public', endpoint_v3['interface'])
 
         # tests for bug 1152632 -- these attributes were being returned by v3
         self.assertNotIn('publicurl', endpoint_v3)

@@ -14,11 +14,13 @@
 
 import datetime
 
+from oslo.utils import timeutils
+
 from keystone import config
 from keystone import exception
-from keystone.openstack.common import timeutils
 from keystone import tests
 from keystone.tests import default_fixtures
+from keystone.tests.ksfixtures import database
 from keystone import token
 from keystone.token.providers import pki
 
@@ -705,6 +707,7 @@ SAMPLE_MALFORMED_TOKEN = {
 class TestTokenProvider(tests.TestCase):
     def setUp(self):
         super(TestTokenProvider, self).setUp()
+        self.useFixture(database.Database())
         self.load_backends()
 
     def test_get_token_version(self):
@@ -722,18 +725,18 @@ class TestTokenProvider(tests.TestCase):
             token.provider.V3,
             self.token_provider_api.get_token_version(
                 SAMPLE_V3_TOKEN_WITH_EMBEDED_VERSION))
-        self.assertRaises(token.provider.UnsupportedTokenVersionException,
+        self.assertRaises(exception.UnsupportedTokenVersionException,
                           self.token_provider_api.get_token_version,
                           'bogus')
 
     def test_default_token_format(self):
-        self.assertEqual(token.provider.Manager.get_token_provider(),
-                         token.provider.PKIZ_PROVIDER)
+        self.assertEqual(token.provider.PKIZ_PROVIDER,
+                         token.provider.Manager.get_token_provider())
 
     def test_uuid_token_format_and_no_provider(self):
         self.config_fixture.config(group='signing', token_format='UUID')
-        self.assertEqual(token.provider.Manager.get_token_provider(),
-                         token.provider.UUID_PROVIDER)
+        self.assertEqual(token.provider.UUID_PROVIDER,
+                         token.provider.Manager.get_token_provider())
 
     def test_default_providers_without_token_format(self):
         self.config_fixture.config(group='token',
@@ -756,27 +759,27 @@ class TestTokenProvider(tests.TestCase):
     def test_uuid_provider(self):
         self.config_fixture.config(group='token',
                                    provider=token.provider.UUID_PROVIDER)
-        self.assertEqual(token.provider.Manager.get_token_provider(),
-                         token.provider.UUID_PROVIDER)
+        self.assertEqual(token.provider.UUID_PROVIDER,
+                         token.provider.Manager.get_token_provider())
 
     def test_provider_override_token_format(self):
         self.config_fixture.config(
             group='token',
             provider='keystone.token.providers.pki.Test')
-        self.assertEqual(token.provider.Manager.get_token_provider(),
-                         'keystone.token.providers.pki.Test')
+        self.assertEqual('keystone.token.providers.pki.Test',
+                         token.provider.Manager.get_token_provider())
 
         self.config_fixture.config(group='signing', token_format='UUID')
         self.config_fixture.config(group='token',
                                    provider=token.provider.UUID_PROVIDER)
-        self.assertEqual(token.provider.Manager.get_token_provider(),
-                         token.provider.UUID_PROVIDER)
+        self.assertEqual(token.provider.UUID_PROVIDER,
+                         token.provider.Manager.get_token_provider())
 
         self.config_fixture.config(group='signing', token_format='PKI')
         self.config_fixture.config(group='token',
                                    provider=token.provider.PKI_PROVIDER)
-        self.assertEqual(token.provider.Manager.get_token_provider(),
-                         token.provider.PKI_PROVIDER)
+        self.assertEqual(token.provider.PKI_PROVIDER,
+                         token.provider.Manager.get_token_provider())
 
         self.config_fixture.config(group='signing', token_format='CUSTOM')
         self.config_fixture.config(group='token',
@@ -803,6 +806,7 @@ class TestTokenProvider(tests.TestCase):
 class TestTokenProviderOAuth1(tests.TestCase):
     def setUp(self):
         super(TestTokenProviderOAuth1, self).setUp()
+        self.useFixture(database.Database())
         self.load_backends()
 
     def config_overrides(self):

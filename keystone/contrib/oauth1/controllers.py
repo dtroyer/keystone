@@ -14,6 +14,8 @@
 
 """Extensions supporting OAuth1."""
 
+from oslo.utils import timeutils
+
 from keystone.common import controller
 from keystone.common import dependency
 from keystone.common import wsgi
@@ -21,9 +23,8 @@ from keystone import config
 from keystone.contrib.oauth1 import core as oauth1
 from keystone.contrib.oauth1 import validator
 from keystone import exception
-from keystone.openstack.common.gettextutils import _
+from keystone.i18n import _
 from keystone.openstack.common import jsonutils
-from keystone.openstack.common import timeutils
 
 
 CONF = config.CONF
@@ -85,6 +86,15 @@ class AccessTokenCrudV3(controller.V3Controller):
     collection_name = 'access_tokens'
     member_name = 'access_token'
 
+    @classmethod
+    def _add_self_referential_link(cls, context, ref):
+        # NOTE(lwolf): overriding method to add proper path to self link
+        ref.setdefault('links', {})
+        path = '/users/%(user_id)s/OS-OAUTH1/access_tokens' % {
+            'user_id': cls._get_user_id(ref)
+        }
+        ref['links']['self'] = cls.base_url(context, path) + '/' + ref['id']
+
     @controller.protected()
     def get_access_token(self, context, user_id, access_token_id):
         access_token = self.oauth_api.get_access_token(access_token_id)
@@ -114,17 +124,19 @@ class AccessTokenCrudV3(controller.V3Controller):
         return self.oauth_api.delete_access_token(
             user_id, access_token_id)
 
+    @staticmethod
+    def _get_user_id(entity):
+        return entity.get('authorizing_user_id', '')
+
     def _format_token_entity(self, context, entity):
 
         formatted_entity = entity.copy()
         access_token_id = formatted_entity['id']
-        user_id = ""
+        user_id = self._get_user_id(formatted_entity)
         if 'role_ids' in entity:
             formatted_entity.pop('role_ids')
         if 'access_secret' in entity:
             formatted_entity.pop('access_secret')
-        if 'authorizing_user_id' in entity:
-            user_id = formatted_entity['authorizing_user_id']
 
         url = ('/users/%(user_id)s/OS-OAUTH1/access_tokens/%(access_token_id)s'
                '/roles' % {'user_id': user_id,

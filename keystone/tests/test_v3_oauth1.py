@@ -301,12 +301,15 @@ class AccessTokenCRUDTests(OAuthFlowTests):
 
     def test_get_single_access_token(self):
         self.test_oauth_flow()
-        resp = self.get('/users/%(user_id)s/OS-OAUTH1/access_tokens/%(key)s'
-                        % {'user_id': self.user_id,
-                           'key': self.access_token.key})
+        url = '/users/%(user_id)s/OS-OAUTH1/access_tokens/%(key)s' % {
+              'user_id': self.user_id,
+              'key': self.access_token.key
+        }
+        resp = self.get(url)
         entity = resp.result['access_token']
         self.assertEqual(entity['id'], self.access_token.key)
         self.assertEqual(entity['consumer_id'], self.consumer['key'])
+        self.assertEqual('http://localhost/v3' + url, entity['links']['self'])
 
     def test_get_access_token_dne(self):
         self.get('/users/%(user_id)s/OS-OAUTH1/access_tokens/%(key)s'
@@ -500,10 +503,8 @@ class AuthTokenTests(OAuthFlowTests):
             user_id=self.user['id'],
             password=self.user['password'],
             trust_id=trust['id'])
-        r = self.post('/auth/tokens', body=auth_data)
 
-        trust_token = r.headers['X-Subject-Token']
-        return trust_token
+        return self.get_requested_token(auth_data)
 
     def _approve_request_token_url(self):
         consumer = self._create_single_consumer()
@@ -710,3 +711,12 @@ class MaliciousOAuth1Tests(OAuth1Tests):
         url, headers, body = self._get_oauth_token(self.consumer,
                                                    self.access_token)
         self.post(url, headers=headers, body=body, expected_status=401)
+
+
+class JsonHomeTests(OAuth1Tests, test_v3.JsonHomeTestMixin):
+    JSON_HOME_DATA = {
+        'http://docs.openstack.org/api/openstack-identity/3/ext/OS-OAUTH1/1.0/'
+        'rel/consumers': {
+            'href': '/OS-OAUTH1/consumers',
+        },
+    }

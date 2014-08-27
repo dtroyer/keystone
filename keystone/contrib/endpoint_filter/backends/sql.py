@@ -14,7 +14,7 @@
 
 from keystone.common import sql
 from keystone import exception
-from keystone.openstack.common.gettextutils import _
+from keystone.i18n import _
 
 
 class ProjectEndpoint(sql.ModelBase, sql.DictBase):
@@ -73,3 +73,17 @@ class EndpointFilter(object):
         query = query.filter_by(endpoint_id=endpoint_id)
         endpoint_filter_refs = query.all()
         return endpoint_filter_refs
+
+    def delete_association_by_endpoint(self, endpoint_id):
+        session = sql.get_session()
+        with session.begin():
+            query = session.query(ProjectEndpoint)
+            query = query.filter_by(endpoint_id=endpoint_id)
+            query.delete(synchronize_session=False)
+
+    def delete_association_by_project(self, project_id):
+        session = sql.get_session()
+        with session.begin():
+            query = session.query(ProjectEndpoint)
+            query = query.filter_by(project_id=project_id)
+            query.delete(synchronize_session=False)

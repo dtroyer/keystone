@@ -37,7 +37,7 @@ from migrate.versioning import api as versioning_api
 from oslo.db import exception as db_exception
 from oslo.db.sqlalchemy import migration
 from oslo.db.sqlalchemy import session as db_session
-import sqlalchemy
+import six
 import sqlalchemy.exc
 
 from keystone.assignment.backends import sql as assignment_sql
@@ -46,6 +46,7 @@ from keystone.common.sql import migrate_repo
 from keystone.common.sql import migration_helpers
 from keystone import config
 from keystone.contrib import federation
+from keystone.contrib import revoke
 from keystone import exception
 from keystone import tests
 from keystone.tests import default_fixtures
@@ -114,6 +115,19 @@ INITIAL_TABLE_STRUCTURE = {
         'user_id', 'project_id', 'data',
     ],
 }
+
+
+INITIAL_EXTENSION_TABLE_STRUCTURE = {
+    'revocation_event': [
+        'id', 'domain_id', 'project_id', 'user_id', 'role_id',
+        'trust_id', 'consumer_id', 'access_token_id',
+        'issued_before', 'expires_at', 'revoked_at', 'audit_id',
+        'audit_chain_id',
+    ],
+}
+
+EXTENSIONS = {'federation': federation,
+              'revoke': revoke}
 
 
 class SqlMigrateBase(tests.SQLDriverOverrides, tests.TestCase):
@@ -500,7 +514,7 @@ class SqlUpgradeTests(SqlMigrateBase):
                  base_data['project']['id']))
             r = session.execute(s)
             data = json.loads(r.fetchone()['data'])
-            self.assertEqual(len(data['roles']), 1)
+            self.assertEqual(1, len(data['roles']))
             self.assertIn({'id': base_data['roles'][0]['id']}, data['roles'])
 
             s = sqlalchemy.select([user_project_table.c.data]).where(
@@ -509,7 +523,7 @@ class SqlUpgradeTests(SqlMigrateBase):
                  base_data['project2']['id']))
             r = session.execute(s)
             data = json.loads(r.fetchone()['data'])
-            self.assertEqual(len(data['roles']), 2)
+            self.assertEqual(2, len(data['roles']))
             self.assertIn({'id': base_data['roles'][1]['id']}, data['roles'])
             self.assertIn({'id': base_data['roles'][2]['id']}, data['roles'])
 
@@ -519,7 +533,7 @@ class SqlUpgradeTests(SqlMigrateBase):
                  base_data['project']['id']))
             r = session.execute(s)
             data = json.loads(r.fetchone()['data'])
-            self.assertEqual(len(data['roles']), 1)
+            self.assertEqual(1, len(data['roles']))
             self.assertIn({'id': base_data['roles'][3]['id']}, data['roles'])
 
             s = sqlalchemy.select([group_project_table.c.data]).where(
@@ -528,7 +542,7 @@ class SqlUpgradeTests(SqlMigrateBase):
                  base_data['project2']['id']))
             r = session.execute(s)
             data = json.loads(r.fetchone()['data'])
-            self.assertEqual(len(data['roles']), 2)
+            self.assertEqual(2, len(data['roles']))
             self.assertIn({'id': base_data['roles'][4]['id']}, data['roles'])
             self.assertIn({'id': base_data['roles'][5]['id']}, data['roles'])
 
@@ -537,7 +551,7 @@ class SqlUpgradeTests(SqlMigrateBase):
                 (group_domain_table.c.domain_id == base_data['domain']['id']))
             r = session.execute(s)
             data = json.loads(r.fetchone()['data'])
-            self.assertEqual(len(data['roles']), 2)
+            self.assertEqual(2, len(data['roles']))
             self.assertIn({'id': base_data['roles'][6]['id']}, data['roles'])
             self.assertIn({'id': base_data['roles'][7]['id'],
                            'inherited_to': 'projects'}, data['roles'])
@@ -547,7 +561,7 @@ class SqlUpgradeTests(SqlMigrateBase):
                 (user_domain_table.c.domain_id == base_data['domain']['id']))
             r = session.execute(s)
             data = json.loads(r.fetchone()['data'])
-            self.assertEqual(len(data['roles']), 1)
+            self.assertEqual(1, len(data['roles']))
             self.assertIn({'id': base_data['roles'][8]['id'],
                            'inherited_to': 'projects'}, data['roles'])
 
@@ -556,7 +570,7 @@ class SqlUpgradeTests(SqlMigrateBase):
                 (user_domain_table.c.domain_id == base_data['domain2']['id']))
             r = session.execute(s)
             data = json.loads(r.fetchone()['data'])
-            self.assertEqual(len(data['roles']), 2)
+            self.assertEqual(2, len(data['roles']))
             self.assertIn({'id': base_data['roles'][6]['id']}, data['roles'])
             self.assertIn({'id': base_data['roles'][7]['id']}, data['roles'])
 
@@ -564,20 +578,20 @@ class SqlUpgradeTests(SqlMigrateBase):
 
             def check_assignment_type(refs, type):
                 for ref in refs:
-                    self.assertEqual(ref.type, type)
+                    self.assertEqual(type, ref.type)
 
             assignment_table = sqlalchemy.Table(
                 'assignment', self.metadata, autoload=True)
 
             refs = session.query(assignment_table).all()
-            self.assertEqual(len(refs), 11)
+            self.assertEqual(11, len(refs))
 
             q = session.query(assignment_table)
             q = q.filter_by(actor_id=base_data['user']['id'])
             q = q.filter_by(target_id=base_data['project']['id'])
             refs = q.all()
-            self.assertEqual(len(refs), 1)
-            self.assertEqual(refs[0].role_id, base_data['roles'][0]['id'])
+            self.assertEqual(1, len(refs))
+            self.assertEqual(base_data['roles'][0]['id'], refs[0].role_id)
             self.assertFalse(refs[0].inherited)
             check_assignment_type(refs,
                                   assignment_sql.AssignmentType.USER_PROJECT)
@@ -586,7 +600,7 @@ class SqlUpgradeTests(SqlMigrateBase):
             q = q.filter_by(actor_id=base_data['user']['id'])
             q = q.filter_by(target_id=base_data['project2']['id'])
             refs = q.all()
-            self.assertEqual(len(refs), 2)
+            self.assertEqual(2, len(refs))
             role_ids = [base_data['roles'][1]['id'],
                         base_data['roles'][2]['id']]
             self.assertIn(refs[0].role_id, role_ids)
@@ -600,8 +614,8 @@ class SqlUpgradeTests(SqlMigrateBase):
             q = q.filter_by(actor_id=base_data['group']['id'])
             q = q.filter_by(target_id=base_data['project']['id'])
             refs = q.all()
-            self.assertEqual(len(refs), 1)
-            self.assertEqual(refs[0].role_id, base_data['roles'][3]['id'])
+            self.assertEqual(1, len(refs))
+            self.assertEqual(base_data['roles'][3]['id'], refs[0].role_id)
             self.assertFalse(refs[0].inherited)
             check_assignment_type(refs,
                                   assignment_sql.AssignmentType.GROUP_PROJECT)
@@ -610,7 +624,7 @@ class SqlUpgradeTests(SqlMigrateBase):
             q = q.filter_by(actor_id=base_data['group']['id'])
             q = q.filter_by(target_id=base_data['project2']['id'])
             refs = q.all()
-            self.assertEqual(len(refs), 2)
+            self.assertEqual(2, len(refs))
             role_ids = [base_data['roles'][4]['id'],
                         base_data['roles'][5]['id']]
             self.assertIn(refs[0].role_id, role_ids)
@@ -624,7 +638,7 @@ class SqlUpgradeTests(SqlMigrateBase):
             q = q.filter_by(actor_id=base_data['group']['id'])
             q = q.filter_by(target_id=base_data['domain']['id'])
             refs = q.all()
-            self.assertEqual(len(refs), 2)
+            self.assertEqual(2, len(refs))
             role_ids = [base_data['roles'][6]['id'],
                         base_data['roles'][7]['id']]
             self.assertIn(refs[0].role_id, role_ids)
@@ -642,8 +656,8 @@ class SqlUpgradeTests(SqlMigrateBase):
             q = q.filter_by(actor_id=base_data['user']['id'])
             q = q.filter_by(target_id=base_data['domain']['id'])
             refs = q.all()
-            self.assertEqual(len(refs), 1)
-            self.assertEqual(refs[0].role_id, base_data['roles'][8]['id'])
+            self.assertEqual(1, len(refs))
+            self.assertEqual(base_data['roles'][8]['id'], refs[0].role_id)
             self.assertTrue(refs[0].inherited)
             check_assignment_type(refs,
                                   assignment_sql.AssignmentType.USER_DOMAIN)
@@ -652,7 +666,7 @@ class SqlUpgradeTests(SqlMigrateBase):
             q = q.filter_by(actor_id=base_data['user']['id'])
             q = q.filter_by(target_id=base_data['domain2']['id'])
             refs = q.all()
-            self.assertEqual(len(refs), 2)
+            self.assertEqual(2, len(refs))
             role_ids = [base_data['roles'][6]['id'],
                         base_data['roles'][7]['id']]
             self.assertIn(refs[0].role_id, role_ids)
@@ -1186,9 +1200,18 @@ class SqlUpgradeTests(SqlMigrateBase):
         add_region(region_unique_table)
         self.assertEqual(1, session.query(region_unique_table).count())
         # verify the unique constraint is enforced
-        self.assertRaises(sqlalchemy.exc.IntegrityError,
-                          add_region,
-                          table=region_unique_table)
+        self.assertRaises(
+            # FIXME (I159): Since oslo.db wraps all the database exceptions
+            # into more specific exception objects, we should catch both of
+            # sqlalchemy and oslo.db exceptions. If an old oslo.db version
+            # is installed, IntegrityError is raised. If >=0.4.0 version of
+            # oslo.db is installed, DBDuplicateEntry is raised.
+            # When the global requirements is updated with
+            # the version fixes exceptions wrapping, IntegrityError must be
+            # removed from the tuple.
+            (sqlalchemy.exc.IntegrityError, db_exception.DBDuplicateEntry),
+            add_region,
+            table=region_unique_table)
 
         # migrate to 43, unique constraint should be dropped
         self.upgrade(43)
@@ -1210,6 +1233,46 @@ class SqlUpgradeTests(SqlMigrateBase):
         self.assertTableExists('id_mapping')
         self.downgrade(50)
         self.assertTableDoesNotExist('id_mapping')
+
+    def test_region_url_upgrade(self):
+        self.upgrade(52)
+        self.assertTableColumns('region',
+                                ['id', 'description', 'parent_region_id',
+                                 'extra', 'url'])
+
+    def test_region_url_downgrade(self):
+        self.upgrade(52)
+        self.downgrade(51)
+        self.assertTableColumns('region',
+                                ['id', 'description', 'parent_region_id',
+                                 'extra'])
+
+    def test_region_url_cleanup(self):
+        # make sure that the url field is dropped in the downgrade
+        self.upgrade(52)
+        session = self.Session()
+        beta = {
+            'id': uuid.uuid4().hex,
+            'description': uuid.uuid4().hex,
+            'parent_region_id': uuid.uuid4().hex,
+            'url': uuid.uuid4().hex
+        }
+        acme = {
+            'id': uuid.uuid4().hex,
+            'description': uuid.uuid4().hex,
+            'parent_region_id': uuid.uuid4().hex,
+            'url': None
+        }
+        self.insert_dict(session, 'region', beta)
+        self.insert_dict(session, 'region', acme)
+        region_table = sqlalchemy.Table('region', self.metadata, autoload=True)
+        self.assertEqual(2, session.query(region_table).count())
+        self.downgrade(51)
+        self.metadata.clear()
+        region_table = sqlalchemy.Table('region', self.metadata, autoload=True)
+        self.assertEqual(2, session.query(region_table).count())
+        region = session.query(region_table)[0]
+        self.assertRaises(AttributeError, getattr, region, 'url')
 
     def populate_user_table(self, with_pass_enab=False,
                             with_pass_enab_domain=False):
@@ -1327,7 +1390,7 @@ class SqlUpgradeTests(SqlMigrateBase):
                                        "and TABLE_NAME!='migrate_version'" %
                                        dict(database=database))
         names = [x[0] for x in noninnodb]
-        self.assertEqual(names, [],
+        self.assertEqual([], names,
                          "Non-InnoDB tables exist")
 
         connection.close()
@@ -1356,18 +1419,38 @@ class VersionTests(SqlMigrateBase):
 
     def test_extension_initial(self):
         """When get the initial version of an extension, it's 0."""
-        abs_path = migration_helpers.find_migrate_repo(federation)
-        migration.db_version_control(sql.get_engine(), abs_path)
-        version = migration_helpers.get_db_version(extension='federation')
-        self.assertEqual(0, version)
+        for name, extension in six.iteritems(EXTENSIONS):
+            abs_path = migration_helpers.find_migrate_repo(extension)
+            migration.db_version_control(sql.get_engine(), abs_path)
+            version = migration_helpers.get_db_version(extension=name)
+            self.assertEqual(0, version,
+                             'Migrate version for %s is not 0' % name)
 
     def test_extension_migrated(self):
         """When get the version after migrating an extension, it's not 0."""
-        abs_path = migration_helpers.find_migrate_repo(federation)
-        migration.db_version_control(sql.get_engine(), abs_path)
-        migration.db_sync(sql.get_engine(), abs_path)
-        version = migration_helpers.get_db_version(extension='federation')
-        self.assertTrue(version > 0, "Version didn't change after migrated?")
+        for name, extension in six.iteritems(EXTENSIONS):
+            abs_path = migration_helpers.find_migrate_repo(extension)
+            migration.db_version_control(sql.get_engine(), abs_path)
+            migration.db_sync(sql.get_engine(), abs_path)
+            version = migration_helpers.get_db_version(extension=name)
+            self.assertTrue(
+                version > 0,
+                "Version for %s didn't change after migrated?" % name)
+
+    def test_extension_downgraded(self):
+        """When get the version after downgrading an extension, it is 0."""
+        for name, extension in six.iteritems(EXTENSIONS):
+            abs_path = migration_helpers.find_migrate_repo(extension)
+            migration.db_version_control(sql.get_engine(), abs_path)
+            migration.db_sync(sql.get_engine(), abs_path)
+            version = migration_helpers.get_db_version(extension=name)
+            self.assertTrue(
+                version > 0,
+                "Version for %s didn't change after migrated?" % name)
+            migration.db_sync(sql.get_engine(), abs_path, version=0)
+            version = migration_helpers.get_db_version(extension=name)
+            self.assertEqual(0, version,
+                             'Migrate version for %s is not 0' % name)
 
     def test_unexpected_extension(self):
         """The version for an extension that doesn't exist raises ImportError.
@@ -1387,3 +1470,18 @@ class VersionTests(SqlMigrateBase):
         self.assertRaises(exception.MigrationNotProvided,
                           migration_helpers.get_db_version,
                           extension='access')
+
+    def test_initial_with_extension_version_None(self):
+        """When performing a default migration, also migrate extensions."""
+        migration_helpers.sync_database_to_version(extension=None,
+                                                   version=None)
+        for table in INITIAL_EXTENSION_TABLE_STRUCTURE:
+            self.assertTableColumns(table,
+                                    INITIAL_EXTENSION_TABLE_STRUCTURE[table])
+
+    def test_initial_with_extension_version_max(self):
+        """When migrating to max version, do not migrate extensions."""
+        migration_helpers.sync_database_to_version(extension=None,
+                                                   version=self.max_version)
+        for table in INITIAL_EXTENSION_TABLE_STRUCTURE:
+            self.assertTableDoesNotExist(table)

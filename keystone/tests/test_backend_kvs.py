@@ -14,10 +14,10 @@
 import datetime
 import uuid
 
+from oslo.utils import timeutils
 import six
 
 from keystone import exception
-from keystone.openstack.common import timeutils
 from keystone import tests
 from keystone.tests import default_fixtures
 from keystone.tests.ksfixtures import database
@@ -229,6 +229,9 @@ class KvsCatalog(tests.TestCase, test_backend.CatalogTests):
         f = super(KvsCatalog, self).test_get_v3_catalog_endpoint_disabled
         self.assertRaises(exception.NotFound, f)
 
+    def test_list_regions_filtered_by_parent_region_id(self):
+        self.skipTest('KVS backend does not support hints')
+
 
 class KvsTokenCacheInvalidation(tests.TestCase,
                                 test_backend.TokenCacheInvalidation):
@@ -245,3 +248,14 @@ class KvsTokenCacheInvalidation(tests.TestCase,
         self.config_fixture.config(
             group='token',
             driver='keystone.token.backends.kvs.Token')
+
+
+class KvsInheritanceTests(tests.TestCase, test_backend.InheritanceTests):
+    def setUp(self):
+        # NOTE(dstanek): setup the database for subsystems that only have a
+        # SQL backend (like credentials)
+        self.useFixture(database.Database())
+
+        super(KvsInheritanceTests, self).setUp()
+        self.load_backends()
+        self.load_fixtures(default_fixtures)

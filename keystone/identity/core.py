@@ -28,9 +28,9 @@ from keystone.common import driver_hints
 from keystone.common import manager
 from keystone import config
 from keystone import exception
+from keystone.i18n import _
 from keystone.identity.mapping_backends import mapping
 from keystone import notifications
-from keystone.openstack.common.gettextutils import _
 from keystone.openstack.common import importutils
 from keystone.openstack.common import log
 
@@ -206,8 +206,7 @@ def exception_translated(exception_type):
 
 @dependency.provider('identity_api')
 @dependency.optional('revoke_api')
-@dependency.requires('assignment_api', 'credential_api', 'id_mapping_api',
-                     'token_api')
+@dependency.requires('assignment_api', 'credential_api', 'id_mapping_api')
 class Manager(manager.Manager):
     """Default pivot point for the Identity backend.
 
@@ -247,6 +246,8 @@ class Manager(manager.Manager):
 
     """
     _USER = 'user'
+    _USER_PASSWORD = 'user_password'
+    _USER_REMOVED_FROM_GROUP = 'user_removed_from_group'
     _GROUP = 'group'
 
     def __init__(self):
@@ -284,9 +285,9 @@ class Manager(manager.Manager):
 
         """
         conf = CONF.identity
-        if (driver is self.driver and driver.generates_uuids() and
-                driver.is_domain_aware()):
-            # The default driver that needs no help, e.g. SQL
+
+        if not self._needs_post_processing(driver):
+            # a classic case would be when running with a single SQL driver
             return ref
 
         LOG.debug('ID Mapping - Domain ID: %(domain)s, '
@@ -300,50 +301,73 @@ class Manager(manager.Manager):
                    'compat': CONF.identity_mapping.backward_compatible_ids})
 
         if isinstance(ref, dict):
-            LOG.debug('Local ID: %s', ref['id'])
-            ref = ref.copy()
-            # If the driver can't handle domains, then we need to insert the
-            # domain_id into the entity being returned.  If the domain_id is
-            # None that means we are running in a single backend mode, so to
-            # remain backwardly compatible, we put in the default domain ID.
-            if not driver.is_domain_aware():
-                if domain_id is None:
-                    domain_id = conf.default_domain_id
-                ref['domain_id'] = domain_id
-
-            # There are two situations where we must now use the mapping:
-            # - this isn't the default driver (i.e. multiple backends), or
-            # - we have a single backend that doesn't use UUIDs
-            # The exception to the above is that we must honor backward
-            # compatibility if this is the default driver (e.g. to support
-            # current LDAP)
-            if (driver is not self.driver or
-                (not driver.generates_uuids() and
-                    not CONF.identity_mapping.backward_compatible_ids)):
-
-                local_entity = {'domain_id': ref['domain_id'],
-                                'local_id': ref['id'],
-                                'entity_type': entity_type}
-                public_id = self.id_mapping_api.get_public_id(local_entity)
-                if public_id:
-                    ref['id'] = public_id
-                    LOG.debug('Found existing mapping to public ID: %s',
-                              ref['id'])
-                else:
-                    # Need to create a mapping. If the driver generates UUIDs
-                    # then pass the local UUID in as the public ID to use.
-                    if driver.generates_uuids():
-                        public_id = ref['id']
-                    ref['id'] = self.id_mapping_api.create_id_mapping(
-                        local_entity, public_id)
-                    LOG.debug('Created new mapping to public ID: %s',
-                              ref['id'])
-            return ref
+            return self._set_domain_id_and_mapping_for_single_ref(
+                ref, domain_id, driver, entity_type, conf)
         elif isinstance(ref, list):
             return [self._set_domain_id_and_mapping(
                     x, domain_id, driver, entity_type) for x in ref]
         else:
             raise ValueError(_('Expected dict or list: %s') % type(ref))
+
+    def _needs_post_processing(self, driver):
+        """Returns whether entity from driver needs domain added or mapping."""
+        return (driver is not self.driver or not driver.generates_uuids() or
+                not driver.is_domain_aware())
+
+    def _set_domain_id_and_mapping_for_single_ref(self, ref, domain_id,
+                                                  driver, entity_type, conf):
+        LOG.debug('Local ID: %s', ref['id'])
+        ref = ref.copy()
+
+        self._insert_domain_id_if_needed(ref, driver, domain_id, conf)
+
+        if self._is_mapping_needed(driver):
+            local_entity = {'domain_id': ref['domain_id'],
+                            'local_id': ref['id'],
+                            'entity_type': entity_type}
+            public_id = self.id_mapping_api.get_public_id(local_entity)
+            if public_id:
+                ref['id'] = public_id
+                LOG.debug('Found existing mapping to public ID: %s',
+                          ref['id'])
+            else:
+                # Need to create a mapping. If the driver generates UUIDs
+                # then pass the local UUID in as the public ID to use.
+                if driver.generates_uuids():
+                    public_id = ref['id']
+                ref['id'] = self.id_mapping_api.create_id_mapping(
+                    local_entity, public_id)
+                LOG.debug('Created new mapping to public ID: %s',
+                          ref['id'])
+        return ref
+
+    def _insert_domain_id_if_needed(self, ref, driver, domain_id, conf):
+        """Inserts the domain ID into the ref, if required.
+
+        If the driver can't handle domains, then we need to insert the
+        domain_id into the entity being returned.  If the domain_id is
+        None that means we are running in a single backend mode, so to
+        remain backwardly compatible, we put in the default domain ID.
+        """
+        if not driver.is_domain_aware():
+            if domain_id is None:
+                domain_id = conf.default_domain_id
+            ref['domain_id'] = domain_id
+
+    def _is_mapping_needed(self, driver):
+        """Returns whether mapping is needed.
+
+        There are two situations where we must use the mapping:
+        - this isn't the default driver (i.e. multiple backends), or
+        - we have a single backend that doesn't use UUIDs
+        The exception to the above is that we must honor backward
+        compatibility if this is the default driver (e.g. to support
+        current LDAP)
+        """
+        is_not_default_driver = driver is not self.driver
+        return (is_not_default_driver or (
+            not driver.generates_uuids() and
+            not CONF.identity_mapping.backward_compatible_ids))
 
     def _clear_domain_id_if_domain_unaware(self, driver, ref):
         """Clear domain_id details if driver is not domain aware."""
@@ -538,6 +562,17 @@ class Manager(manager.Manager):
         return self._set_domain_id_and_mapping(
             ref, domain_id, driver, mapping.EntityType.USER)
 
+    def assert_user_enabled(self, user_id, user=None):
+        """Assert the user and the user's domain are enabled.
+
+        :raise AssertionError if the user or the user's domain is disabled.
+        """
+        if user is None:
+            user = self.get_user(user_id)
+        self.assignment_api.assert_domain_enabled(user['domain_id'])
+        if not user.get('enabled', True):
+            raise AssertionError(_('User is disabled: %s') % user_id)
+
     @domains_configured
     @exception_translated('user')
     def get_user_by_name(self, user_name, domain_id):
@@ -568,6 +603,7 @@ class Manager(manager.Manager):
     @domains_configured
     @exception_translated('user')
     def update_user(self, user_id, user_ref):
+        old_user_ref = self.get_user(user_id)
         user = user_ref.copy()
         if 'name' in user:
             user['name'] = clean.user_name(user['name'])
@@ -587,12 +623,27 @@ class Manager(manager.Manager):
             self._get_domain_driver_and_entity_id(user_id))
         user = self._clear_domain_id_if_domain_unaware(driver, user)
         ref = driver.update_user(entity_id, user)
-        if user.get('enabled') is False or user.get('password') is not None:
-            if self.revoke_api:
-                self.revoke_api.revoke_by_user(user_id)
-            self.token_api.delete_tokens_for_user(user_id)
+
+        if ((user.get('enabled') is False) and
+                user['enabled'] != old_user_ref.get('enabled')):
+            self._emit_disable_user_notify(user_id)
+        elif user.get('password') is not None:
+            self._emit_user_password_notify(user_id)
+
         return self._set_domain_id_and_mapping(
             ref, domain_id, driver, mapping.EntityType.USER)
+
+    @notifications.disabled(_USER, public=False)
+    def _emit_disable_user_notify(self, user_id):
+        # Simply emit that the user has been disabled so the callback system
+        # can do the right thing.
+        pass
+
+    @notifications.updated(_USER_PASSWORD, public=False)
+    def _emit_user_password_notify(self, user_id):
+        # Simply emit that the user's password has been updated so the callback
+        # system can do the right thing.
+        pass
 
     @notifications.deleted(_USER)
     @domains_configured
@@ -602,7 +653,6 @@ class Manager(manager.Manager):
             self._get_domain_driver_and_entity_id(user_id))
         driver.delete_user(entity_id)
         self.credential_api.delete_credentials_for_user(user_id)
-        self.token_api.delete_tokens_for_user(user_id)
         self.id_mapping_api.delete_id_mapping(user_id)
 
     @notifications.created(_GROUP, result_id_arg_attr='id')
@@ -648,30 +698,17 @@ class Manager(manager.Manager):
         return self._set_domain_id_and_mapping(
             ref, domain_id, driver, mapping.EntityType.GROUP)
 
-    def revoke_tokens_for_group(self, group_id):
-        # We get the list of users before we attempt the group
-        # deletion, so that we can remove these tokens after we know
-        # the group deletion succeeded.
-
-        # TODO(ayoung): revoke based on group and roleids instead
-        user_ids = []
-        for u in self.list_users_in_group(group_id):
-            user_ids.append(u['id'])
-            if self.revoke_api:
-                self.revoke_api.revoke_by_user(u['id'])
-        self.token_api.delete_tokens_for_users(user_ids)
-
     @notifications.deleted(_GROUP)
     @domains_configured
     @exception_translated('group')
     def delete_group(self, group_id):
         domain_id, driver, entity_id = (
             self._get_domain_driver_and_entity_id(group_id))
-        # As well as deleting the group, we need to invalidate
-        # any tokens for the users who are members of the group.
-        self.revoke_tokens_for_group(group_id)
+        user_ids = (u['id'] for u in self.list_users_in_group(group_id))
         driver.delete_group(entity_id)
         self.id_mapping_api.delete_id_mapping(group_id)
+        for uid in user_ids:
+            self._emit_user_removed_from_group_notification(uid)
 
     @domains_configured
     @exception_translated('group')
@@ -691,7 +728,6 @@ class Manager(manager.Manager):
             user_entity_id, user_driver, group_entity_id, group_driver)
 
         group_driver.add_user_to_group(user_entity_id, group_entity_id)
-        self.token_api.delete_tokens_for_user(user_id)
 
     @domains_configured
     @exception_translated('group')
@@ -711,13 +747,13 @@ class Manager(manager.Manager):
             user_entity_id, user_driver, group_entity_id, group_driver)
 
         group_driver.remove_user_from_group(user_entity_id, group_entity_id)
-        # TODO(ayoung) revoking all tokens for a user based on group
-        # membership is overkill, as we only would need to revoke tokens
-        # that had role assignments via the group.  Calculating those
-        # assignments would have to be done by the assignment backend.
-        if self.revoke_api:
-            self.revoke_api.revoke_by_user(user_id)
-        self.token_api.delete_tokens_for_user(user_id)
+        self._emit_user_removed_from_group_notification(user_id)
+
+    @notifications.updated(_USER_REMOVED_FROM_GROUP, public=False)
+    def _emit_user_removed_from_group_notification(self, user_id):
+        # Simply emit that the user has been removed from a group so the
+        # callback system can do the right thing.
+        pass
 
     @manager.response_truncated
     @domains_configured
@@ -819,7 +855,7 @@ class Driver(object):
         :returns: user_ref
         :raises: AssertionError
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     # user crud
 
@@ -830,7 +866,7 @@ class Driver(object):
         :raises: keystone.exception.Conflict
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def list_users(self, hints):
@@ -842,7 +878,7 @@ class Driver(object):
         :returns: a list of user_refs or an empty list.
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def list_users_in_group(self, group_id, hints):
@@ -855,7 +891,7 @@ class Driver(object):
         :returns: a list of user_refs or an empty list.
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def get_user(self, user_id):
@@ -865,7 +901,7 @@ class Driver(object):
         :raises: keystone.exception.UserNotFound
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def update_user(self, user_id, user):
@@ -875,7 +911,7 @@ class Driver(object):
                  keystone.exception.Conflict
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def add_user_to_group(self, user_id, group_id):
@@ -885,7 +921,7 @@ class Driver(object):
                  keystone.exception.GroupNotFound
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def check_user_in_group(self, user_id, group_id):
@@ -895,7 +931,7 @@ class Driver(object):
                  keystone.exception.GroupNotFound
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def remove_user_from_group(self, user_id, group_id):
@@ -904,7 +940,7 @@ class Driver(object):
         :raises: keystone.exception.NotFound
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def delete_user(self, user_id):
@@ -913,7 +949,7 @@ class Driver(object):
         :raises: keystone.exception.UserNotFound
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def get_user_by_name(self, user_name, domain_id):
@@ -923,7 +959,7 @@ class Driver(object):
         :raises: keystone.exception.UserNotFound
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     # group crud
 
@@ -934,7 +970,7 @@ class Driver(object):
         :raises: keystone.exception.Conflict
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def list_groups(self, hints):
@@ -946,7 +982,7 @@ class Driver(object):
         :returns: a list of group_refs or an empty list.
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def list_groups_for_user(self, user_id, hints):
@@ -959,7 +995,7 @@ class Driver(object):
         :returns: a list of group_refs or an empty list.
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def get_group(self, group_id):
@@ -969,7 +1005,7 @@ class Driver(object):
         :raises: keystone.exception.GroupNotFound
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def update_group(self, group_id, group):
@@ -979,7 +1015,7 @@ class Driver(object):
                  keystone.exception.Conflict
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def delete_group(self, group_id):
@@ -988,7 +1024,7 @@ class Driver(object):
         :raises: keystone.exception.GroupNotFound
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     # end of identity
 
@@ -1014,7 +1050,7 @@ class MappingDriver(object):
         :returns: public ID, or None if no mapping is found.
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def get_id_mapping(self, public_id):
@@ -1025,7 +1061,7 @@ class MappingDriver(object):
                        mapping is found, it returns None.
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def create_id_mapping(self, local_entity, public_id=None):
@@ -1038,7 +1074,7 @@ class MappingDriver(object):
         :returns: public ID
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def delete_id_mapping(self, public_id):
@@ -1049,7 +1085,7 @@ class MappingDriver(object):
         The method is silent if no mapping is found.
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def purge_mappings(self, purge_filter):
@@ -1060,4 +1096,4 @@ class MappingDriver(object):
                                   filter means purge all mappings.
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover

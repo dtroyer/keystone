@@ -770,8 +770,6 @@ class FederatedTokenTests(FederationTests):
         }
     }
 
-    AUTH_URL = '/auth/tokens'
-
     def load_fixtures(self, fixtures):
         super(FederationTests, self).load_fixtures(fixtures)
         self.load_federation_sample_data()
@@ -861,15 +859,27 @@ class FederatedTokenTests(FederationTests):
             raise AssertionError("You must specify either"
                                  "project or domain.")
 
-    def _issue_unscoped_token(self, assertion='EMPLOYEE_ASSERTION'):
+        self.assertIn('OS-FEDERATION', token['user'])
+        os_federation = token['user']['OS-FEDERATION']
+        self.assertEqual(self.IDP, os_federation['identity_provider']['id'])
+        self.assertEqual(self.PROTOCOL, os_federation['protocol']['id'])
+
+    def _issue_unscoped_token(self,
+                              assertion='EMPLOYEE_ASSERTION',
+                              environment=None):
         api = federation_controllers.Auth()
-        context = {'environment': {}}
+        context = {'environment': environment or {}}
         self._inject_assertion(context, assertion)
         r = api.federated_authentication(context, self.IDP, self.PROTOCOL)
         return r
 
     def test_issue_unscoped_token(self):
         r = self._issue_unscoped_token()
+        self.assertIsNotNone(r.headers.get('X-Subject-Token'))
+
+    def test_issue_unscoped_token_with_remote_user_as_empty_string(self):
+        # make sure that REMOTE_USER set as the empty string won't interfere
+        r = self._issue_unscoped_token(environment={'REMOTE_USER': ''})
         self.assertIsNotNone(r.headers.get('X-Subject-Token'))
 
     def test_issue_unscoped_token_serialize_to_xml(self):
@@ -917,8 +927,8 @@ class FederatedTokenTests(FederationTests):
         self.assertIsNotNone(r.headers.get('X-Subject-Token'))
 
     def test_scope_to_project_once(self):
-        r = self.post(self.AUTH_URL,
-                      body=self.TOKEN_SCOPE_PROJECT_EMPLOYEE_FROM_EMPLOYEE)
+        r = self.v3_authenticate_token(
+            self.TOKEN_SCOPE_PROJECT_EMPLOYEE_FROM_EMPLOYEE)
         token_resp = r.result['token']
         project_id = token_resp['project']['id']
         self.assertEqual(project_id, self.proj_employees['id'])
@@ -930,9 +940,9 @@ class FederatedTokenTests(FederationTests):
     def test_scope_to_bad_project(self):
         """Scope unscoped token with a project we don't have access to."""
 
-        self.post(self.AUTH_URL,
-                  body=self.TOKEN_SCOPE_PROJECT_EMPLOYEE_FROM_CUSTOMER,
-                  expected_status=401)
+        self.v3_authenticate_token(
+            self.TOKEN_SCOPE_PROJECT_EMPLOYEE_FROM_CUSTOMER,
+            expected_status=401)
 
     def test_scope_to_project_multiple_times(self):
         """Try to scope the unscoped token multiple times.
@@ -949,7 +959,7 @@ class FederatedTokenTests(FederationTests):
         project_ids = (self.proj_employees['id'],
                        self.proj_customers['id'])
         for body, project_id_ref in zip(bodies, project_ids):
-            r = self.post(self.AUTH_URL, body=body)
+            r = self.v3_authenticate_token(body)
             token_resp = r.result['token']
             project_id = token_resp['project']['id']
             self.assertEqual(project_id, project_id_ref)
@@ -957,9 +967,9 @@ class FederatedTokenTests(FederationTests):
 
     def test_scope_token_from_nonexistent_unscoped_token(self):
         """Try to scope token from non-existent unscoped token."""
-        self.post(self.AUTH_URL,
-                  body=self.TOKEN_SCOPE_PROJECT_FROM_NONEXISTENT_TOKEN,
-                  expected_status=404)
+        self.v3_authenticate_token(
+            self.TOKEN_SCOPE_PROJECT_FROM_NONEXISTENT_TOKEN,
+            expected_status=404)
 
     def test_issue_token_from_rules_without_user(self):
         api = auth_controllers.Auth()
@@ -981,8 +991,7 @@ class FederatedTokenTests(FederationTests):
                           assertion='CONTRACTOR_ASSERTION')
 
     def test_scope_to_domain_once(self):
-        r = self.post(self.AUTH_URL,
-                      body=self.TOKEN_SCOPE_DOMAIN_A_FROM_CUSTOMER)
+        r = self.v3_authenticate_token(self.TOKEN_SCOPE_DOMAIN_A_FROM_CUSTOMER)
         token_resp = r.result['token']
         domain_id = token_resp['domain']['id']
         self.assertEqual(domain_id, self.domainA['id'])
@@ -1006,14 +1015,14 @@ class FederatedTokenTests(FederationTests):
                       self.domainC['id'])
 
         for body, domain_id_ref in zip(bodies, domain_ids):
-            r = self.post(self.AUTH_URL, body=body)
+            r = self.v3_authenticate_token(body)
             token_resp = r.result['token']
             domain_id = token_resp['domain']['id']
             self.assertEqual(domain_id, domain_id_ref)
             self._check_scoped_token_attributes(token_resp)
 
     def test_list_projects(self):
-        url = '/OS-FEDERATION/projects'
+        urls = ('/OS-FEDERATION/projects', '/auth/projects')
 
         token = (self.tokens['CUSTOMER_ASSERTION'],
                  self.tokens['EMPLOYEE_ASSERTION'],
@@ -1027,13 +1036,15 @@ class FederatedTokenTests(FederationTests):
                               self.proj_customers['id']]))
 
         for token, projects_ref in zip(token, projects_refs):
-            r = self.get(url, token=token)
-            projects_resp = r.result['projects']
-            projects = set(p['id'] for p in projects_resp)
-            self.assertEqual(projects, projects_ref)
+            for url in urls:
+                r = self.get(url, token=token)
+                projects_resp = r.result['projects']
+                projects = set(p['id'] for p in projects_resp)
+                self.assertEqual(projects, projects_ref,
+                                 'match failed for url %s' % url)
 
     def test_list_domains(self):
-        url = '/OS-FEDERATION/domains'
+        urls = ('/OS-FEDERATION/domains', '/auth/domains')
 
         tokens = (self.tokens['CUSTOMER_ASSERTION'],
                   self.tokens['EMPLOYEE_ASSERTION'],
@@ -1047,10 +1058,12 @@ class FederatedTokenTests(FederationTests):
                             self.domainC['id']]))
 
         for token, domains_ref in zip(tokens, domain_refs):
-            r = self.get(url, token=token)
-            domains_resp = r.result['domains']
-            domains = set(p['id'] for p in domains_resp)
-            self.assertEqual(domains, domains_ref)
+            for url in urls:
+                r = self.get(url, token=token)
+                domains_resp = r.result['domains']
+                domains = set(p['id'] for p in domains_resp)
+                self.assertEqual(domains, domains_ref,
+                                 'match failed for url %s' % url)
 
     def test_full_workflow(self):
         """Test 'standard' workflow for granting access tokens.
@@ -1072,7 +1085,7 @@ class FederatedTokenTests(FederationTests):
         v3_scope_request = self._scope_request(employee_unscoped_token_id,
                                                'project', project['id'])
 
-        r = self.post(self.AUTH_URL, body=v3_scope_request)
+        r = self.v3_authenticate_token(v3_scope_request)
         token_resp = r.result['token']
         project_id = token_resp['project']['id']
         self.assertEqual(project_id, project['id'])
@@ -1147,9 +1160,7 @@ class FederatedTokenTests(FederationTests):
             token_id, 'project',
             self.project_all['id'])
 
-        self.post(self.AUTH_URL,
-                  body=scoped_token,
-                  expected_status=500)
+        self.v3_authenticate_token(scoped_token, expected_status=500)
 
     def test_assertion_prefix_parameter(self):
         """Test parameters filtering based on the prefix.
@@ -1560,3 +1571,16 @@ class FederatedTokenTests(FederationTests):
         assertion = getattr(mapping_fixtures, variant)
         context['environment'].update(assertion)
         context['query_string'] = []
+
+
+class JsonHomeTests(FederationTests, test_v3.JsonHomeTestMixin):
+    JSON_HOME_DATA = {
+        'http://docs.openstack.org/api/openstack-identity/3/ext/OS-FEDERATION/'
+        '1.0/rel/identity_provider': {
+            'href-template': '/OS-FEDERATION/identity_providers/{idp_id}',
+            'href-vars': {
+                'idp_id': 'http://docs.openstack.org/api/openstack-identity/3/'
+                'ext/OS-FEDERATION/1.0/param/idp_id'
+            },
+        },
+    }

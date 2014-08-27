@@ -28,9 +28,10 @@ CONF = config.CONF
 
 class Region(sql.ModelBase, sql.DictBase):
     __tablename__ = 'region'
-    attributes = ['id', 'description', 'parent_region_id']
+    attributes = ['id', 'description', 'parent_region_id', 'url']
     id = sql.Column(sql.String(64), primary_key=True)
     description = sql.Column(sql.String(255), nullable=False)
+    url = sql.Column(sql.String(255), nullable=True)
     # NOTE(jaypipes): Right now, using an adjacency list model for
     #                 storing the hierarchy of regions is fine, since
     #                 the API does not support any kind of querying for
@@ -82,9 +83,10 @@ class Endpoint(sql.ModelBase, sql.DictBase):
 class Catalog(catalog.Driver):
 
     # Regions
-    def list_regions(self):
+    def list_regions(self, hints):
         session = sql.get_session()
-        regions = session.query(Region).all()
+        regions = session.query(Region)
+        regions = sql.filter_limit_query(Region, regions, hints)
         return [s.to_dict() for s in list(regions)]
 
     def _get_region(self, session, region_id):
@@ -240,9 +242,8 @@ class Catalog(catalog.Driver):
         return ref.to_dict()
 
     def get_catalog(self, user_id, tenant_id, metadata=None):
-        d = dict(six.iteritems(CONF))
-        d.update({'tenant_id': tenant_id,
-                  'user_id': user_id})
+        substitutions = dict(six.iteritems(CONF))
+        substitutions.update({'tenant_id': tenant_id, 'user_id': user_id})
 
         session = sql.get_session()
         t = True  # variable for singleton for PEP8, E712.
@@ -256,7 +257,7 @@ class Catalog(catalog.Driver):
             if not endpoint.service['enabled']:
                 continue
             try:
-                url = core.format_url(endpoint['url'], d)
+                url = core.format_url(endpoint['url'], substitutions)
             except exception.MalformedEndpoint:
                 continue  # this failure is already logged in format_url()
 

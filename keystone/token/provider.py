@@ -15,31 +15,42 @@
 """Token provider interface."""
 
 import abc
+import base64
+import datetime
+import sys
+import uuid
 
+from keystoneclient.common import cms
+from oslo.utils import timeutils
 import six
 
 from keystone.common import cache
 from keystone.common import dependency
 from keystone.common import manager
 from keystone import config
-
 from keystone import exception
-from keystone.openstack.common.gettextutils import _
+from keystone.i18n import _
+from keystone.models import token_model
 from keystone.openstack.common import log
-from keystone.openstack.common import timeutils
+from keystone.openstack.common import versionutils
+from keystone.token import persistence
 
 
 CONF = config.CONF
 LOG = log.getLogger(__name__)
 SHOULD_CACHE = cache.should_cache_fn('token')
 
+# NOTE(morganfainberg): This is for compatibility in case someone was relying
+# on the old location of the UnsupportedTokenVersionException for their code.
+UnsupportedTokenVersionException = exception.UnsupportedTokenVersionException
+
 # NOTE(blk-u): The config options are not available at import time.
 EXPIRATION_TIME = lambda: CONF.token.cache_time
 
 # supported token versions
-V2 = 'v2.0'
-V3 = 'v3.0'
-VERSIONS = frozenset([V2, V3])
+V2 = token_model.V2
+V3 = token_model.V3
+VERSIONS = token_model.VERSIONS
 
 # default token providers
 PKI_PROVIDER = 'keystone.token.providers.pki.Provider'
@@ -54,12 +65,39 @@ _FORMAT_TO_PROVIDER = {
 }
 
 
-class UnsupportedTokenVersionException(Exception):
-    """Token version is unrecognizable or unsupported."""
-    pass
+def default_expire_time():
+    """Determine when a fresh token should expire.
+
+    Expiration time varies based on configuration (see ``[token] expiration``).
+
+    :returns: a naive UTC datetime.datetime object
+
+    """
+    expire_delta = datetime.timedelta(seconds=CONF.token.expiration)
+    return timeutils.utcnow() + expire_delta
 
 
-@dependency.requires('token_api')
+def audit_info(parent_audit_id):
+    """Build the audit data for a token.
+
+    If ``parent_audit_id`` is None, the list will be one element in length
+    containing a newly generated audit_id.
+
+    If ``parent_audit_id`` is supplied, the list will be two elements in length
+    containing a newly generated audit_id and the ``parent_audit_id``. The
+    ``parent_audit_id`` will always be element index 1 in the resulting
+    list.
+
+    :param parent_audit_id: the audit of the original token in the chain
+    :type parent_audit_id: str
+    :returns: Keystone token audit data
+    """
+    audit_id = base64.urlsafe_b64encode(uuid.uuid4().bytes)[:-2]
+    if parent_audit_id is not None:
+        return [audit_id, parent_audit_id]
+    return [audit_id]
+
+
 @dependency.optional('revoke_api')
 @dependency.provider('token_provider_api')
 class Manager(manager.Manager):
@@ -69,6 +107,12 @@ class Manager(manager.Manager):
     dynamically calls the backend.
 
     """
+
+    V2 = V2
+    V3 = V3
+    VERSIONS = VERSIONS
+
+    _persistence_manager = None
 
     @classmethod
     def get_token_provider(cls):
@@ -105,8 +149,56 @@ class Manager(manager.Manager):
     def __init__(self):
         super(Manager, self).__init__(self.get_token_provider())
 
+        # This is used by the @dependency.provider decorator to register the
+        # provider (token_provider_api) manager to listen for trust deletions.
+        self.event_callbacks = {
+            'deleted': {'OS-TRUST:trust': [self._trust_deleted_event_callback],
+                        'user': [self._delete_user_tokens_callback]},
+            'disabled': {'user': [self._delete_user_tokens_callback]},
+            'updated': {'user_password': [self._delete_user_tokens_callback],
+                        'user_removed_from_group': [
+                            self._delete_user_tokens_callback]}
+        }
+
+    @property
+    def persistence(self):
+        # NOTE(morganfainberg): This should not be handled via __init__ to
+        # avoid dependency injection oddities circular dependencies (where
+        # the provider manager requires the token persistence manager, which
+        # requires the token provider manager).
+        if self._persistence_manager is None:
+            self._persistence_manager = persistence.PersistenceManager()
+        return self._persistence_manager
+
+    def unique_id(self, token_id):
+        """Return a unique ID for a token.
+
+        The returned value is useful as the primary key of a database table,
+        memcache store, or other lookup table.
+
+        :returns: Given a PKI token, returns it's hashed value. Otherwise,
+                  returns the passed-in value (such as a UUID token ID or an
+                  existing hash).
+        """
+        return cms.cms_hash_token(token_id, mode=CONF.token.hash_algorithm)
+
+    def _create_token(self, token_id, token_data):
+        try:
+            if isinstance(token_data['expires'], six.string_types):
+                token_data['expires'] = timeutils.normalize_time(
+                    timeutils.parse_isotime(token_data['expires']))
+            self.persistence.create_token(token_id, token_data)
+        except Exception:
+            exc_info = sys.exc_info()
+            # an identical token may have been created already.
+            # if so, return the token_data as it is also identical
+            try:
+                self.persistence.get_token(token_id)
+            except exception.TokenNotFound:
+                six.reraise(*exc_info)
+
     def validate_token(self, token_id, belongs_to=None):
-        unique_id = self.token_api.unique_id(token_id)
+        unique_id = self.unique_id(token_id)
         # NOTE(morganfainberg): Ensure we never use the long-form token_id
         # (PKI) as part of the cache_key.
         token = self._validate_token(unique_id)
@@ -126,10 +218,11 @@ class Manager(manager.Manager):
             self.revoke_api.check_token(token_values)
 
     def validate_v2_token(self, token_id, belongs_to=None):
-        unique_id = self.token_api.unique_id(token_id)
+        unique_id = self.unique_id(token_id)
         # NOTE(morganfainberg): Ensure we never use the long-form token_id
         # (PKI) as part of the cache_key.
-        token = self._validate_v2_token(unique_id)
+        token_ref = self.persistence.get_token(unique_id)
+        token = self._validate_v2_token(token_ref)
         self.check_revocation_v2(token)
         self._token_belongs_to(token, belongs_to)
         self._is_valid_token(token)
@@ -152,13 +245,22 @@ class Manager(manager.Manager):
             return self.check_revocation_v3(token)
 
     def validate_v3_token(self, token_id):
-        unique_id = self.token_api.unique_id(token_id)
+        unique_id = self.unique_id(token_id)
         # NOTE(morganfainberg): Ensure we never use the long-form token_id
         # (PKI) as part of the cache_key.
-        token = self._validate_v3_token(unique_id)
+        try:
+            token_ref = self.persistence.get_token(unique_id)
+        except (exception.ValidationError, exception.UserNotFound):
+            raise exception.TokenNotFound(token_id=token_id)
+        token = self._validate_v3_token(token_ref)
         self._is_valid_token(token)
         return token
 
+    @versionutils.deprecated(
+        as_of=versionutils.deprecated.JUNO,
+        what='token_provider_api.check_v2_token',
+        in_favor_of='token_provider_api.validate_v2_token',
+        remove_in=+1)
     def check_v2_token(self, token_id, belongs_to=None):
         """Check the validity of the given V2 token.
 
@@ -169,9 +271,14 @@ class Manager(manager.Manager):
         """
         # NOTE(morganfainberg): Ensure we never use the long-form token_id
         # (PKI) as part of the cache_key.
-        unique_id = self.token_api.unique_id(token_id)
+        unique_id = self.unique_id(token_id)
         self.validate_v2_token(unique_id, belongs_to=belongs_to)
 
+    @versionutils.deprecated(
+        as_of=versionutils.deprecated.JUNO,
+        what='token_provider_api.check_v3_token',
+        in_favor_of='token_provider_api.validate_v3_token',
+        remove_in=+1)
     def check_v3_token(self, token_id):
         """Check the validity of the given V3 token.
 
@@ -181,13 +288,19 @@ class Manager(manager.Manager):
         """
         # NOTE(morganfainberg): Ensure we never use the long-form token_id
         # (PKI) as part of the cache_key.
-        unique_id = self.token_api.unique_id(token_id)
+        unique_id = self.unique_id(token_id)
         self.validate_v3_token(unique_id)
 
     @cache.on_arguments(should_cache_fn=SHOULD_CACHE,
                         expiration_time=EXPIRATION_TIME)
     def _validate_token(self, token_id):
-        return self.driver.validate_token(token_id)
+        token_ref = self.persistence.get_token(token_id)
+        version = self.driver.get_token_version(token_ref)
+        if version == self.V3:
+            return self.driver.validate_v3_token(token_ref)
+        elif version == self.V2:
+            return self.driver.validate_v2_token(token_ref)
+        raise exception.UnsupportedTokenVersionException()
 
     @cache.on_arguments(should_cache_fn=SHOULD_CACHE,
                         expiration_time=EXPIRATION_TIME)
@@ -239,6 +352,62 @@ class Manager(manager.Manager):
                     token_data['tenant']['id'] != belongs_to):
                 raise exception.Unauthorized()
 
+    def issue_v2_token(self, token_ref, roles_ref=None, catalog_ref=None):
+        token_id, token_data = self.driver.issue_v2_token(
+            token_ref, roles_ref, catalog_ref)
+
+        data = dict(key=token_id,
+                    id=token_id,
+                    expires=token_data['access']['token']['expires'],
+                    user=token_ref['user'],
+                    tenant=token_ref['tenant'],
+                    metadata=token_ref['metadata'],
+                    token_data=token_data,
+                    bind=token_ref.get('bind'),
+                    trust_id=token_ref['metadata'].get('trust_id'),
+                    token_version=self.V2)
+        self._create_token(token_id, data)
+
+        return token_id, token_data
+
+    def issue_v3_token(self, user_id, method_names, expires_at=None,
+                       project_id=None, domain_id=None, auth_context=None,
+                       trust=None, metadata_ref=None, include_catalog=True,
+                       parent_audit_id=None):
+        token_id, token_data = self.driver.issue_v3_token(
+            user_id, method_names, expires_at, project_id, domain_id,
+            auth_context, trust, metadata_ref, include_catalog,
+            parent_audit_id)
+
+        if metadata_ref is None:
+            metadata_ref = {}
+
+        if 'project' in token_data['token']:
+            # project-scoped token, fill in the v2 token data
+            # all we care are the role IDs
+
+            # FIXME(gyee): is there really a need to store roles in metadata?
+            role_ids = [r['id'] for r in token_data['token']['roles']]
+            metadata_ref = {'roles': role_ids}
+
+        if trust:
+            metadata_ref.setdefault('trust_id', trust['id'])
+            metadata_ref.setdefault('trustee_user_id',
+                                    trust['trustee_user_id'])
+
+        data = dict(key=token_id,
+                    id=token_id,
+                    expires=token_data['token']['expires_at'],
+                    user=token_data['token']['user'],
+                    tenant=token_data['token'].get('project'),
+                    metadata=metadata_ref,
+                    token_data=token_data,
+                    trust_id=trust['id'] if trust else None,
+                    token_version=self.V3)
+
+        self._create_token(token_id, data)
+        return token_id, token_data
+
     def invalidate_individual_token_cache(self, token_id):
         # NOTE(morganfainberg): invalidate takes the exact same arguments as
         # the normal method, this means we need to pass "self" in (which gets
@@ -252,6 +421,62 @@ class Manager(manager.Manager):
         self._validate_token.invalidate(self, token_id)
         self._validate_v2_token.invalidate(self, token_id)
         self._validate_v3_token.invalidate(self, token_id)
+
+    def revoke_token(self, token_id, revoke_chain=False):
+        if self.revoke_api:
+            revoke_by_expires = False
+            project_id = None
+            domain_id = None
+
+            token_ref = token_model.KeystoneToken(
+                token_id=token_id,
+                token_data=self.validate_token(token_id))
+
+            user_id = token_ref.user_id
+            expires_at = token_ref.expires
+            audit_id = token_ref.audit_id
+            audit_chain_id = token_ref.audit_chain_id
+            if token_ref.project_scoped:
+                project_id = token_ref.project_id
+            if token_ref.domain_scoped:
+                domain_id = token_ref.domain_id
+
+            if audit_id is None and not revoke_chain:
+                LOG.debug('Received token with no audit_id.')
+                revoke_by_expires = True
+
+            if audit_chain_id is None and revoke_chain:
+                LOG.debug('Received token with no audit_chain_id.', token_id)
+                revoke_by_expires = True
+
+            if revoke_by_expires:
+                self.revoke_api.revoke_by_expiration(user_id, expires_at,
+                                                     project_id=project_id,
+                                                     domain_id=domain_id)
+            elif revoke_chain:
+                self.revoke_api.revoke_by_audit_chain_id(audit_chain_id,
+                                                         project_id=project_id,
+                                                         domain_id=domain_id)
+            else:
+                self.revoke_api.revoke_by_audit_id(audit_id)
+
+        if CONF.token.revoke_by_id:
+            self.persistence.delete_token(token_id=token_id)
+
+    def list_revoked_tokens(self):
+        return self.persistence.list_revoked_tokens()
+
+    def _trust_deleted_event_callback(self, service, resource_type, operation,
+                                      payload):
+        trust_id = payload['resource_info']
+        trust = self.trust_api.get_trust(trust_id, deleted=True)
+        self.persistence.delete_tokens(user_id=trust['trustor_user_id'],
+                                       trust_id=trust_id)
+
+    def _delete_user_tokens_callback(self, service, resource_type, operation,
+                                     payload):
+        user_id = payload['resource_info']
+        self.persistence.delete_tokens_for_user(user_id)
 
 
 @six.add_metaclass(abc.ABCMeta)
@@ -270,7 +495,7 @@ class Provider(object):
         :returns: token version string
         :raises: keystone.token.provider.UnsupportedTokenVersionException
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def issue_v2_token(self, token_ref, roles_ref=None, catalog_ref=None):
@@ -284,12 +509,13 @@ class Provider(object):
         :type catalog_ref: dict
         :returns: (token_id, token_data)
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def issue_v3_token(self, user_id, method_names, expires_at=None,
                        project_id=None, domain_id=None, auth_context=None,
-                       metadata_ref=None, include_catalog=True):
+                       trust=None, metadata_ref=None, include_catalog=True,
+                       parent_audit_id=None):
         """Issue a V3 Token.
 
         :param user_id: identity of the user
@@ -304,61 +530,42 @@ class Provider(object):
         :type domain_id: string
         :param auth_context: optional context from the authorization plugins
         :type auth_context: dict
+        :param trust: optional trust reference
+        :type trust: dict
         :param metadata_ref: optional metadata reference
         :type metadata_ref: dict
         :param include_catalog: optional, include the catalog in token data
         :type include_catalog: boolean
+        :param parent_audit_id: optional, the audit id of the parent token
+        :type parent_audit_id: string
         :returns: (token_id, token_data)
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
-    def revoke_token(self, token_id):
-        """Revoke a given token.
-
-        :param token_id: identity of the token
-        :type token_id: string
-        :returns: None.
-        """
-        raise exception.NotImplemented()
-
-    @abc.abstractmethod
-    def validate_token(self, token_id):
-        """Detect token version and validate token and return the token data.
-
-        Must raise Unauthorized exception if unable to validate token.
-
-        :param token_id: identity of the token
-        :type token_id: string
-        :returns: token_data
-        :raises: keystone.exception.TokenNotFound
-        """
-        raise exception.NotImplemented()
-
-    @abc.abstractmethod
-    def validate_v2_token(self, token_id):
+    def validate_v2_token(self, token_ref):
         """Validate the given V2 token and return the token data.
 
         Must raise Unauthorized exception if unable to validate token.
 
-        :param token_id: identity of the token
-        :type token_id: string
+        :param token_ref: the token reference
+        :type token_ref: dict
         :returns: token data
         :raises: keystone.exception.TokenNotFound
 
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
-    def validate_v3_token(self, token_id):
+    def validate_v3_token(self, token_ref):
         """Validate the given V3 token and return the token_data.
 
-        :param token_id: identity of the token
-        :type token_id: string
+        :param token_ref: the token reference
+        :type token_ref: dict
         :returns: token data
         :raises: keystone.exception.TokenNotFound
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover
 
     @abc.abstractmethod
     def _get_token_id(self, token_data):
@@ -368,4 +575,4 @@ class Provider(object):
         :type token_data: dict
         returns: token identifier
         """
-        raise exception.NotImplemented()
+        raise exception.NotImplemented()  # pragma: no cover

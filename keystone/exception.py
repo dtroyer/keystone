@@ -12,12 +12,12 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+from oslo.utils import encodeutils
 import six
 
 from keystone.common import config
-from keystone.openstack.common.gettextutils import _
+from keystone.i18n import _
 from keystone.openstack.common import log
-from keystone.openstack.common import strutils
 
 
 CONF = config.CONF
@@ -62,7 +62,7 @@ class Error(Exception):
                 message = self.message_format % kwargs
             except UnicodeDecodeError:
                 try:
-                    kwargs = dict([(k, strutils.safe_decode(v)) for k, v in
+                    kwargs = dict([(k, encodeutils.safe_decode(v)) for k, v in
                                    six.iteritems(kwargs)])
                 except UnicodeDecodeError:
                     # NOTE(jamielennox): This is the complete failure case
@@ -82,6 +82,12 @@ class ValidationError(Error):
                        " incorrect. The client is assumed to be in error.")
     code = 400
     title = 'Bad Request'
+
+
+class SchemaValidationError(ValidationError):
+    # NOTE(lbragstad): For whole OpenStack message consistency, this error
+    # message has been written in a format consistent with WSME.
+    message_format = _("%(detail)s")
 
 
 class ValidationTimeStampError(Error):
@@ -326,6 +332,11 @@ class UnexpectedError(SecurityError):
     title = 'Internal Server Error'
 
 
+class TrustConsumeMaximumAttempt(UnexpectedError):
+    debug_message_format = _("Unable to consume trust %(trust_id)s, unable to "
+                             "acquire lock.")
+
+
 class CertificateFilesUnavailable(UnexpectedError):
     debug_message_format = _("Expected signing certificates are not available "
                              "on the server. Please check Keystone "
@@ -367,3 +378,8 @@ class MigrationNotProvided(Exception):
             "%(mod_name)s doesn't provide database migrations. The migration"
             " repository path at %(path)s doesn't exist or isn't a directory."
         ) % {'mod_name': mod_name, 'path': path})
+
+
+class UnsupportedTokenVersionException(Exception):
+    """Token version is unrecognizable or unsupported."""
+    pass
