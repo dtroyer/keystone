@@ -1,4 +1,4 @@
-# Copyright 2012 OpenStack Foundationc
+# Copyright 2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -12,22 +12,21 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+import itertools
 import os.path
 
-import six
+from oslo_log import log
 
-from keystone.catalog.backends import kvs
-from keystone.catalog import core
-from keystone import config
+from keystone.catalog.backends import base
+from keystone.common import utils
+import keystone.conf
 from keystone import exception
-from keystone.i18n import _
-from keystone.openstack.common import log
-from keystone.openstack.common import versionutils
+from keystone.i18n import _LC
 
 
 LOG = log.getLogger(__name__)
 
-CONF = config.CONF
+CONF = keystone.conf.CONF
 
 
 def parse_templates(template_lines):
@@ -57,7 +56,7 @@ def parse_templates(template_lines):
     return o
 
 
-class Catalog(kvs.Catalog):
+class Catalog(base.CatalogDriverBase):
     """A backend that generates endpoints for the Catalog based on templates.
 
     It is usually configured via config entries that look like:
@@ -101,33 +100,199 @@ class Catalog(kvs.Catalog):
 
     def _load_templates(self, template_file):
         try:
-            self.templates = parse_templates(open(template_file))
+            with open(template_file) as f:
+                self.templates = parse_templates(f)
         except IOError:
-            LOG.critical(_('Unable to open template file %s'), template_file)
+            LOG.critical(_LC('Unable to open template file %s'), template_file)
             raise
 
-    def get_catalog(self, user_id, tenant_id, metadata=None):
-        substitutions = dict(six.iteritems(CONF))
-        substitutions.update({'tenant_id': tenant_id, 'user_id': user_id})
+    # region crud
+
+    def create_region(self, region_ref):
+        raise exception.NotImplemented()
+
+    def list_regions(self, hints):
+        return [{'id': region_id, 'description': '', 'parent_region_id': ''}
+                for region_id in self.templates]
+
+    def get_region(self, region_id):
+        if region_id in self.templates:
+            return {'id': region_id, 'description': '', 'parent_region_id': ''}
+        raise exception.RegionNotFound(region_id=region_id)
+
+    def update_region(self, region_id, region_ref):
+        raise exception.NotImplemented()
+
+    def delete_region(self, region_id):
+        raise exception.NotImplemented()
+
+    # service crud
+
+    def create_service(self, service_id, service_ref):
+        raise exception.NotImplemented()
+
+    def _list_services(self, hints):
+        for region_ref in self.templates.values():
+            for service_type, service_ref in region_ref.items():
+                yield {
+                    'id': service_type,
+                    'enabled': True,
+                    'name': service_ref.get('name', ''),
+                    'description': service_ref.get('description', ''),
+                    'type': service_type,
+                }
+
+    def list_services(self, hints):
+        return list(self._list_services(hints=None))
+
+    def get_service(self, service_id):
+        for service in self._list_services(hints=None):
+            if service['id'] == service_id:
+                return service
+        raise exception.ServiceNotFound(service_id=service_id)
+
+    def update_service(self, service_id, service_ref):
+        raise exception.NotImplemented()
+
+    def delete_service(self, service_id):
+        raise exception.NotImplemented()
+
+    # endpoint crud
+
+    def create_endpoint(self, endpoint_id, endpoint_ref):
+        raise exception.NotImplemented()
+
+    def _list_endpoints(self):
+        for region_id, region_ref in self.templates.items():
+            for service_type, service_ref in region_ref.items():
+                for key in service_ref:
+                    if key.endswith('URL'):
+                        interface = key[:-3]
+                        endpoint_id = ('%s-%s-%s' %
+                                       (region_id, service_type, interface))
+                        yield {
+                            'id': endpoint_id,
+                            'service_id': service_type,
+                            'interface': interface,
+                            'url': service_ref[key],
+                            'legacy_endpoint_id': None,
+                            'region_id': region_id,
+                            'enabled': True,
+                        }
+
+    def list_endpoints(self, hints):
+        return list(self._list_endpoints())
+
+    def get_endpoint(self, endpoint_id):
+        for endpoint in self._list_endpoints():
+            if endpoint['id'] == endpoint_id:
+                return endpoint
+        raise exception.EndpointNotFound(endpoint_id=endpoint_id)
+
+    def update_endpoint(self, endpoint_id, endpoint_ref):
+        raise exception.NotImplemented()
+
+    def delete_endpoint(self, endpoint_id):
+        raise exception.NotImplemented()
+
+    def get_catalog(self, user_id, tenant_id):
+        """Retrieve and format the V2 service catalog.
+
+        :param user_id: The id of the user who has been authenticated for
+            creating service catalog.
+        :param tenant_id: The id of the project. 'tenant_id' will be None in
+            the case this being called to create a catalog to go in a domain
+            scoped token. In this case, any endpoint that requires a tenant_id
+            as part of their URL will be skipped.
+
+        :returns: A nested dict representing the service catalog or an
+                  empty dict.
+
+        """
+        substitutions = dict(
+            itertools.chain(CONF.items(), CONF.eventlet_server.items()))
+        substitutions.update({'user_id': user_id})
+        silent_keyerror_failures = []
+        if tenant_id:
+            substitutions.update({
+                'tenant_id': tenant_id,
+                'project_id': tenant_id,
+            })
+        else:
+            silent_keyerror_failures = ['tenant_id', 'project_id', ]
 
         catalog = {}
-        for region, region_ref in six.iteritems(self.templates):
+        # TODO(davechen): If there is service with no endpoints, we should
+        # skip the service instead of keeping it in the catalog.
+        # see bug #1436704.
+        for region, region_ref in self.templates.items():
             catalog[region] = {}
-            for service, service_ref in six.iteritems(region_ref):
+            for service, service_ref in region_ref.items():
                 service_data = {}
                 try:
-                    for k, v in six.iteritems(service_ref):
-                        service_data[k] = core.format_url(v, substitutions)
-                except exception.MalformedEndpoint:
+                    for k, v in service_ref.items():
+                        formatted_value = utils.format_url(
+                            v, substitutions,
+                            silent_keyerror_failures=silent_keyerror_failures)
+                        if formatted_value:
+                            service_data[k] = formatted_value
+                except exception.MalformedEndpoint:  # nosec(tkelsey)
                     continue  # this failure is already logged in format_url()
                 catalog[region][service] = service_data
 
         return catalog
 
+    def add_endpoint_to_project(self, endpoint_id, project_id):
+        raise exception.NotImplemented()
 
-@versionutils.deprecated(
-    versionutils.deprecated.ICEHOUSE,
-    in_favor_of='keystone.catalog.backends.templated.Catalog',
-    remove_in=+2)
-class TemplatedCatalog(Catalog):
-    pass
+    def remove_endpoint_from_project(self, endpoint_id, project_id):
+        raise exception.NotImplemented()
+
+    def check_endpoint_in_project(self, endpoint_id, project_id):
+        raise exception.NotImplemented()
+
+    def list_endpoints_for_project(self, project_id):
+        raise exception.NotImplemented()
+
+    def list_projects_for_endpoint(self, endpoint_id):
+        raise exception.NotImplemented()
+
+    def delete_association_by_endpoint(self, endpoint_id):
+        raise exception.NotImplemented()
+
+    def delete_association_by_project(self, project_id):
+        raise exception.NotImplemented()
+
+    def create_endpoint_group(self, endpoint_group):
+        raise exception.NotImplemented()
+
+    def get_endpoint_group(self, endpoint_group_id):
+        raise exception.NotImplemented()
+
+    def update_endpoint_group(self, endpoint_group_id, endpoint_group):
+        raise exception.NotImplemented()
+
+    def delete_endpoint_group(self, endpoint_group_id):
+        raise exception.NotImplemented()
+
+    def add_endpoint_group_to_project(self, endpoint_group_id, project_id):
+        raise exception.NotImplemented()
+
+    def get_endpoint_group_in_project(self, endpoint_group_id, project_id):
+        raise exception.NotImplemented()
+
+    def list_endpoint_groups(self):
+        raise exception.NotImplemented()
+
+    def list_endpoint_groups_for_project(self, project_id):
+        raise exception.NotImplemented()
+
+    def list_projects_associated_with_endpoint_group(self, endpoint_group_id):
+        raise exception.NotImplemented()
+
+    def remove_endpoint_group_from_project(self, endpoint_group_id,
+                                           project_id):
+        raise exception.NotImplemented()
+
+    def delete_endpoint_group_association_by_project(self, project_id):
+        raise exception.NotImplemented()

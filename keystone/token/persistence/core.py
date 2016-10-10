@@ -12,86 +12,59 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-"""Main entry point into the Token persistence service."""
+"""Main entry point into the Token Persistence service."""
 
 import abc
 import copy
 
-from oslo.utils import timeutils
+from oslo_log import log
 import six
 
 from keystone.common import cache
 from keystone.common import dependency
 from keystone.common import manager
-from keystone import config
+import keystone.conf
 from keystone import exception
-from keystone.openstack.common import log
-from keystone.openstack.common import versionutils
+from keystone.i18n import _LW
+from keystone.token import utils
 
 
-CONF = config.CONF
+CONF = keystone.conf.CONF
 LOG = log.getLogger(__name__)
-SHOULD_CACHE = cache.should_cache_fn('token')
-
-# NOTE(blk-u): The config options are not available at import time.
-EXPIRATION_TIME = lambda: CONF.token.cache_time
-REVOCATION_CACHE_EXPIRATION_TIME = lambda: CONF.token.revocation_cache_time
+MEMOIZE = cache.get_memoization_decorator(group='token')
+REVOCATION_MEMOIZE = cache.get_memoization_decorator(group='token',
+                                                     expiration_group='revoke')
 
 
-@dependency.requires('assignment_api', 'identity_api', 'token_provider_api',
-                     'trust_api')
+@dependency.requires('assignment_api', 'identity_api', 'resource_api',
+                     'token_provider_api', 'trust_api')
 class PersistenceManager(manager.Manager):
-    """Default pivot point for the Token backend.
+    """Default pivot point for the Token Persistence backend.
 
     See :mod:`keystone.common.manager.Manager` for more details on how this
     dynamically calls the backend.
 
     """
 
+    driver_namespace = 'keystone.token.persistence'
+
     def __init__(self):
         super(PersistenceManager, self).__init__(CONF.token.driver)
 
-    @versionutils.deprecated(as_of=versionutils.deprecated.JUNO,
-                             in_favor_of='token_provider_api.unique_id',
-                             remove_in=+1,
-                             what='token_api.unique_id')
-    def unique_id(self, token_id):
-        return self.token_provider_api.unique_id(token_id)
-
-    def _assert_valid(self, token_id, token_ref):
-        """Raise TokenNotFound if the token is expired."""
-        current_time = timeutils.normalize_time(timeutils.utcnow())
-        expires = token_ref.get('expires')
-        if not expires or current_time > timeutils.normalize_time(expires):
-            raise exception.TokenNotFound(token_id=token_id)
-
     def get_token(self, token_id):
-        if not token_id:
-            # NOTE(morganfainberg): There are cases when the
-            # context['token_id'] will in-fact be None. This also saves
-            # a round-trip to the backend if we don't have a token_id.
-            raise exception.TokenNotFound(token_id='')
-        unique_id = self.token_provider_api.unique_id(token_id)
-        token_ref = self._get_token(unique_id)
-        # NOTE(morganfainberg): Lift expired checking to the manager, there is
-        # no reason to make the drivers implement this check. With caching,
-        # self._get_token could return an expired token. Make sure we behave
-        # as expected and raise TokenNotFound on those instances.
-        self._assert_valid(token_id, token_ref)
-        return token_ref
+        return self._get_token(utils.generate_unique_id(token_id))
 
-    @cache.on_arguments(should_cache_fn=SHOULD_CACHE,
-                        expiration_time=EXPIRATION_TIME)
+    @MEMOIZE
     def _get_token(self, token_id):
         # Only ever use the "unique" id in the cache key.
         return self.driver.get_token(token_id)
 
     def create_token(self, token_id, data):
-        unique_id = self.token_provider_api.unique_id(token_id)
+        unique_id = utils.generate_unique_id(token_id)
         data_copy = copy.deepcopy(data)
         data_copy['id'] = unique_id
         ret = self.driver.create_token(unique_id, data_copy)
-        if SHOULD_CACHE(ret):
+        if MEMOIZE.should_cache(ret):
             # NOTE(morganfainberg): when doing a cache set, you must pass the
             # same arguments through, the same as invalidate (this includes
             # "self"). First argument is always the value to be cached
@@ -101,7 +74,7 @@ class PersistenceManager(manager.Manager):
     def delete_token(self, token_id):
         if not CONF.token.revoke_by_id:
             return
-        unique_id = self.token_provider_api.unique_id(token_id)
+        unique_id = utils.generate_unique_id(token_id)
         self.driver.delete_token(unique_id)
         self._invalidate_individual_token_cache(unique_id)
         self.invalidate_revocation_list()
@@ -110,16 +83,14 @@ class PersistenceManager(manager.Manager):
                       consumer_id=None):
         if not CONF.token.revoke_by_id:
             return
-        token_list = self.driver._list_tokens(user_id, tenant_id, trust_id,
-                                              consumer_id)
-        self.driver.delete_tokens(user_id, tenant_id, trust_id, consumer_id)
+        token_list = self.driver.delete_tokens(user_id, tenant_id, trust_id,
+                                               consumer_id)
         for token_id in token_list:
-            unique_id = self.token_provider_api.unique_id(token_id)
+            unique_id = utils.generate_unique_id(token_id)
             self._invalidate_individual_token_cache(unique_id)
         self.invalidate_revocation_list()
 
-    @cache.on_arguments(should_cache_fn=SHOULD_CACHE,
-                        expiration_time=REVOCATION_CACHE_EXPIRATION_TIME)
+    @REVOCATION_MEMOIZE
     def list_revoked_tokens(self):
         return self.driver.list_revoked_tokens()
 
@@ -141,7 +112,7 @@ class PersistenceManager(manager.Manager):
         """
         if not CONF.token.revoke_by_id:
             return
-        projects = self.assignment_api.list_projects()
+        projects = self.resource_api.list_projects()
         for project in projects:
             if project['domain_id'] == domain_id:
                 for user_id in self.assignment_api.list_user_ids_for_project(
@@ -207,11 +178,6 @@ class PersistenceManager(manager.Manager):
         self.token_provider_api.invalidate_individual_token_cache(token_id)
 
 
-# NOTE(morganfainberg): @dependency.optional() is required here to ensure the
-# class-level optional dependency control attribute is populated as empty
-# this is because of the override of .__getattr__ and ensures that if the
-# optional dependency injector changes attributes, this class doesn't break.
-@dependency.optional()
 @dependency.requires('token_provider_api')
 @dependency.provider('token_api')
 class Manager(object):
@@ -220,21 +186,31 @@ class Manager(object):
     This class is a proxy class to the token_provider_api's persistence
     manager.
     """
+
     def __init__(self):
         # NOTE(morganfainberg): __init__ is required for dependency processing.
         super(Manager, self).__init__()
 
     def __getattr__(self, item):
         """Forward calls to the `token_provider_api` persistence manager."""
-        # TODO(morganfainberg): Once the `token_api` is deprecated, apply a
-        # @versionutils.deprecated decorator to each item forwarded.
-        f = getattr(self.token_provider_api.persistence, item)
+        # NOTE(morganfainberg): Prevent infinite recursion, raise an
+        # AttributeError for 'token_provider_api' ensuring that the dep
+        # injection doesn't infinitely try and lookup self.token_provider_api
+        # on _process_dependencies. This doesn't need an exception string as
+        # it should only ever be hit on instantiation.
+        if item == 'token_provider_api':
+            raise AttributeError()
+
+        f = getattr(self.token_provider_api._persistence, item)
+        LOG.warning(_LW('`token_api.%s` is deprecated as of Juno in favor of '
+                        'utilizing methods on `token_provider_api` and may be '
+                        'removed in Kilo.'), item)
         setattr(self, item, f)
         return f
 
 
 @six.add_metaclass(abc.ABCMeta)
-class Driver(object):
+class TokenDriverBase(object):
     """Interface description for a Token driver."""
 
     @abc.abstractmethod
@@ -244,7 +220,7 @@ class Driver(object):
         :param token_id: identity of the token
         :type token_id: string
         :returns: token_ref
-        :raises: keystone.exception.TokenNotFound
+        :raises keystone.exception.TokenNotFound: If the token doesn't exist.
 
         """
         raise exception.NotImplemented()  # pragma: no cover
@@ -275,12 +251,12 @@ class Driver(object):
 
     @abc.abstractmethod
     def delete_token(self, token_id):
-        """Deletes a token by id.
+        """Delete a token by id.
 
         :param token_id: identity of the token
         :type token_id: string
         :returns: None.
-        :raises: keystone.exception.TokenNotFound
+        :raises keystone.exception.TokenNotFound: If the token doesn't exist.
 
         """
         raise exception.NotImplemented()  # pragma: no cover
@@ -288,7 +264,7 @@ class Driver(object):
     @abc.abstractmethod
     def delete_tokens(self, user_id, tenant_id=None, trust_id=None,
                       consumer_id=None):
-        """Deletes tokens by user.
+        """Delete tokens by user.
 
         If the tenant_id is not None, only delete the tokens by user id under
         the specified tenant.
@@ -307,8 +283,8 @@ class Driver(object):
         :type trust_id: string
         :param consumer_id: identity of the consumer
         :type consumer_id: string
-        :returns: None.
-        :raises: keystone.exception.TokenNotFound
+        :returns: The tokens that have been deleted.
+        :raises keystone.exception.TokenNotFound: If the token doesn't exist.
 
         """
         if not CONF.token.revoke_by_id:
@@ -321,13 +297,15 @@ class Driver(object):
         for token in token_list:
             try:
                 self.delete_token(token)
-            except exception.NotFound:
+            except exception.NotFound:  # nosec
+                # The token is already gone, good.
                 pass
+        return token_list
 
     @abc.abstractmethod
     def _list_tokens(self, user_id, tenant_id=None, trust_id=None,
                      consumer_id=None):
-        """Returns a list of current token_id's for a user
+        """Return a list of current token_id's for a user.
 
         This is effectively a private method only used by the ``delete_tokens``
         method and should not be called by anything outside of the
@@ -348,7 +326,7 @@ class Driver(object):
 
     @abc.abstractmethod
     def list_revoked_tokens(self):
-        """Returns a list of all revoked tokens
+        """Return a list of all revoked tokens.
 
         :returns: list of token_id's
 
@@ -357,6 +335,5 @@ class Driver(object):
 
     @abc.abstractmethod
     def flush_expired_tokens(self):
-        """Archive or delete tokens that have expired.
-        """
+        """Archive or delete tokens that have expired."""
         raise exception.NotImplemented()  # pragma: no cover

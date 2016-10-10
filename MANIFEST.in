@@ -1,16 +1,14 @@
 include AUTHORS
 include babel.cfg
 include ChangeLog
-include CONTRIBUTING.txt
+include CONTRIBUTING.rst
 include LICENSE
 include HACKING.rst
 include README.rst
 include openstack-common.conf
-include run_tests.py
 include run_tests.sh
 include setup.cfg
 include setup.py
-include TODO
 include tox.ini
 include etc/*
 include httpd/*
@@ -19,5 +17,5 @@ graft doc
 graft keystone/tests
 graft tools
 graft examples
-recursive-include keystone *.json *.xml *.cfg *.pem README *.po *.pot *.sql
+recursive-include keystone *.json *.xml *.cfg *.pem README *.po *.mo *.sql
 global-exclude *.pyc *.sdx *.log *.db *.swp keystone/tests/tmp/*

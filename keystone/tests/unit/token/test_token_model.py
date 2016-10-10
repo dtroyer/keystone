@@ -13,22 +13,23 @@
 import copy
 import uuid
 
-from oslo.utils import timeutils
+from oslo_utils import timeutils
+from six.moves import range
 
-from keystone.common import config
+import keystone.conf
 from keystone import exception
+from keystone.federation import constants as federation_constants
 from keystone.models import token_model
-from keystone.tests import core
-from keystone.tests import test_token_provider
+from keystone.tests.unit import core
+from keystone.tests.unit import test_token_provider
 
 
-CONF = config.CONF
+CONF = keystone.conf.CONF
 
 
 class TestKeystoneTokenModel(core.TestCase):
     def setUp(self):
         super(TestKeystoneTokenModel, self).setUp()
-        self.load_backends()
         self.v2_sample_token = copy.deepcopy(
             test_token_provider.SAMPLE_V2_TOKEN)
         self.v3_sample_token = copy.deepcopy(
@@ -59,6 +60,8 @@ class TestKeystoneTokenModel(core.TestCase):
         self.assertEqual(
             self.v3_sample_token['token']['project']['domain']['name'],
             token_data.project_domain_name)
+        self.assertEqual(
+            self.v3_sample_token['token']['is_domain'], token_data.is_domain)
         self.assertEqual(self.v3_sample_token['token']['OS-TRUST:trust']['id'],
                          token_data.trust_id)
         self.assertEqual(
@@ -127,7 +130,7 @@ class TestKeystoneTokenModel(core.TestCase):
         self.assertIsNone(token_data.federation_protocol_id)
         self.assertIsNone(token_data.federation_idp_id)
 
-        token_data['user'][token_model.federation.FEDERATION] = federation_data
+        token_data['user'][federation_constants.FEDERATION] = federation_data
 
         self.assertTrue(token_data.is_federated_user)
         self.assertEqual([x['id'] for x in federation_data['groups']],
@@ -149,7 +152,7 @@ class TestKeystoneTokenModel(core.TestCase):
         self.assertIsNone(token_data.federation_protocol_id)
         self.assertIsNone(token_data.federation_idp_id)
 
-        token_data['user'][token_model.federation.FEDERATION] = federation_data
+        token_data['user'][federation_constants.FEDERATION] = federation_data
 
         # Federated users should not exist in V2, the data should remain empty
         self.assertFalse(token_data.is_federated_user)
@@ -180,7 +183,12 @@ class TestKeystoneTokenModel(core.TestCase):
                          token_data.project_domain_name)
         self.assertEqual(self.v2_sample_token['access']['trust']['id'],
                          token_data.trust_id)
-        self.assertIsNone(token_data.trustor_user_id)
+        self.assertEqual(
+            self.v2_sample_token['access']['trust']['trustor_user_id'],
+            token_data.trustor_user_id)
+        self.assertEqual(
+            self.v2_sample_token['access']['trust']['impersonation'],
+            token_data.trust_impersonation)
         self.assertEqual(
             self.v2_sample_token['access']['trust']['trustee_user_id'],
             token_data.trustee_user_id)

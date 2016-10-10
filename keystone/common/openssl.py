@@ -14,14 +14,16 @@
 #
 
 import os
+import subprocess  # nosec : see comments in the code below
 
-from keystone.common import environment
+from oslo_log import log
+
 from keystone.common import utils
-from keystone import config
-from keystone.openstack.common import log
+import keystone.conf
+from keystone.i18n import _LI, _LE, _LW
 
 LOG = log.getLogger(__name__)
-CONF = config.CONF
+CONF = keystone.conf.CONF
 
 PUBLIC_DIR_PERMS = 0o755        # -rwxr-xr-x
 PRIVATE_DIR_PERMS = 0o750       # -rwxr-x---
@@ -40,10 +42,12 @@ class BaseCertificateConfigure(object):
 
     """
 
-    def __init__(self, conf_obj, keystone_user, keystone_group, **kwargs):
+    def __init__(self, conf_obj, keystone_user,
+                 keystone_group, rebuild, **kwargs):
         self.conf_dir = os.path.dirname(conf_obj.ca_certs)
         self.use_keystone_user = keystone_user
         self.use_keystone_group = keystone_group
+        self.rebuild = rebuild
         self.ssl_config_file_name = os.path.join(self.conf_dir, "openssl.conf")
         self.request_file_name = os.path.join(self.conf_dir, "req.pem")
         self.ssl_dictionary = {'conf_dir': self.conf_dir,
@@ -59,23 +63,65 @@ class BaseCertificateConfigure(object):
                                'cert_subject': conf_obj.cert_subject}
 
         try:
-            # OpenSSL 1.0 and newer support default_md = default, olders do not
-            openssl_ver = environment.subprocess.Popen(
-                ['openssl', 'version'],
-                stdout=environment.subprocess.PIPE).stdout.read()
-            if "OpenSSL 0." in openssl_ver:
+            # OpenSSL 1.0 and newer support default_md = default,
+            # older versions do not
+            openssl_ver = subprocess.check_output(  # nosec : the arguments
+                # are hardcoded and just check the openssl version
+                ['openssl', 'version'])
+            if b'OpenSSL 0.' in openssl_ver:
                 self.ssl_dictionary['default_md'] = 'sha1'
-        except OSError:
-            LOG.warn('Failed to invoke ``openssl version``, '
-                     'assuming is v1.0 or newer')
+        except subprocess.CalledProcessError:
+            LOG.warning(_LW('Failed to invoke ``openssl version``, '
+                            'assuming is v1.0 or newer'))
         self.ssl_dictionary.update(kwargs)
 
     def exec_command(self, command):
-        to_exec = []
-        for cmd_part in command:
-            to_exec.append(cmd_part % self.ssl_dictionary)
-        LOG.info(' '.join(to_exec))
-        environment.subprocess.check_call(to_exec)
+        to_exec = [part % self.ssl_dictionary for part in command]
+        LOG.info(_LI('Running command - %s'), ' '.join(to_exec))
+        try:
+            # NOTE(shaleh): use check_output instead of the simpler
+            # `check_call()` in order to log any output from an error.
+            subprocess.check_output(  # nosec : the arguments being passed
+                # in are defined in this file and trusted to build CAs, keys
+                # and certs
+                to_exec,
+                stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as e:
+            msg = _LE("Command %(to_exec)s exited with %(retcode)s - "
+                      "%(output)s)")
+            LOG.error(msg,
+                      {'to_exec': to_exec,
+                       'retcode': e.returncode,
+                       'output': e.output})
+            raise
+
+    def clean_up_existing_files(self):
+        files_to_clean = [self.ssl_dictionary['ca_private_key'],
+                          self.ssl_dictionary['ca_cert'],
+                          self.ssl_dictionary['signing_key'],
+                          self.ssl_dictionary['signing_cert'],
+                          ]
+
+        existing_files = []
+
+        for file_path in files_to_clean:
+            if file_exists(file_path):
+                if self.rebuild:
+                    # The file exists but the user wants to rebuild it, so blow
+                    # it away
+                    try:
+                        os.remove(file_path)
+                    except OSError as exc:
+                        msg = _LE("Failed to remove file %(file_path)r: "
+                                  "%(error)s")
+                        LOG.error(msg,
+                                  {'file_path': file_path,
+                                   'error': exc.strerror})
+                        raise
+                else:
+                    existing_files.append(file_path)
+
+        return existing_files
 
     def build_ssl_config_file(self):
         utils.make_dirs(os.path.dirname(self.ssl_config_file_name),
@@ -83,9 +129,8 @@ class BaseCertificateConfigure(object):
                         user=self.use_keystone_user,
                         group=self.use_keystone_group, log=LOG)
         if not file_exists(self.ssl_config_file_name):
-            ssl_config_file = open(self.ssl_config_file_name, 'w')
-            ssl_config_file.write(self.sslconfig % self.ssl_dictionary)
-            ssl_config_file.close()
+            with open(self.ssl_config_file_name, 'w') as ssl_config_file:
+                ssl_config_file.write(self.sslconfig % self.ssl_dictionary)
         utils.set_permissions(self.ssl_config_file_name,
                               mode=PRIVATE_FILE_PERMS,
                               user=self.use_keystone_user,
@@ -93,9 +138,8 @@ class BaseCertificateConfigure(object):
 
         index_file_name = os.path.join(self.conf_dir, 'index.txt')
         if not file_exists(index_file_name):
-            index_file = open(index_file_name, 'w')
-            index_file.write('')
-            index_file.close()
+            with open(index_file_name, 'w') as index_file:
+                index_file.write('')
         utils.set_permissions(index_file_name,
                               mode=PRIVATE_FILE_PERMS,
                               user=self.use_keystone_user,
@@ -103,9 +147,8 @@ class BaseCertificateConfigure(object):
 
         serial_file_name = os.path.join(self.conf_dir, 'serial')
         if not file_exists(serial_file_name):
-            index_file = open(serial_file_name, 'w')
-            index_file.write('01')
-            index_file.close()
+            with open(serial_file_name, 'w') as index_file:
+                index_file.write('01')
         utils.set_permissions(serial_file_name,
                               mode=PRIVATE_FILE_PERMS,
                               user=self.use_keystone_user,
@@ -180,6 +223,18 @@ class BaseCertificateConfigure(object):
                                '-infiles', '%(request_file)s'])
 
     def run(self):
+        try:
+            existing_files = self.clean_up_existing_files()
+        except OSError:
+            print('An error occurred when rebuilding cert files.')
+            return
+        if existing_files:
+            print('The following cert files already exist, use --rebuild to '
+                  'remove the existing files before regenerating:')
+            for f in existing_files:
+                print('%s already exists' % f)
+            return
+
         self.build_ssl_config_file()
         self.build_ca_cert()
         self.build_private_key()
@@ -195,21 +250,9 @@ class ConfigurePKI(BaseCertificateConfigure):
 
     """
 
-    def __init__(self, keystone_user, keystone_group):
-        super(ConfigurePKI, self).__init__(CONF.signing,
-                                           keystone_user, keystone_group)
-
-
-class ConfigureSSL(BaseCertificateConfigure):
-    """Generate files for HTTPS using OpenSSL.
-
-    Creates a public/private key and certificates. If a CA is not given
-    one will be generated using provided arguments.
-    """
-
-    def __init__(self, keystone_user, keystone_group):
-        super(ConfigureSSL, self).__init__(CONF.ssl,
-                                           keystone_user, keystone_group)
+    def __init__(self, keystone_user, keystone_group, rebuild=False):
+        super(ConfigurePKI, self).__init__(CONF.signing, keystone_user,
+                                           keystone_group, rebuild=rebuild)
 
 
 BaseCertificateConfigure.sslconfig = """

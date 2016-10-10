@@ -20,29 +20,57 @@ import calendar
 import collections
 import grp
 import hashlib
+import itertools
 import os
 import pwd
+import uuid
 
-from oslo.utils import strutils
+from oslo_log import log
+from oslo_serialization import jsonutils
+from oslo_utils import reflection
+from oslo_utils import strutils
+from oslo_utils import timeutils
 import passlib.hash
 import six
 from six import moves
 
-from keystone.common import config
-from keystone.common import environment
+from keystone.common import authorization
+import keystone.conf
 from keystone import exception
-from keystone.i18n import _
-from keystone.openstack.common import jsonutils
-from keystone.openstack.common import log
+from keystone.i18n import _, _LE, _LW
 
 
-CONF = config.CONF
-
+CONF = keystone.conf.CONF
 LOG = log.getLogger(__name__)
+WHITELISTED_PROPERTIES = [
+    'tenant_id', 'project_id', 'user_id',
+    'public_bind_host', 'admin_bind_host',
+    'compute_host', 'admin_port', 'public_port',
+    'public_endpoint', 'admin_endpoint', ]
+
+
+# NOTE(stevermar): This UUID must stay the same, forever, across
+# all of keystone to preserve its value as a URN namespace, which is
+# used for ID transformation.
+RESOURCE_ID_NAMESPACE = uuid.UUID('4332ecab-770b-4288-a680-b9aca3b1b153')
+
+
+def resource_uuid(value):
+    """Convert input to valid UUID hex digits."""
+    try:
+        uuid.UUID(value)
+        return value
+    except ValueError:
+        if len(value) <= 64:
+            if six.PY2 and isinstance(value, six.text_type):
+                value = value.encode('utf-8')
+            return uuid.uuid5(RESOURCE_ID_NAMESPACE, value).hex
+        raise ValueError(_('Length of transformable resource id > 64, '
+                         'which is max allowed characters'))
 
 
 def flatten_dict(d, parent_key=''):
-    """Flatten a nested dictionary
+    """Flatten a nested dictionary.
 
     Converts a dictionary with nested values to a single level flat
     dictionary, with dotted notation for each key.
@@ -52,38 +80,26 @@ def flatten_dict(d, parent_key=''):
     for k, v in d.items():
         new_key = parent_key + '.' + k if parent_key else k
         if isinstance(v, collections.MutableMapping):
-            items.extend(flatten_dict(v, new_key).items())
+            items.extend(list(flatten_dict(v, new_key).items()))
         else:
             items.append((new_key, v))
     return dict(items)
 
 
-def read_cached_file(filename, cache_info, reload_func=None):
-    """Read from a file if it has been modified.
-
-    :param cache_info: dictionary to hold opaque cache.
-    :param reload_func: optional function to be called with data when
-                        file is reloaded due to a modification.
-
-    :returns: data from file.
-
-    """
-    mtime = os.path.getmtime(filename)
-    if not cache_info or mtime != cache_info.get('mtime'):
-        with open(filename) as fap:
-            cache_info['data'] = fap.read()
-        cache_info['mtime'] = mtime
-        if reload_func:
-            reload_func(cache_info['data'])
-    return cache_info['data']
-
-
 class SmarterEncoder(jsonutils.json.JSONEncoder):
     """Help for JSON encoding dict-like objects."""
+
     def default(self, obj):
         if not isinstance(obj, dict) and hasattr(obj, 'iteritems'):
             return dict(obj.iteritems())
         return super(SmarterEncoder, self).default(obj)
+
+
+class PKIEncoder(SmarterEncoder):
+    """Special encoder to make token JSON a bit shorter."""
+
+    item_separator = ','
+    key_separator = ':'
 
 
 def verify_length_and_trunc_password(password):
@@ -94,9 +110,8 @@ def verify_length_and_trunc_password(password):
             if CONF.strict_password_check:
                 raise exception.PasswordVerificationError(size=max_length)
             else:
-                LOG.warning(
-                    _('Truncating user password to '
-                      '%d characters.'), max_length)
+                msg = _LW("Truncating user password to %d characters.")
+                LOG.warning(msg, max_length)
                 return password[:max_length]
         else:
             return password
@@ -106,6 +121,8 @@ def verify_length_and_trunc_password(password):
 
 def hash_access_key(access):
     hash_ = hashlib.sha256()
+    if not isinstance(access, six.binary_type):
+        access = access.encode('utf-8')
     hash_.update(access)
     return hash_.hexdigest()
 
@@ -140,7 +157,7 @@ def check_password(password, hashed):
 
 
 def attr_as_boolean(val_attr):
-    """Returns the boolean value, decoded from a string.
+    """Return the boolean value, decoded from a string.
 
     We test explicitly for a value meaning False, which can be one of
     several formats as specified in oslo strutils.FALSE_STRINGS.
@@ -149,43 +166,6 @@ def attr_as_boolean(val_attr):
 
     """
     return strutils.bool_from_string(val_attr, default=True)
-
-
-# From python 2.7
-def check_output(*popenargs, **kwargs):
-    r"""Run command with arguments and return its output as a byte string.
-
-    If the exit code was non-zero it raises a CalledProcessError.  The
-    CalledProcessError object will have the return code in the returncode
-    attribute and output in the output attribute.
-
-    The arguments are the same as for the Popen constructor.  Example:
-
-    >>> check_output(['ls', '-l', '/dev/null'])
-    'crw-rw-rw- 1 root root 1, 3 Oct 18  2007 /dev/null\n'
-
-    The stdout argument is not allowed as it is used internally.
-    To capture standard error in the result, use stderr=STDOUT.
-
-    >>> import sys
-    >>> check_output(['/bin/sh', '-c',
-    ...               'ls -l non_existent_file ; exit 0'],
-    ...              stderr=sys.STDOUT)
-    'ls: non_existent_file: No such file or directory\n'
-    """
-    if 'stdout' in kwargs:
-        raise ValueError('stdout argument not allowed, it will be overridden.')
-    LOG.debug(' '.join(popenargs[0]))
-    process = environment.subprocess.Popen(stdout=environment.subprocess.PIPE,
-                                           *popenargs, **kwargs)
-    output, unused_err = process.communicate()
-    retcode = process.poll()
-    if retcode:
-        cmd = kwargs.get('args')
-        if cmd is None:
-            cmd = popenargs[0]
-        raise environment.subprocess.CalledProcessError(retcode, cmd)
-    return output
 
 
 def get_blob_from_credential(credential):
@@ -220,12 +200,8 @@ def convert_v3_to_ec2_credential(credential):
             }
 
 
-def git(*args):
-    return check_output(['git'] + list(args))
-
-
 def unixtime(dt_obj):
-    """Format datetime object as unix timestamp
+    """Format datetime object as unix timestamp.
 
     :param dt_obj: datetime.datetime object
     :returns: float
@@ -240,7 +216,7 @@ def auth_str_equal(provided, known):
     :params provided: the first string
     :params known: the second string
 
-    :return: True if the strings are equal.
+    :returns: True if the strings are equal.
 
     This function takes two strings and compares them.  It is intended to be
     used when doing a comparison for authentication purposes to help guard
@@ -272,48 +248,15 @@ def setup_remote_pydev_debug():
                             stderrToServer=True)
             return True
         except Exception:
-            LOG.exception(_(
+            LOG.exception(_LE(
                 'Error setting up the debug environment. Verify that the '
                 'option --debug-url has the format <host>:<port> and that a '
                 'debugger processes is listening on that port.'))
             raise
 
 
-class LimitingReader(object):
-    """Reader to limit the size of an incoming request."""
-    def __init__(self, data, limit):
-        """Create an iterator on the underlying data.
-
-        :param data: Underlying data object
-        :param limit: maximum number of bytes the reader should allow
-        """
-        self.data = data
-        self.limit = limit
-        self.bytes_read = 0
-
-    def __iter__(self):
-        for chunk in self.data:
-            self.bytes_read += len(chunk)
-            if self.bytes_read > self.limit:
-                raise exception.RequestTooLarge()
-            else:
-                yield chunk
-
-    def read(self, i=None):
-        # NOTE(jamielennox): We can't simply provide the default to the read()
-        # call as the expected default differs between mod_wsgi and eventlet
-        if i is None:
-            result = self.data.read()
-        else:
-            result = self.data.read(i)
-        self.bytes_read += len(result)
-        if self.bytes_read > self.limit:
-            raise exception.RequestTooLarge()
-        return result
-
-
 def get_unix_user(user=None):
-    '''Get the uid and user name.
+    """Get the uid and user name.
 
     This is a convenience utility which accepts a variety of input
     which might represent a unix user. If successful it returns the uid
@@ -326,7 +269,7 @@ def get_unix_user(user=None):
         lookup as a uid.
 
     int
-        An integer is interpretted as a uid.
+        An integer is interpreted as a uid.
 
     None
         None is interpreted to mean use the current process's
@@ -338,9 +281,9 @@ def get_unix_user(user=None):
     :param object user: string, int or None specifying the user to
                         lookup.
 
-    :return: tuple of (uid, name)
-    '''
+    :returns: tuple of (uid, name)
 
+    """
     if isinstance(user, six.string_types):
         try:
             user_info = pwd.getpwnam(user)
@@ -361,14 +304,16 @@ def get_unix_user(user=None):
     elif user is None:
         user_info = pwd.getpwuid(os.geteuid())
     else:
+        user_cls_name = reflection.get_class_name(user,
+                                                  fully_qualified=False)
         raise TypeError('user must be string, int or None; not %s (%r)' %
-                        (user.__class__.__name__, user))
+                        (user_cls_name, user))
 
     return user_info.pw_uid, user_info.pw_name
 
 
 def get_unix_group(group=None):
-    '''Get the gid and group name.
+    """Get the gid and group name.
 
     This is a convenience utility which accepts a variety of input
     which might represent a unix group. If successful it returns the gid
@@ -381,7 +326,7 @@ def get_unix_group(group=None):
         lookup as a gid.
 
     int
-        An integer is interpretted as a gid.
+        An integer is interpreted as a gid.
 
     None
         None is interpreted to mean use the current process's
@@ -394,9 +339,9 @@ def get_unix_group(group=None):
     :param object group: string, int or None specifying the group to
                          lookup.
 
-    :return: tuple of (gid, name)
-    '''
+    :returns: tuple of (gid, name)
 
+    """
     if isinstance(group, six.string_types):
         try:
             group_info = grp.getgrnam(group)
@@ -419,14 +364,16 @@ def get_unix_group(group=None):
     elif group is None:
         group_info = grp.getgrgid(os.getegid())
     else:
+        group_cls_name = reflection.get_class_name(group,
+                                                   fully_qualified=False)
         raise TypeError('group must be string, int or None; not %s (%r)' %
-                        (group.__class__.__name__, group))
+                        (group_cls_name, group))
 
     return group_info.gr_gid, group_info.gr_name
 
 
 def set_permissions(path, mode=None, user=None, group=None, log=None):
-    '''Set the ownership and permissions on the pathname.
+    """Set the ownership and permissions on the pathname.
 
     Each of the mode, user and group are optional, if None then
     that aspect is not modified.
@@ -443,8 +390,8 @@ def set_permissions(path, mode=None, user=None, group=None, log=None):
                          if None do not set.
     :param logger log: logging.logger object, used to emit log messages,
                        if None no logging is performed.
-    '''
 
+    """
     if user is None:
         user_uid, user_name = None, None
     else:
@@ -489,9 +436,9 @@ def set_permissions(path, mode=None, user=None, group=None, log=None):
 
 
 def make_dirs(path, mode=None, user=None, group=None, log=None):
-    '''Assure directory exists, set ownership and permissions.
+    """Assure directory exists, set ownership and permissions.
 
-    Assure the directory exists and optionally set it's ownership
+    Assure the directory exists and optionally set its ownership
     and permissions.
 
     Each of the mode, user and group are optional, if None then
@@ -509,8 +456,8 @@ def make_dirs(path, mode=None, user=None, group=None, log=None):
                          if None do not set.
     :param logger log: logging.logger object, used to emit log messages,
                        if None no logging is performed.
-    '''
 
+    """
     if log:
         if mode is None:
             mode_string = str(mode)
@@ -526,3 +473,184 @@ def make_dirs(path, mode=None, user=None, group=None, log=None):
             raise EnvironmentError("makedirs('%s'): %s" % (path, exc.strerror))
 
     set_permissions(path, mode, user, group, log)
+
+
+class WhiteListedItemFilter(object):
+
+    def __init__(self, whitelist, data):
+        self._whitelist = set(whitelist or [])
+        self._data = data
+
+    def __getitem__(self, name):
+        """Evaluation on an item access."""
+        if name not in self._whitelist:
+            raise KeyError
+        return self._data[name]
+
+
+_ISO8601_TIME_FORMAT_SUBSECOND = '%Y-%m-%dT%H:%M:%S.%f'
+_ISO8601_TIME_FORMAT = '%Y-%m-%dT%H:%M:%S'
+
+
+def isotime(at=None, subsecond=False):
+    """Stringify time in ISO 8601 format.
+
+    Python provides a similar instance method for datetime.datetime objects
+    called `isoformat()`. The format of the strings generated by `isoformat()`
+    has a couple of problems:
+    1) The strings generated by `isotime()` are used in tokens and other public
+       APIs that we can't change without a deprecation period. The strings
+       generated by `isoformat()` are not the same format, so we can't just
+       change to it.
+    2) The strings generated by `isoformat()` do not include the microseconds
+       if the value happens to be 0. This will likely show up as random
+       failures as parsers may be written to always expect microseconds, and it
+       will parse correctly most of the time.
+
+    :param at: Optional datetime object to return at a string. If not provided,
+               the time when the function was called will be used.
+    :type at: datetime.datetime
+    :param subsecond: If true, the returned string will represent microsecond
+                      precision, but only precise to the second. For example, a
+                      `datetime.datetime(2016, 9, 14, 14, 1, 13, 970223)` will
+                      be returned as `2016-09-14T14:01:13.000000Z`.
+    :type subsecond: bool
+    :returns: A time string represented in ISO 8601 format.
+    :rtype: str
+    """
+    if not at:
+        at = timeutils.utcnow()
+    # NOTE(lbragstad): Datetime objects are immutable, so reassign the date we
+    # are working with to itself as we drop microsecond precision.
+    at = at.replace(microsecond=0)
+    st = at.strftime(_ISO8601_TIME_FORMAT
+                     if not subsecond
+                     else _ISO8601_TIME_FORMAT_SUBSECOND)
+    tz = at.tzinfo.tzname(None) if at.tzinfo else 'UTC'
+    st += ('Z' if tz == 'UTC' else tz)
+    return st
+
+
+def get_token_ref(context):
+    """Retrieve KeystoneToken object from the auth context and returns it.
+
+    :param dict context: The request context.
+    :raises keystone.exception.Unauthorized: If auth context cannot be found.
+    :returns: The KeystoneToken object.
+    """
+    try:
+        # Retrieve the auth context that was prepared by AuthContextMiddleware.
+        auth_context = (context['environment']
+                        [authorization.AUTH_CONTEXT_ENV])
+        return auth_context['token']
+    except KeyError:
+        LOG.warning(_LW("Couldn't find the auth context."))
+        raise exception.Unauthorized()
+
+
+URL_RESERVED_CHARS = ":/?#[]@!$&'()*+,;="
+
+
+def is_not_url_safe(name):
+    """Check if a string contains any url reserved characters."""
+    return len(list_url_unsafe_chars(name)) > 0
+
+
+def list_url_unsafe_chars(name):
+    """Return a list of the reserved characters."""
+    reserved_chars = ''
+    for i in name:
+        if i in URL_RESERVED_CHARS:
+            reserved_chars += i
+    return reserved_chars
+
+
+def lower_case_hostname(url):
+    """Change the URL's hostname to lowercase."""
+    # NOTE(gyee): according to
+    # https://www.w3.org/TR/WD-html40-970708/htmlweb.html, the netloc portion
+    # of the URL is case-insensitive
+    parsed = moves.urllib.parse.urlparse(url)
+    # Note: _replace method for named tuples is public and defined in docs
+    replaced = parsed._replace(netloc=parsed.netloc.lower())
+    return moves.urllib.parse.urlunparse(replaced)
+
+
+def remove_standard_port(url):
+    # remove the default ports specified in RFC2616 and 2818
+    o = moves.urllib.parse.urlparse(url)
+    separator = ':'
+    (host, separator, port) = o.netloc.partition(':')
+    if o.scheme.lower() == 'http' and port == '80':
+        # NOTE(gyee): _replace() is not a private method. It has
+        # an underscore prefix to prevent conflict with field names.
+        # See https://docs.python.org/2/library/collections.html#
+        # collections.namedtuple
+        o = o._replace(netloc=host)
+    if o.scheme.lower() == 'https' and port == '443':
+        o = o._replace(netloc=host)
+
+    return moves.urllib.parse.urlunparse(o)
+
+
+def format_url(url, substitutions, silent_keyerror_failures=None):
+    """Format a user-defined URL with the given substitutions.
+
+    :param string url: the URL to be formatted
+    :param dict substitutions: the dictionary used for substitution
+    :param list silent_keyerror_failures: keys for which we should be silent
+        if there is a KeyError exception on substitution attempt
+    :returns: a formatted URL
+
+    """
+    substitutions = WhiteListedItemFilter(
+        WHITELISTED_PROPERTIES,
+        substitutions)
+    allow_keyerror = silent_keyerror_failures or []
+    try:
+        result = url.replace('$(', '%(') % substitutions
+    except AttributeError:
+        msg = _LE("Malformed endpoint - %(url)r is not a string")
+        LOG.error(msg, {"url": url})
+        raise exception.MalformedEndpoint(endpoint=url)
+    except KeyError as e:
+        if not e.args or e.args[0] not in allow_keyerror:
+            msg = _LE("Malformed endpoint %(url)s - unknown key "
+                      "%(keyerror)s")
+            LOG.error(msg, {"url": url, "keyerror": e})
+            raise exception.MalformedEndpoint(endpoint=url)
+        else:
+            result = None
+    except TypeError as e:
+        msg = _LE("Malformed endpoint '%(url)s'. The following type error "
+                  "occurred during string substitution: %(typeerror)s")
+        LOG.error(msg, {"url": url, "typeerror": e})
+        raise exception.MalformedEndpoint(endpoint=url)
+    except ValueError as e:
+        msg = _LE("Malformed endpoint %s - incomplete format "
+                  "(are you missing a type notifier ?)")
+        LOG.error(msg, url)
+        raise exception.MalformedEndpoint(endpoint=url)
+    return result
+
+
+def check_endpoint_url(url):
+    """Check substitution of url.
+
+    The invalid urls are as follows:
+    urls with substitutions that is not in the whitelist
+
+    Check the substitutions in the URL to make sure they are valid
+    and on the whitelist.
+
+    :param str url: the URL to validate
+    :rtype: None
+    :raises keystone.exception.URLValidationError: if the URL is invalid
+    """
+    # check whether the property in the path is exactly the same
+    # with that in the whitelist below
+    substitutions = dict(zip(WHITELISTED_PROPERTIES, itertools.repeat('')))
+    try:
+        url.replace('$(', '%(') % substitutions
+    except (KeyError, TypeError, ValueError):
+        raise exception.URLValidationError(url)

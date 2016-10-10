@@ -15,24 +15,28 @@
 
 from __future__ import absolute_import
 import copy
+import threading
 
-from oslo.utils import timeutils
+from oslo_log import log
+from oslo_utils import timeutils
 import six
 
 from keystone.common import kvs
-from keystone import config
+from keystone.common import utils
+import keystone.conf
 from keystone import exception
-from keystone.i18n import _
-from keystone.openstack.common import log
+from keystone.i18n import _, _LE, _LW
 from keystone import token
 from keystone.token import provider
 
 
-CONF = config.CONF
+CONF = keystone.conf.CONF
 LOG = log.getLogger(__name__)
 
+STORE_CONF_LOCK = threading.Lock()
 
-class Token(token.persistence.Driver):
+
+class Token(token.persistence.TokenDriverBase):
     """KeyValueStore backend for tokens.
 
     This is the base implementation for any/all key-value-stores (e.g.
@@ -48,23 +52,29 @@ class Token(token.persistence.Driver):
         self._store = kvs.get_key_value_store('token-driver')
         if backing_store is not None:
             self.kvs_backend = backing_store
-        if not self._store.is_configured:
-            # Do not re-configure the backend if the store has been initialized
-            self._store.configure(backing_store=self.kvs_backend, **kwargs)
+        # Using a lock here to avoid race condition.
+        with STORE_CONF_LOCK:
+            if not self._store.is_configured:
+                # Do not re-configure the backend if the store has been
+                # initialized.
+                self._store.configure(backing_store=self.kvs_backend, **kwargs)
         if self.__class__ == Token:
             # NOTE(morganfainberg): Only warn if the base KVS implementation
             # is instantiated.
-            LOG.warn(_('It is recommended to only use the base '
-                       'key-value-store implementation for the token driver '
-                       'for testing purposes.  '
-                       'Please use keystone.token.backends.memcache.Token '
-                       'or keystone.token.backends.sql.Token instead.'))
+            LOG.warning(_LW('It is recommended to only use the base '
+                            'key-value-store implementation for the token '
+                            'driver for testing purposes. Please use '
+                            "'memcache' or 'sql' instead."))
 
     def _prefix_token_id(self, token_id):
-        return 'token-%s' % token_id.encode('utf-8')
+        if six.PY2:
+            token_id = token_id.encode('utf-8')
+        return 'token-%s' % token_id
 
     def _prefix_user_id(self, user_id):
-        return 'usertokens-%s' % user_id.encode('utf-8')
+        if six.PY2:
+            user_id = user_id.encode('utf-8')
+        return 'usertokens-%s' % user_id
 
     def _get_key_or_default(self, key, default=None):
         try:
@@ -107,7 +117,7 @@ class Token(token.persistence.Driver):
         # concern about the backend, always store the value(s) in the
         # index as the isotime (string) version so this is where the string is
         # built.
-        expires_str = timeutils.isotime(data_copy['expires'], subsecond=True)
+        expires_str = utils.isotime(data_copy['expires'], subsecond=True)
 
         self._set_key(ptk, data_copy)
         user_id = data['user']['id']
@@ -138,8 +148,10 @@ class Token(token.persistence.Driver):
         return data_copy
 
     def _get_user_token_list_with_expiry(self, user_key):
-        """Return a list of tuples in the format (token_id, token_expiry) for
-        the user_key.
+        """Return user token list with token expiry.
+
+        :return: the tuples in the format (token_id, token_expiry)
+        :rtype: list
         """
         return self._get_key_or_default(user_key, default=[])
 
@@ -162,24 +174,24 @@ class Token(token.persistence.Driver):
             for item in token_list:
                 try:
                     item_id, expires = self._format_token_index_item(item)
-                except (ValueError, TypeError):
+                except (ValueError, TypeError):  # nosec(tkelsey)
                     # NOTE(morganfainberg): Skip on expected errors
                     # possibilities from the `_format_token_index_item` method.
                     continue
 
                 if expires < current_time:
-                    LOG.debug(('Token `%(token_id)s` is expired, removing '
-                               'from `%(user_key)s`.'),
-                              {'token_id': item_id, 'user_key': user_key})
+                    msg = ('Token `%(token_id)s` is expired, '
+                           'removing from `%(user_key)s`.')
+                    LOG.debug(msg, {'token_id': item_id, 'user_key': user_key})
                     continue
 
                 if item_id in revoked_token_list:
                     # NOTE(morganfainberg): If the token has been revoked, it
                     # can safely be removed from this list.  This helps to keep
                     # the user_token_list as reasonably small as possible.
-                    LOG.debug(('Token `%(token_id)s` is revoked, removing '
-                               'from `%(user_key)s`.'),
-                              {'token_id': item_id, 'user_key': user_key})
+                    msg = ('Token `%(token_id)s` is revoked, removing '
+                           'from `%(user_key)s`.')
+                    LOG.debug(msg, {'token_id': item_id, 'user_key': user_key})
                     continue
                 filtered_list.append(item)
             filtered_list.append((token_id, expires_isotime_str))
@@ -202,13 +214,22 @@ class Token(token.persistence.Driver):
         expires = timeutils.normalize_time(expires)
 
         if expires < current_time:
-            LOG.warning(_('Token `%s` is expired, not adding to the '
-                          'revocation list.'), data['id'])
+            LOG.warning(_LW('Token `%s` is expired, not adding to the '
+                            'revocation list.'), data['id'])
             return
 
-        revoked_token_data['expires'] = timeutils.isotime(expires,
-                                                          subsecond=True)
+        revoked_token_data['expires'] = utils.isotime(expires,
+                                                      subsecond=True)
         revoked_token_data['id'] = data['id']
+
+        token_data = data['token_data']
+        if 'access' in token_data:
+            # It's a v2 token.
+            audit_ids = token_data['access']['token']['audit_ids']
+        else:
+            # It's a v3 token.
+            audit_ids = token_data['token']['audit_ids']
+        revoked_token_data['audit_id'] = audit_ids[0]
 
         token_list = self._get_key_or_default(self.revocation_key, default=[])
         if not isinstance(token_list, list):
@@ -222,10 +243,10 @@ class Token(token.persistence.Driver):
             # be recoverable. Keystone cannot control external applications
             # from changing a key in some backends, however, it is possible to
             # gracefully handle and notify of this event.
-            LOG.error(_('Reinitializing revocation list due to error '
-                        'in loading revocation list from backend.  '
-                        'Expected `list` type got `%(type)s`. Old '
-                        'revocation list data: %(list)r'),
+            LOG.error(_LE('Reinitializing revocation list due to error '
+                          'in loading revocation list from backend.  '
+                          'Expected `list` type got `%(type)s`. Old '
+                          'revocation list data: %(list)r'),
                       {'type': type(token_list), 'list': token_list})
             token_list = []
 
@@ -236,8 +257,8 @@ class Token(token.persistence.Driver):
                 expires_at = timeutils.normalize_time(
                     timeutils.parse_isotime(token_data['expires']))
             except ValueError:
-                LOG.warning(_('Removing `%s` from revocation list due to '
-                              'invalid expires data in revocation list.'),
+                LOG.warning(_LW('Removing `%s` from revocation list due to '
+                                'invalid expires data in revocation list.'),
                             token_data.get('id', 'INVALID_TOKEN_DATA'))
                 continue
             if expires_at > current_time:
@@ -317,7 +338,7 @@ class Token(token.persistence.Driver):
         for item in token_list:
             try:
                 token_id, expires = self._format_token_index_item(item)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError):  # nosec(tkelsey)
                 # NOTE(morganfainberg): Skip on expected error possibilities
                 # from the `_format_token_index_item` method.
                 continue
@@ -327,7 +348,7 @@ class Token(token.persistence.Driver):
 
             try:
                 token_ref = self.get_token(token_id)
-            except exception.TokenNotFound:
+            except exception.TokenNotFound:  # nosec(tkelsey)
                 # NOTE(morganfainberg): Token doesn't exist, skip it.
                 continue
             if token_ref:

@@ -14,15 +14,14 @@
 
 import time
 
-from oslo.utils import timeutils
+from oslo_utils import timeutils
+from six.moves import range
 
 from keystone.common import sql
 from keystone import exception
-from keystone.openstack.common import log
-from keystone import trust
+from keystone.trust.backends import base
 
 
-LOG = log.getLogger(__name__)
 # The maximum number of iterations that will be attempted for optimistic
 # locking on consuming a limited-use trust.
 MAXIMUM_CONSUME_ATTEMPTS = 10
@@ -44,6 +43,10 @@ class TrustModel(sql.ModelBase, sql.DictBase):
     expires_at = sql.Column(sql.DateTime)
     remaining_uses = sql.Column(sql.Integer, nullable=True)
     extra = sql.Column(sql.JsonBlob())
+    __table_args__ = (sql.UniqueConstraint(
+                      'trustor_user_id', 'trustee_user_id', 'project_id',
+                      'impersonation', 'expires_at',
+                      name='duplicate_trust_constraint'),)
 
 
 class TrustRole(sql.ModelBase):
@@ -53,10 +56,10 @@ class TrustRole(sql.ModelBase):
     role_id = sql.Column(sql.String(64), primary_key=True, nullable=False)
 
 
-class Trust(trust.Driver):
+class Trust(base.TrustDriverBase):
     @sql.handle_conflicts(conflict_type='trust')
     def create_trust(self, trust_id, trust, roles):
-        with sql.transaction() as session:
+        with sql.session_for_write() as session:
             ref = TrustModel.from_dict(trust)
             ref['id'] = trust_id
             if ref.get('expires_at') and ref['expires_at'].tzinfo is not None:
@@ -69,9 +72,9 @@ class Trust(trust.Driver):
                 trust_role.role_id = role['id']
                 added_roles.append({'id': role['id']})
                 session.add(trust_role)
-        trust_dict = ref.to_dict()
-        trust_dict['roles'] = added_roles
-        return trust_dict
+            trust_dict = ref.to_dict()
+            trust_dict['roles'] = added_roles
+            return trust_dict
 
     def _add_roles(self, trust_id, session, trust_dict):
         roles = []
@@ -83,7 +86,7 @@ class Trust(trust.Driver):
     def consume_use(self, trust_id):
 
         for attempt in range(MAXIMUM_CONSUME_ATTEMPTS):
-            with sql.transaction() as session:
+            with sql.session_for_write() as session:
                 try:
                     query_result = (session.query(TrustModel.remaining_uses).
                                     filter_by(id=trust_id).
@@ -117,7 +120,7 @@ class Trust(trust.Driver):
                     raise exception.TrustUseLimitReached(trust_id=trust_id)
             # NOTE(morganfainberg): Ensure we have a yield point for eventlet
             # here. This should cost us nothing otherwise. This can be removed
-            # if/when oslo.db cleanly handles yields on db calls.
+            # if/when oslo_db cleanly handles yields on db calls.
             time.sleep(0)
         else:
             # NOTE(morganfainberg): In the case the for loop is not prematurely
@@ -129,51 +132,51 @@ class Trust(trust.Driver):
             raise exception.TrustConsumeMaximumAttempt(trust_id=trust_id)
 
     def get_trust(self, trust_id, deleted=False):
-        session = sql.get_session()
-        query = session.query(TrustModel).filter_by(id=trust_id)
-        if not deleted:
-            query = query.filter_by(deleted_at=None)
-        ref = query.first()
-        if ref is None:
-            return None
-        if ref.expires_at is not None and not deleted:
-            now = timeutils.utcnow()
-            if now > ref.expires_at:
-                return None
-        # Do not return trusts that can't be used anymore
-        if ref.remaining_uses is not None and not deleted:
-            if ref.remaining_uses <= 0:
-                return None
-        trust_dict = ref.to_dict()
+        with sql.session_for_read() as session:
+            query = session.query(TrustModel).filter_by(id=trust_id)
+            if not deleted:
+                query = query.filter_by(deleted_at=None)
+            ref = query.first()
+            if ref is None:
+                raise exception.TrustNotFound(trust_id=trust_id)
+            if ref.expires_at is not None and not deleted:
+                now = timeutils.utcnow()
+                if now > ref.expires_at:
+                    raise exception.TrustNotFound(trust_id=trust_id)
+            # Do not return trusts that can't be used anymore
+            if ref.remaining_uses is not None and not deleted:
+                if ref.remaining_uses <= 0:
+                    raise exception.TrustNotFound(trust_id=trust_id)
+            trust_dict = ref.to_dict()
 
-        self._add_roles(trust_id, session, trust_dict)
-        return trust_dict
+            self._add_roles(trust_id, session, trust_dict)
+            return trust_dict
 
     @sql.handle_conflicts(conflict_type='trust')
     def list_trusts(self):
-        session = sql.get_session()
-        trusts = session.query(TrustModel).filter_by(deleted_at=None)
-        return [trust_ref.to_dict() for trust_ref in trusts]
+        with sql.session_for_read() as session:
+            trusts = session.query(TrustModel).filter_by(deleted_at=None)
+            return [trust_ref.to_dict() for trust_ref in trusts]
 
     @sql.handle_conflicts(conflict_type='trust')
     def list_trusts_for_trustee(self, trustee_user_id):
-        session = sql.get_session()
-        trusts = (session.query(TrustModel).
-                  filter_by(deleted_at=None).
-                  filter_by(trustee_user_id=trustee_user_id))
-        return [trust_ref.to_dict() for trust_ref in trusts]
+        with sql.session_for_read() as session:
+            trusts = (session.query(TrustModel).
+                      filter_by(deleted_at=None).
+                      filter_by(trustee_user_id=trustee_user_id))
+            return [trust_ref.to_dict() for trust_ref in trusts]
 
     @sql.handle_conflicts(conflict_type='trust')
     def list_trusts_for_trustor(self, trustor_user_id):
-        session = sql.get_session()
-        trusts = (session.query(TrustModel).
-                  filter_by(deleted_at=None).
-                  filter_by(trustor_user_id=trustor_user_id))
-        return [trust_ref.to_dict() for trust_ref in trusts]
+        with sql.session_for_read() as session:
+            trusts = (session.query(TrustModel).
+                      filter_by(deleted_at=None).
+                      filter_by(trustor_user_id=trustor_user_id))
+            return [trust_ref.to_dict() for trust_ref in trusts]
 
     @sql.handle_conflicts(conflict_type='trust')
     def delete_trust(self, trust_id):
-        with sql.transaction() as session:
+        with sql.session_for_write() as session:
             trust_ref = session.query(TrustModel).get(trust_id)
             if not trust_ref:
                 raise exception.TrustNotFound(trust_id=trust_id)

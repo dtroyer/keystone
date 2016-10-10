@@ -1,0 +1,103 @@
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
+# not use this file except in compliance with the License. You may obtain
+# a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations
+# under the License.
+
+"""Main entry point into the Federation service."""
+
+from keystone.common import cache
+from keystone.common import dependency
+from keystone.common import extension
+from keystone.common import manager
+import keystone.conf
+from keystone.federation import utils
+
+
+# This is a general cache region for service providers.
+MEMOIZE = cache.get_memoization_decorator(group='federation')
+
+CONF = keystone.conf.CONF
+EXTENSION_DATA = {
+    'name': 'OpenStack Federation APIs',
+    'namespace': 'http://docs.openstack.org/identity/api/ext/'
+                 'OS-FEDERATION/v1.0',
+    'alias': 'OS-FEDERATION',
+    'updated': '2013-12-17T12:00:0-00:00',
+    'description': 'OpenStack Identity Providers Mechanism.',
+    'links': [{
+        'rel': 'describedby',
+        'type': 'text/html',
+        'href': 'http://developer.openstack.org/api-ref-identity-v3-ext.html',
+    }]}
+extension.register_admin_extension(EXTENSION_DATA['alias'], EXTENSION_DATA)
+extension.register_public_extension(EXTENSION_DATA['alias'], EXTENSION_DATA)
+
+
+@dependency.provider('federation_api')
+class Manager(manager.Manager):
+    """Default pivot point for the Federation backend.
+
+    See :mod:`keystone.common.manager.Manager` for more details on how this
+    dynamically calls the backend.
+
+    """
+
+    driver_namespace = 'keystone.federation'
+
+    def __init__(self):
+        super(Manager, self).__init__(CONF.federation.driver)
+
+    @MEMOIZE
+    def get_enabled_service_providers(self):
+        """List enabled service providers for Service Catalog.
+
+        Service Provider in a catalog contains three attributes: ``id``,
+        ``auth_url``, ``sp_url``, where:
+
+        - id is a unique, user defined identifier for service provider object
+        - auth_url is an authentication URL of remote Keystone
+        - sp_url a URL accessible at the remote service provider where SAML
+          assertion is transmitted.
+
+        :returns: list of dictionaries with enabled service providers
+        :rtype: list of dicts
+
+        """
+        def normalize(sp):
+            ref = {
+                'auth_url': sp.auth_url,
+                'id': sp.id,
+                'sp_url': sp.sp_url
+            }
+            return ref
+
+        service_providers = self.driver.get_enabled_service_providers()
+        return [normalize(sp) for sp in service_providers]
+
+    def create_sp(self, sp_id, service_provider):
+        sp_ref = self.driver.create_sp(sp_id, service_provider)
+        self.get_enabled_service_providers.invalidate(self)
+        return sp_ref
+
+    def delete_sp(self, sp_id):
+        self.driver.delete_sp(sp_id)
+        self.get_enabled_service_providers.invalidate(self)
+
+    def update_sp(self, sp_id, service_provider):
+        sp_ref = self.driver.update_sp(sp_id, service_provider)
+        self.get_enabled_service_providers.invalidate(self)
+        return sp_ref
+
+    def evaluate(self, idp_id, protocol_id, assertion_data):
+        mapping = self.get_mapping_from_idp_and_protocol(idp_id, protocol_id)
+        rules = mapping['rules']
+        rule_processor = utils.RuleProcessor(mapping['id'], rules)
+        mapped_properties = rule_processor.process(assertion_data)
+        return mapped_properties, mapping['id']

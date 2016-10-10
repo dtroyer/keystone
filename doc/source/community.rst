@@ -29,7 +29,6 @@ Our community welcomes all people interested in open source cloud computing,
 and there are no formal membership requirements. The best way to join the
 community is to talk with others online or at a meetup and offer contributions
 through Launchpad_, the wiki_, or blogs. We welcome all types of contributions,
-
 from blueprint designs to documentation to testing to deployment scripts.
 
 .. _Launchpad: https://launchpad.net/keystone
@@ -65,16 +64,16 @@ Keystone on Launchpad
 
 Launchpad is a code hosting that OpenStack is using to track bugs, feature
 work, and releases of OpenStack. Like other OpenStack projects, Keystone source
-code is hosted on GitHub
+code is hosted on git.openstack.org
 
 * `Keystone Project Page on Launchpad <http://launchpad.net/keystone>`_
-* `Keystone Source Repository on GitHub <http://github.com/openstack/keystone>`_
+* `Keystone Source Repository <https://git.openstack.org/cgit/openstack/keystone>`_
 
 Within launchpad, we use
 `blueprints <https://blueprints.launchpad.net/keystone>`_, to track feature
 work, and track `bugs <https://bugs.launchpad.net/keystone>`_ as well. If
 you are looking for a place to get started contributing to keystone, please
-look at any bugs for keystone that are tagged as `low-hanging-fruit
+look at any bugs for Keystone that are tagged as `low-hanging-fruit
 <https://bugs.launchpad.net/keystone/+bugs?field.tag=low-hanging-fruit>`_.
 
 OpenStack Blog
@@ -96,6 +95,5 @@ Twitter
 -------
 
 Because all the cool kids do it: `@openstack <http://twitter.com/openstack>`_.
-Also follow the `#openstack <http://search.twitter.com/search?q=%23openstack>`_
+Also follow the `#openstack <https://twitter.com/search?q=%23openstack>`_
 tag for relevant tweets.
-

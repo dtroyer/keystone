@@ -12,24 +12,31 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-"""Keystone PKI Token Provider"""
+"""Keystone PKI Token Provider."""
+
+import subprocess  # nosec : used to catch subprocess exceptions
 
 from keystoneclient.common import cms
+from oslo_log import log
+from oslo_log import versionutils
+from oslo_serialization import jsonutils
 
-from keystone.common import environment
-from keystone import config
+from keystone.common import utils
+import keystone.conf
 from keystone import exception
-from keystone.i18n import _
-from keystone.openstack.common import jsonutils
-from keystone.openstack.common import log
+from keystone.i18n import _, _LE
 from keystone.token.providers import common
 
 
-CONF = config.CONF
+CONF = keystone.conf.CONF
 
 LOG = log.getLogger(__name__)
 
 
+@versionutils.deprecated(
+    as_of=versionutils.deprecated.MITAKA,
+    what='the PKI token provider',
+    in_favor_of='the Fernet or UUID token providers')
 class Provider(common.BaseProvider):
     def _get_token_id(self, token_data):
         try:
@@ -37,11 +44,24 @@ class Provider(common.BaseProvider):
             # produces unicode.  This can be removed if the client returns
             # str()
             # TODO(ayoung): Make to a byte_str for Python3
-            token_id = str(cms.cms_sign_token(jsonutils.dumps(token_data),
+            token_json = jsonutils.dumps(token_data, cls=utils.PKIEncoder)
+            token_id = str(cms.cms_sign_token(token_json,
                                               CONF.signing.certfile,
                                               CONF.signing.keyfile))
             return token_id
-        except environment.subprocess.CalledProcessError:
-            LOG.exception(_('Unable to sign token'))
+        except subprocess.CalledProcessError:
+            LOG.exception(_LE('Unable to sign token'))
             raise exception.UnexpectedError(_(
                 'Unable to sign token.'))
+
+    @property
+    def _supports_bind_authentication(self):
+        """Return if the token provider supports bind authentication methods.
+
+        :returns: True
+        """
+        return True
+
+    def needs_persistence(self):
+        """Should the token be written to a backend."""
+        return True

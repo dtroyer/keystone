@@ -20,15 +20,18 @@ import six
 
 from keystone.common import dependency
 from keystone.common import manager
-from keystone import config
+import keystone.conf
 from keystone import exception
 
-CONF = config.CONF
+
+CONF = keystone.conf.CONF
 
 
 @dependency.provider('id_generator_api')
 class Manager(manager.Manager):
     """Default pivot point for the identifier generator backend."""
+
+    driver_namespace = 'keystone.identity.id_generator'
 
     def __init__(self):
         super(Manager, self).__init__(CONF.identity_mapping.generator)
@@ -44,8 +47,8 @@ class IDGenerator(object):
 
         :param dict mapping: The items to be hashed.
 
-        The ID must be reproduceable and no more than 64 chars in length.
-        The ID generated should be independant of the order of the items
+        The ID must be reproducible and no more than 64 chars in length.
+        The ID generated should be independent of the order of the items
         in the mapping dict.
 
         """

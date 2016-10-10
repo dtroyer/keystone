@@ -11,16 +11,47 @@
 # under the License.
 """Internal implementation of request body validating middleware."""
 
+import re
+
 import jsonschema
+from oslo_config import cfg
+from oslo_log import log
+import six
 
 from keystone import exception
-from keystone.i18n import _
+from keystone.i18n import _, _LE
+
+
+CONF = cfg.CONF
+LOG = log.getLogger(__name__)
+
+
+# TODO(rderose): extend schema validation and add this check there
+def validate_password(password):
+    pattern = CONF.security_compliance.password_regex
+    if pattern:
+        if not isinstance(password, six.string_types):
+            detail = _("Password must be a string type")
+            raise exception.PasswordValidationError(detail=detail)
+        try:
+            if not re.match(pattern, password):
+                pattern_desc = (
+                    CONF.security_compliance.password_regex_description)
+                detail = _("The password does not meet the requirements: "
+                           "%(message)s") % {'message': pattern_desc}
+                raise exception.PasswordValidationError(detail=detail)
+        except re.error:
+            msg = _LE("Unable to validate password due to invalid regular "
+                      "expression - password_regex: ")
+            LOG.error(msg, pattern)
+            detail = _("Unable to validate password due to invalid "
+                       "configuration")
+            raise exception.PasswordValidationError(detail=detail)
 
 
 class SchemaValidator(object):
     """Resource reference validator class."""
 
-    validator = None
     validator_org = jsonschema.Draft4Validator
 
     def __init__(self, schema):
@@ -43,7 +74,7 @@ class SchemaValidator(object):
         except jsonschema.ValidationError as ex:
             # NOTE: For whole OpenStack message consistency, this error
             # message has been written in a format consistent with WSME.
-            if len(ex.path) > 0:
+            if ex.path:
                 # NOTE(lbragstad): Here we could think about using iter_errors
                 # as a method of providing invalid parameters back to the
                 # user.
@@ -51,9 +82,9 @@ class SchemaValidator(object):
                 # too long, then we should build the masking in here so that
                 # we don't expose sensitive user information in the event it
                 # fails validation.
-                detail = _("Invalid input for field '%(path)s'. The value is "
-                           "'%(value)s'.") % {'path': ex.path.pop(),
-                                              'value': ex.instance}
+                detail = _("Invalid input for field '%(path)s': "
+                           "%(message)s") % {'path': ex.path.pop(),
+                                             'message': ex.message}
             else:
                 detail = ex.message
             raise exception.SchemaValidationError(detail=detail)

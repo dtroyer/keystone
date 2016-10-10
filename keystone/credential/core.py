@@ -12,26 +12,22 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-"""Main entry point into the Credentials service."""
+"""Main entry point into the Credential service."""
 
-import abc
-
-import six
+import json
 
 from keystone.common import dependency
 from keystone.common import driver_hints
 from keystone.common import manager
-from keystone import config
+import keystone.conf
 from keystone import exception
-from keystone.openstack.common import log
 
 
-CONF = config.CONF
-
-LOG = log.getLogger(__name__)
+CONF = keystone.conf.CONF
 
 
 @dependency.provider('credential_api')
+@dependency.requires('credential_provider_api')
 class Manager(manager.Manager):
     """Default pivot point for the Credential backend.
 
@@ -40,101 +36,106 @@ class Manager(manager.Manager):
 
     """
 
+    driver_namespace = 'keystone.credential'
+
     def __init__(self):
         super(Manager, self).__init__(CONF.credential.driver)
 
+    def _decrypt_credential(self, credential):
+        """Return a decrypted credential reference."""
+        if credential['type'] == 'ec2':
+            decrypted_blob = json.loads(
+                self.credential_provider_api.decrypt(
+                    credential['encrypted_blob'],
+                )
+            )
+        else:
+            decrypted_blob = self.credential_provider_api.decrypt(
+                credential['encrypted_blob']
+            )
+        credential['blob'] = decrypted_blob
+        credential.pop('key_hash', None)
+        credential.pop('encrypted_blob', None)
+        return credential
+
+    def _encrypt_credential(self, credential):
+        """Return an encrypted credential reference."""
+        credential_copy = credential.copy()
+        if credential.get('type', None) == 'ec2':
+            # NOTE(lbragstad): When dealing with ec2 credentials, it's possible
+            # for the `blob` to be a dictionary. Let's make sure we are
+            # encrypting a string otherwise encryption will fail.
+            encrypted_blob, key_hash = self.credential_provider_api.encrypt(
+                json.dumps(credential['blob'])
+            )
+        else:
+            encrypted_blob, key_hash = self.credential_provider_api.encrypt(
+                credential['blob']
+            )
+        credential_copy['encrypted_blob'] = encrypted_blob
+        credential_copy['key_hash'] = key_hash
+        credential_copy.pop('blob', None)
+        return credential_copy
+
     @manager.response_truncated
     def list_credentials(self, hints=None):
-        return self.driver.list_credentials(hints or driver_hints.Hints())
+        credentials = self.driver.list_credentials(
+            hints or driver_hints.Hints()
+        )
+        for credential in credentials:
+            credential = self._decrypt_credential(credential)
+        return credentials
 
+    def list_credentials_for_user(self, user_id, type=None):
+        """List credentials for a specific user."""
+        credentials = self.driver.list_credentials_for_user(user_id, type=type)
+        for credential in credentials:
+            credential = self._decrypt_credential(credential)
+        return credentials
 
-@six.add_metaclass(abc.ABCMeta)
-class Driver(object):
-    # credential crud
-
-    @abc.abstractmethod
-    def create_credential(self, credential_id, credential):
-        """Creates a new credential.
-
-        :raises: keystone.exception.Conflict
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
-    def list_credentials(self, hints):
-        """List all credentials.
-
-        :param hints: contains the list of filters yet to be satisfied.
-                      Any filters satisfied here will be removed so that
-                      the caller will know if any filters remain.
-
-        :returns: a list of credential_refs or an empty list.
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
-    def list_credentials_for_user(self, user_id):
-        """List credentials for a user.
-
-        :param user_id: ID of a user to filter credentials by.
-
-        :returns: a list of credential_refs or an empty list.
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
     def get_credential(self, credential_id):
-        """Get a credential by ID.
+        """Return a credential reference."""
+        credential = self.driver.get_credential(credential_id)
+        return self._decrypt_credential(credential)
 
-        :returns: credential_ref
-        :raises: keystone.exception.CredentialNotFound
+    def create_credential(self, credential_id, credential):
+        """Create a credential."""
+        credential_copy = self._encrypt_credential(credential)
+        ref = self.driver.create_credential(credential_id, credential_copy)
+        ref.pop('key_hash', None)
+        ref.pop('encrypted_blob', None)
+        ref['blob'] = credential['blob']
+        return ref
 
-        """
-        raise exception.NotImplemented()  # pragma: no cover
+    def _validate_credential_update(self, credential_id, credential):
+        # ec2 credentials require a "project_id" to be functional. Before we
+        # update, check the case where a non-ec2 credential changes its type
+        # to be "ec2", but has no associated "project_id", either in the
+        # request or already set in the database
+        if (credential.get('type', '').lower() == 'ec2' and
+                not credential.get('project_id')):
+            existing_cred = self.get_credential(credential_id)
+            if not existing_cred['project_id']:
+                raise exception.ValidationError(attribute='project_id',
+                                                target='credential')
 
-    @abc.abstractmethod
     def update_credential(self, credential_id, credential):
-        """Updates an existing credential.
-
-        :raises: keystone.exception.CredentialNotFound,
-                 keystone.exception.Conflict
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
-    def delete_credential(self, credential_id):
-        """Deletes an existing credential.
-
-        :raises: keystone.exception.CredentialNotFound
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
-    def delete_credentials_for_project(self, project_id):
-        """Deletes all credentials for a project."""
-        self._delete_credentials(lambda cr: cr['project_id'] == project_id)
-
-    @abc.abstractmethod
-    def delete_credentials_for_user(self, user_id):
-        """Deletes all credentials for a user."""
-        self._delete_credentials(lambda cr: cr['user_id'] == user_id)
-
-    def _delete_credentials(self, match_fn):
-        """Do the actual credential deletion work (default implementation).
-
-        :param match_fn: function that takes a credential dict as the
-                         parameter and returns true or false if the
-                         identifier matches the credential dict.
-        """
-        for cr in self.list_credentials():
-            if match_fn(cr):
-                try:
-                    self.credential_api.delete_credential(cr['id'])
-                except exception.CredentialNotFound:
-                    LOG.debug('Deletion of credential is not required: %s',
-                              cr['id'])
+        """Update an existing credential."""
+        self._validate_credential_update(credential_id, credential)
+        if 'blob' in credential:
+            credential_copy = self._encrypt_credential(credential)
+        else:
+            credential_copy = credential.copy()
+            existing_credential = self.get_credential(credential_id)
+            existing_blob = existing_credential['blob']
+        ref = self.driver.update_credential(credential_id, credential_copy)
+        ref.pop('key_hash', None)
+        ref.pop('encrypted_blob', None)
+        # If the update request contains a `blob` attribute - we should return
+        # that in the update response. If not, then we should return the
+        # existing `blob` attribute since it wasn't updated.
+        if credential.get('blob'):
+            ref['blob'] = credential['blob']
+        else:
+            ref['blob'] = existing_blob
+        return ref

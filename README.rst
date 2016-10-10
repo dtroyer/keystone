@@ -10,19 +10,15 @@ such as LDAP.
 Developer documentation, the source of which is in ``doc/source/``, is
 published at:
 
-    http://keystone.openstack.org/
+    http://docs.openstack.org/developer/keystone/
 
-The API specification is available at:
+The API specification and documentation are available at:
 
-    https://github.com/openstack/identity-api
-
-The API documentation is available at:
-
-    http://api.openstack.org/api-ref-identity.html
+    http://specs.openstack.org/openstack/keystone-specs/
 
 The canonical client library is available at:
 
-    https://github.com/openstack/python-keystoneclient
+    https://git.openstack.org/cgit/openstack/python-keystoneclient
 
 Documentation for cloud administrators is available at:
 
@@ -30,7 +26,7 @@ Documentation for cloud administrators is available at:
 
 The source of documentation for cloud administrators is available at:
 
-    https://github.com/openstack/openstack-manuals
+    https://git.openstack.org/cgit/openstack/openstack-manuals
 
 Information about our team meeting is available at:
 
@@ -42,7 +38,7 @@ Bugs and feature requests are tracked on Launchpad at:
 
 Future design work is tracked at:
 
-    https://github.com/openstack/keystone-specs
+    http://specs.openstack.org/openstack/keystone-specs/#identity-program-specifications
 
 Contributors are encouraged to join IRC (``#openstack-keystone`` on freenode):
 

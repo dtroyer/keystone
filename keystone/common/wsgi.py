@@ -19,33 +19,43 @@
 """Utility methods for working with WSGI servers."""
 
 import copy
+import functools
+import itertools
+import re
+import wsgiref.util
 
-from oslo import i18n
+import oslo_i18n
+from oslo_log import log
+from oslo_serialization import jsonutils
+from oslo_utils import importutils
+from oslo_utils import strutils
 import routes.middleware
 import six
+from six.moves import http_client
 import webob.dec
 import webob.exc
 
-from keystone.common import config
 from keystone.common import dependency
+from keystone.common import json_home
+from keystone.common import request as request_mod
 from keystone.common import utils
+import keystone.conf
 from keystone import exception
-from keystone.i18n import _
+from keystone.i18n import _, _LI, _LW
 from keystone.models import token_model
-from keystone.openstack.common import importutils
-from keystone.openstack.common import jsonutils
-from keystone.openstack.common import log
 
 
-CONF = config.CONF
+CONF = keystone.conf.CONF
 LOG = log.getLogger(__name__)
 
 # Environment variable used to pass the request context
 CONTEXT_ENV = 'openstack.context'
 
-
 # Environment variable used to pass the request params
 PARAMS_ENV = 'openstack.params'
+
+JSON_ENCODE_CONTENT_TYPES = set(['application/json',
+                                 'application/json-home'])
 
 
 def validate_token_bind(context, token_ref):
@@ -63,54 +73,60 @@ def validate_token_bind(context, token_ref):
     # permissive and strict modes don't require there to be a bind
     permissive = bind_mode in ('permissive', 'strict')
 
-    # get the named mode if bind_mode is not one of the known
-    name = None if permissive or bind_mode == 'required' else bind_mode
-
     if not bind:
         if permissive:
             # no bind provided and none required
             return
         else:
-            LOG.info(_("No bind information present in token"))
+            LOG.info(_LI("No bind information present in token"))
             raise exception.Unauthorized()
+
+    # get the named mode if bind_mode is not one of the known
+    name = None if permissive or bind_mode == 'required' else bind_mode
 
     if name and name not in bind:
-        LOG.info(_("Named bind mode %s not in bind information"), name)
+        LOG.info(_LI("Named bind mode %s not in bind information"), name)
         raise exception.Unauthorized()
 
-    for bind_type, identifier in six.iteritems(bind):
+    for bind_type, identifier in bind.items():
         if bind_type == 'kerberos':
-            if not (context['environment'].get('AUTH_TYPE', '').lower()
-                    == 'negotiate'):
-                LOG.info(_("Kerberos credentials required and not present"))
-                raise exception.Unauthorized()
+            if (context['environment'].get('AUTH_TYPE', '').lower() !=
+                    'negotiate'):
+                msg = _('Kerberos credentials required and not present')
+                LOG.info(msg)
+                raise exception.Unauthorized(msg)
 
-            if not context['environment'].get('REMOTE_USER') == identifier:
-                LOG.info(_("Kerberos credentials do not match those in bind"))
-                raise exception.Unauthorized()
+            if context['environment'].get('REMOTE_USER') != identifier:
+                msg = _('Kerberos credentials do not match those in bind')
+                LOG.info(msg)
+                raise exception.Unauthorized(msg)
 
-            LOG.info(_("Kerberos bind authentication successful"))
+            LOG.info(_LI('Kerberos bind authentication successful'))
 
         elif bind_mode == 'permissive':
-            LOG.debug(("Ignoring unknown bind for permissive mode: "
-                       "{%(bind_type)s: %(identifier)s}"),
-                      {'bind_type': bind_type, 'identifier': identifier})
+            LOG.debug(("Ignoring unknown bind (due to permissive mode): "
+                       "{%(bind_type)s: %(identifier)s}"), {
+                           'bind_type': bind_type,
+                           'identifier': identifier})
         else:
-            LOG.info(_("Couldn't verify unknown bind: "
-                       "{%(bind_type)s: %(identifier)s}"),
-                     {'bind_type': bind_type, 'identifier': identifier})
-            raise exception.Unauthorized()
+            msg = _('Could not verify unknown bind: {%(bind_type)s: '
+                    '%(identifier)s}') % {
+                        'bind_type': bind_type,
+                        'identifier': identifier}
+            LOG.info(msg)
+            raise exception.Unauthorized(msg)
 
 
 def best_match_language(req):
-    """Determines the best available locale from the Accept-Language
-    HTTP header passed in the request.
-    """
+    """Determine the best available locale.
 
+    This returns best available locale based on the Accept-Language HTTP
+    header passed in the request.
+    """
     if not req.accept_language:
         return None
     return req.accept_language.best_match(
-        i18n.get_available_languages('keystone'))
+        oslo_i18n.get_available_languages('keystone'))
 
 
 class BaseApplication(object):
@@ -142,7 +158,9 @@ class BaseApplication(object):
         return cls(**local_config)
 
     def __call__(self, environ, start_response):
-        r"""Subclasses will probably want to implement __call__ like this:
+        r"""Provide subclasses on how to implement __call__.
+
+        Probably like this:
 
         @webob.dec.wsgify()
         def __call__(self, req):
@@ -180,30 +198,15 @@ class BaseApplication(object):
 
 @dependency.requires('assignment_api', 'policy_api', 'token_provider_api')
 class Application(BaseApplication):
-    @webob.dec.wsgify()
+
+    @webob.dec.wsgify(RequestClass=request_mod.Request)
     def __call__(self, req):
         arg_dict = req.environ['wsgiorg.routing_args'][1]
         action = arg_dict.pop('action')
         del arg_dict['controller']
-        LOG.debug('arg_dict: %s', arg_dict)
 
-        # allow middleware up the stack to provide context, params and headers.
-        context = req.environ.get(CONTEXT_ENV, {})
-        context['query_string'] = dict(six.iteritems(req.params))
-        context['headers'] = dict(six.iteritems(req.headers))
-        context['path'] = req.environ['PATH_INFO']
-        context['host_url'] = req.host_url
         params = req.environ.get(PARAMS_ENV, {})
-        # authentication and authorization attributes are set as environment
-        # values by the container and processed by the pipeline.  the complete
-        # set is not yet know.
-        context['environment'] = req.environ
-        context['accept_header'] = req.accept
-        req.environ = None
-
         params.update(arg_dict)
-
-        context.setdefault('is_admin', False)
 
         # TODO(termie): do some basic normalization on methods
         method = getattr(self, action)
@@ -211,36 +214,43 @@ class Application(BaseApplication):
         # NOTE(morganfainberg): use the request method to normalize the
         # response code between GET and HEAD requests. The HTTP status should
         # be the same.
-        req_method = req.environ['REQUEST_METHOD'].upper()
+        LOG.info('%(req_method)s %(uri)s', {
+            'req_method': req.method.upper(),
+            'uri': wsgiref.util.request_uri(req.environ),
+        })
 
-        # NOTE(vish): make sure we have no unicode keys for py2.6.
         params = self._normalize_dict(params)
 
         try:
-            result = method(context, **params)
+            result = method(req, **params)
         except exception.Unauthorized as e:
             LOG.warning(
-                _('Authorization failed. %(exception)s from %(remote_addr)s'),
+                _LW("Authorization failed. %(exception)s from "
+                    "%(remote_addr)s"),
                 {'exception': e, 'remote_addr': req.environ['REMOTE_ADDR']})
-            return render_exception(e, context=context,
+            return render_exception(e,
+                                    context=req.context_dict,
                                     user_locale=best_match_language(req))
         except exception.Error as e:
-            LOG.warning(e)
-            return render_exception(e, context=context,
+            LOG.warning(six.text_type(e))
+            return render_exception(e,
+                                    context=req.context_dict,
                                     user_locale=best_match_language(req))
         except TypeError as e:
-            LOG.exception(e)
+            LOG.exception(six.text_type(e))
             return render_exception(exception.ValidationError(e),
-                                    context=context,
+                                    context=req.context_dict,
                                     user_locale=best_match_language(req))
         except Exception as e:
-            LOG.exception(e)
+            LOG.exception(six.text_type(e))
             return render_exception(exception.UnexpectedError(exception=e),
-                                    context=context,
+                                    context=req.context_dict,
                                     user_locale=best_match_language(req))
 
         if result is None:
-            return render_response(status=(204, 'No Content'))
+            return render_response(
+                status=(http_client.NO_CONTENT,
+                        http_client.responses[http_client.NO_CONTENT]))
         elif isinstance(result, six.string_types):
             return result
         elif isinstance(result, webob.Response):
@@ -249,35 +259,40 @@ class Application(BaseApplication):
             return result
 
         response_code = self._get_response_code(req)
-        return render_response(body=result, status=response_code,
-                               method=req_method)
+        return render_response(body=result,
+                               status=response_code,
+                               method=req.method)
 
     def _get_response_code(self, req):
         req_method = req.environ['REQUEST_METHOD']
         controller = importutils.import_class('keystone.common.controller')
         code = None
         if isinstance(self, controller.V3Controller) and req_method == 'POST':
-            code = (201, 'Created')
+            code = (http_client.CREATED,
+                    http_client.responses[http_client.CREATED])
         return code
 
     def _normalize_arg(self, arg):
-        return str(arg).replace(':', '_').replace('-', '_')
+        return arg.replace(':', '_').replace('-', '_')
 
     def _normalize_dict(self, d):
-        return dict([(self._normalize_arg(k), v)
-                     for (k, v) in six.iteritems(d)])
+        return {self._normalize_arg(k): v for (k, v) in d.items()}
 
-    def assert_admin(self, context):
-        if not context['is_admin']:
-            try:
-                user_token_ref = token_model.KeystoneToken(
-                    token_id=context['token_id'],
-                    token_data=self.token_provider_api.validate_token(
-                        context['token_id']))
-            except exception.TokenNotFound as e:
-                raise exception.Unauthorized(e)
+    def assert_admin(self, request):
+        """Ensure the user is an admin.
 
-            validate_token_bind(context, user_token_ref)
+        :raises keystone.exception.Unauthorized: if a token could not be
+            found/authorized, a user is invalid, or a tenant is
+            invalid/not scoped.
+        :raises keystone.exception.Forbidden: if the user is not an admin and
+            does not have the admin role
+
+        """
+        request.assert_authenticated()
+
+        if not request.context.is_admin:
+            user_token_ref = utils.get_token_ref(request.context_dict)
+
             creds = copy.deepcopy(user_token_ref.metadata)
 
             try:
@@ -297,13 +312,11 @@ class Application(BaseApplication):
             self.policy_api.enforce(creds, 'admin_required', {})
 
     def _attribute_is_empty(self, ref, attribute):
-        """Returns true if the attribute in the given ref (which is a
-        dict) is empty or None.
-        """
+        """Determine if the attribute in ref is empty or None."""
         return ref.get(attribute) is None or ref.get(attribute) == ''
 
     def _require_attribute(self, ref, attribute):
-        """Ensures the reference contains the specified attribute.
+        """Ensure the reference contains the specified attribute.
 
         Raise a ValidationError if the given attribute is not present
         """
@@ -312,7 +325,7 @@ class Application(BaseApplication):
             raise exception.ValidationError(message=msg)
 
     def _require_attributes(self, ref, attrs):
-        """Ensures the reference contains the specified attributes.
+        """Ensure the reference contains the specified attributes.
 
         Raise a ValidationError if any of the given attributes is not present
         """
@@ -323,44 +336,54 @@ class Application(BaseApplication):
             msg = _('%s field(s) cannot be empty') % ', '.join(missing_attrs)
             raise exception.ValidationError(message=msg)
 
-    def _get_trust_id_for_request(self, context):
-        """Get the trust_id for a call.
-
-        Retrieve the trust_id from the token
-        Returns None if token is not trust scoped
-        """
-        if ('token_id' not in context or
-                context.get('token_id') == CONF.admin_token):
-            LOG.debug(('will not lookup trust as the request auth token is '
-                       'either absent or it is the system admin token'))
-            return None
-
-        try:
-            token_data = self.token_provider_api.validate_token(
-                context['token_id'])
-        except exception.TokenNotFound:
-            LOG.warning(_('Invalid token in _get_trust_id_for_request'))
-            raise exception.Unauthorized()
-
-        token_ref = token_model.KeystoneToken(token_id=context['token_id'],
-                                              token_data=token_data)
-        return token_ref.trust_id
-
     @classmethod
     def base_url(cls, context, endpoint_type):
         url = CONF['%s_endpoint' % endpoint_type]
 
         if url:
-            url = url % CONF
+            substitutions = dict(
+                itertools.chain(CONF.items(), CONF.eventlet_server.items()))
+
+            url = url % substitutions
+        elif 'environment' in context:
+            url = wsgiref.util.application_uri(context['environment'])
+            # remove version from the URL as it may be part of SCRIPT_NAME but
+            # it should not be part of base URL
+            url = re.sub(r'/v(3|(2\.0))/*$', '', url)
+
+            # now remove the standard port
+            url = utils.remove_standard_port(url)
         else:
-            # NOTE(jamielennox): if url is not set via the config file we
-            # should set it relative to the url that the user used to get here
-            # so as not to mess with version discovery. This is not perfect.
-            # host_url omits the path prefix, but there isn't another good
-            # solution that will work for all urls.
-            url = context['host_url']
+            # if we don't have enough information to come up with a base URL,
+            # then fall back to localhost. This should never happen in
+            # production environment.
+            url = 'http://localhost:%d' % CONF.eventlet_server.public_port
 
         return url.rstrip('/')
+
+
+def middleware_exceptions(method):
+
+    @functools.wraps(method)
+    def _inner(self, request):
+        try:
+            return method(self, request)
+        except exception.Error as e:
+            LOG.warning(six.text_type(e))
+            return render_exception(e, request=request,
+                                    user_locale=best_match_language(request))
+        except TypeError as e:
+            LOG.exception(six.text_type(e))
+            return render_exception(exception.ValidationError(e),
+                                    request=request,
+                                    user_locale=best_match_language(request))
+        except Exception as e:
+            LOG.exception(six.text_type(e))
+            return render_exception(exception.UnexpectedError(exception=e),
+                                    request=request,
+                                    user_locale=best_match_language(request))
+
+    return _inner
 
 
 class Middleware(Application):
@@ -374,32 +397,10 @@ class Middleware(Application):
     """
 
     @classmethod
-    def factory(cls, global_config, **local_config):
-        """Used for paste app factories in paste.deploy config files.
-
-        Any local configuration (that is, values under the [filter:APPNAME]
-        section of the paste config) will be passed into the `__init__` method
-        as kwargs.
-
-        A hypothetical configuration would look like:
-
-            [filter:analytics]
-            redis_host = 127.0.0.1
-            paste.filter_factory = keystone.analytics:Analytics.factory
-
-        which would result in a call to the `Analytics` class as
-
-            import keystone.analytics
-            keystone.analytics.Analytics(app, redis_host='127.0.0.1')
-
-        You could of course re-implement the `factory` method in subclasses,
-        but using the kwarg passing it shouldn't be necessary.
-
-        """
+    def factory(cls, global_config):
+        """Used for paste app factories in paste.deploy config files."""
         def _factory(app):
-            conf = global_config.copy()
-            conf.update(local_config)
-            return cls(app, **local_config)
+            return cls(app)
         return _factory
 
     def __init__(self, application):
@@ -420,28 +421,14 @@ class Middleware(Application):
         """Do whatever you'd like to the response, based on the request."""
         return response
 
-    @webob.dec.wsgify()
+    @webob.dec.wsgify(RequestClass=request_mod.Request)
+    @middleware_exceptions
     def __call__(self, request):
-        try:
-            response = self.process_request(request)
-            if response:
-                return response
-            response = request.get_response(self.application)
-            return self.process_response(request, response)
-        except exception.Error as e:
-            LOG.warning(e)
-            return render_exception(e, request=request,
-                                    user_locale=best_match_language(request))
-        except TypeError as e:
-            LOG.exception(e)
-            return render_exception(exception.ValidationError(e),
-                                    request=request,
-                                    user_locale=best_match_language(request))
-        except Exception as e:
-            LOG.exception(e)
-            return render_exception(exception.UnexpectedError(exception=e),
-                                    request=request,
-                                    user_locale=best_match_language(request))
+        response = self.process_request(request)
+        if response:
+            return response
+        response = request.get_response(self.application)
+        return self.process_response(request, response)
 
 
 class Debug(Middleware):
@@ -452,23 +439,23 @@ class Debug(Middleware):
 
     """
 
-    @webob.dec.wsgify()
+    @webob.dec.wsgify(RequestClass=request_mod.Request)
     def __call__(self, req):
         if not hasattr(LOG, 'isEnabledFor') or LOG.isEnabledFor(LOG.debug):
             LOG.debug('%s %s %s', ('*' * 20), 'REQUEST ENVIRON', ('*' * 20))
             for key, value in req.environ.items():
                 LOG.debug('%s = %s', key,
-                          log.mask_password(value))
+                          strutils.mask_password(value))
             LOG.debug('')
             LOG.debug('%s %s %s', ('*' * 20), 'REQUEST BODY', ('*' * 20))
             for line in req.body_file:
-                LOG.debug('%s', log.mask_password(line))
+                LOG.debug('%s', strutils.mask_password(line))
             LOG.debug('')
 
         resp = req.get_response(self.application)
         if not hasattr(LOG, 'isEnabledFor') or LOG.isEnabledFor(LOG.debug):
             LOG.debug('%s %s %s', ('*' * 20), 'RESPONSE HEADERS', ('*' * 20))
-            for (key, value) in six.iteritems(resp.headers):
+            for (key, value) in resp.headers.items():
                 LOG.debug('%s = %s', key, value)
             LOG.debug('')
 
@@ -516,7 +503,7 @@ class Router(object):
         self._router = routes.middleware.RoutesMiddleware(self._dispatch,
                                                           self.map)
 
-    @webob.dec.wsgify()
+    @webob.dec.wsgify(RequestClass=request_mod.Request)
     def __call__(self, req):
         """Route the incoming request to a controller based on self.map.
 
@@ -526,7 +513,7 @@ class Router(object):
         return self._router
 
     @staticmethod
-    @webob.dec.wsgify()
+    @webob.dec.wsgify(RequestClass=request_mod.Request)
     def _dispatch(req):
         """Dispatch the request to the appropriate controller.
 
@@ -575,12 +562,13 @@ class ExtensionRouter(Router):
 
     Expects to be subclassed.
     """
+
     def __init__(self, application, mapper=None):
         if mapper is None:
             mapper = routes.Mapper()
         self.application = application
         self.add_routes(mapper)
-        mapper.connect('{path_info:.*}', controller=self.application)
+        mapper.connect('/{path_info:.*}', controller=self.application)
         super(ExtensionRouter, self).__init__(mapper)
 
     def add_routes(self, mapper):
@@ -630,46 +618,56 @@ class RoutersBase(object):
         Use self._add_resource() to map routes for a resource.
         """
 
-    def _add_resource(self, mapper, controller, path,
+    def _add_resource(self, mapper, controller, path, rel,
                       get_action=None, head_action=None, get_head_action=None,
                       put_action=None, post_action=None, patch_action=None,
-                      delete_action=None, get_post_action=None, rel=None,
-                      path_vars=None):
+                      delete_action=None, get_post_action=None,
+                      path_vars=None, status=json_home.Status.STABLE,
+                      new_path=None):
         if get_head_action:
+            getattr(controller, get_head_action)  # ensure the attribute exists
             mapper.connect(path, controller=controller, action=get_head_action,
                            conditions=dict(method=['GET', 'HEAD']))
         if get_action:
+            getattr(controller, get_action)  # ensure the attribute exists
             mapper.connect(path, controller=controller, action=get_action,
                            conditions=dict(method=['GET']))
         if head_action:
+            getattr(controller, head_action)  # ensure the attribute exists
             mapper.connect(path, controller=controller, action=head_action,
                            conditions=dict(method=['HEAD']))
         if put_action:
+            getattr(controller, put_action)  # ensure the attribute exists
             mapper.connect(path, controller=controller, action=put_action,
                            conditions=dict(method=['PUT']))
         if post_action:
+            getattr(controller, post_action)  # ensure the attribute exists
             mapper.connect(path, controller=controller, action=post_action,
                            conditions=dict(method=['POST']))
         if patch_action:
+            getattr(controller, patch_action)  # ensure the attribute exists
             mapper.connect(path, controller=controller, action=patch_action,
                            conditions=dict(method=['PATCH']))
         if delete_action:
+            getattr(controller, delete_action)  # ensure the attribute exists
             mapper.connect(path, controller=controller, action=delete_action,
                            conditions=dict(method=['DELETE']))
         if get_post_action:
+            getattr(controller, get_post_action)  # ensure the attribute exists
             mapper.connect(path, controller=controller, action=get_post_action,
                            conditions=dict(method=['GET', 'POST']))
 
-        if rel:
-            resource_data = dict()
+        resource_data = dict()
 
-            if path_vars:
-                resource_data['href-template'] = path
-                resource_data['href-vars'] = path_vars
-            else:
-                resource_data['href'] = path
+        if path_vars:
+            resource_data['href-template'] = new_path or path
+            resource_data['href-vars'] = path_vars
+        else:
+            resource_data['href'] = new_path or path
 
-            self.v3_resources.append((rel, resource_data))
+        json_home.Status.update_resource_data(resource_data, status)
+
+        self.v3_resources.append((rel, resource_data))
 
 
 class V3ExtensionRouter(ExtensionRouter, RoutersBase):
@@ -682,7 +680,7 @@ class V3ExtensionRouter(ExtensionRouter, RoutersBase):
     def _update_version_response(self, response_data):
         response_data['resources'].update(self.v3_resources)
 
-    @webob.dec.wsgify()
+    @webob.dec.wsgify(RequestClass=request_mod.Request)
     def __call__(self, request):
         if request.path_info != '/':
             # Not a request for version info so forward to super.
@@ -690,7 +688,7 @@ class V3ExtensionRouter(ExtensionRouter, RoutersBase):
 
         response = request.get_response(self.application)
 
-        if response.status_code != 200:
+        if response.status_code != http_client.OK:
             # The request failed, so don't update the response.
             return response
 
@@ -701,13 +699,13 @@ class V3ExtensionRouter(ExtensionRouter, RoutersBase):
 
         response_data = jsonutils.loads(response.body)
         self._update_version_response(response_data)
-        response.body = jsonutils.dumps(response_data,
-                                        cls=utils.SmarterEncoder)
+        response.body = jsonutils.dump_as_bytes(response_data,
+                                                cls=utils.SmarterEncoder)
         return response
 
 
 def render_response(body=None, status=None, headers=None, method=None):
-    """Forms a WSGI response."""
+    """Form a WSGI response."""
     if headers is None:
         headers = []
     else:
@@ -715,8 +713,9 @@ def render_response(body=None, status=None, headers=None, method=None):
     headers.append(('Vary', 'X-Auth-Token'))
 
     if body is None:
-        body = ''
-        status = status or (204, 'No Content')
+        body = b''
+        status = status or (http_client.NO_CONTENT,
+                            http_client.responses[http_client.NO_CONTENT])
     else:
         content_types = [v for h, v in headers if h == 'Content-Type']
         if content_types:
@@ -724,19 +723,48 @@ def render_response(body=None, status=None, headers=None, method=None):
         else:
             content_type = None
 
-        JSON_ENCODE_CONTENT_TYPES = ('application/json',
-                                     'application/json-home',)
         if content_type is None or content_type in JSON_ENCODE_CONTENT_TYPES:
-            body = jsonutils.dumps(body, cls=utils.SmarterEncoder)
+            body = jsonutils.dump_as_bytes(body, cls=utils.SmarterEncoder)
             if content_type is None:
                 headers.append(('Content-Type', 'application/json'))
-        status = status or (200, 'OK')
+        status = status or (http_client.OK,
+                            http_client.responses[http_client.OK])
+
+    # NOTE(davechen): `mod_wsgi` follows the standards from pep-3333 and
+    # requires the value in response header to be binary type(str) on python2,
+    # unicode based string(str) on python3, or else keystone will not work
+    # under apache with `mod_wsgi`.
+    # keystone needs to check the data type of each header and convert the
+    # type if needed.
+    # see bug:
+    # https://bugs.launchpad.net/keystone/+bug/1528981
+    # see pep-3333:
+    # https://www.python.org/dev/peps/pep-3333/#a-note-on-string-types
+    # see source from mod_wsgi:
+    # https://github.com/GrahamDumpleton/mod_wsgi(methods:
+    # wsgi_convert_headers_to_bytes(...), wsgi_convert_string_to_bytes(...)
+    # and wsgi_validate_header_value(...)).
+    def _convert_to_str(headers):
+        str_headers = []
+        for header in headers:
+            str_header = []
+            for value in header:
+                if not isinstance(value, str):
+                    str_header.append(str(value))
+                else:
+                    str_header.append(value)
+            # convert the list to the immutable tuple to build the headers.
+            # header's key/value will be guaranteed to be str type.
+            str_headers.append(tuple(str_header))
+        return str_headers
+
+    headers = _convert_to_str(headers)
 
     resp = webob.Response(body=body,
-                          status='%s %s' % status,
+                          status='%d %s' % status,
                           headerlist=headers)
 
-    if method == 'HEAD':
+    if method and method.upper() == 'HEAD':
         # NOTE(morganfainberg): HEAD requests should return the same status
         # as a GET request and same headers (including content-type and
         # content-length). The webob.Response object automatically changes
@@ -747,17 +775,16 @@ def render_response(body=None, status=None, headers=None, method=None):
         # both py2x and py3x.
         stored_headers = resp.headers.copy()
         resp.body = b''
-        for header, value in six.iteritems(stored_headers):
+        for header, value in stored_headers.items():
             resp.headers[header] = value
 
     return resp
 
 
 def render_exception(error, context=None, request=None, user_locale=None):
-    """Forms a WSGI response based on the current error."""
-
+    """Form a WSGI response based on the current error."""
     error_message = error.args[0]
-    message = i18n.translate(error_message, desired_locale=user_locale)
+    message = oslo_i18n.translate(error_message, desired_locale=user_locale)
     if message is error_message:
         # translate() didn't do anything because it wasn't a Message,
         # convert to a string.
@@ -772,16 +799,15 @@ def render_exception(error, context=None, request=None, user_locale=None):
     if isinstance(error, exception.AuthPluginException):
         body['error']['identity'] = error.authentication
     elif isinstance(error, exception.Unauthorized):
-        url = CONF.public_endpoint
-        if not url:
-            if request:
-                context = {'host_url': request.host_url}
-            if context:
-                url = Application.base_url(context, 'public')
-            else:
-                url = 'http://localhost:%d' % CONF.public_port
-        else:
-            url = url % CONF
+        # NOTE(gyee): we only care about the request environment in the
+        # context. Also, its OK to pass the environment as it is read-only in
+        # Application.base_url()
+        local_context = {}
+        if request:
+            local_context = {'environment': request.environ}
+        elif context and 'environment' in context:
+            local_context = {'environment': context['environment']}
+        url = Application.base_url(local_context, 'public')
 
         headers.append(('WWW-Authenticate', 'Keystone uri="%s"' % url))
     return render_response(status=(error.code, error.title),

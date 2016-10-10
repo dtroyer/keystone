@@ -13,16 +13,16 @@
 """Unified in-memory token model."""
 
 from keystoneclient.common import cms
-from oslo.utils import timeutils
+from oslo_utils import reflection
+from oslo_utils import timeutils
 import six
 
-from keystone.common import config
-from keystone.contrib import federation
+import keystone.conf
 from keystone import exception
+from keystone.federation import constants
 from keystone.i18n import _
 
-
-CONF = config.CONF
+CONF = keystone.conf.CONF
 # supported token versions
 V2 = 'v2.0'
 V3 = 'v3.0'
@@ -37,6 +37,7 @@ def _parse_and_normalize_time(time_data):
 
 class KeystoneToken(dict):
     """An in-memory representation that unifies v2 and v3 tokens."""
+
     # TODO(morganfainberg): Align this in-memory representation with the
     # objects in keystoneclient. This object should be eventually updated
     # to be the source of token data with the ability to emit any version
@@ -62,9 +63,12 @@ class KeystoneToken(dict):
                                               'both project and domain.'))
 
     def __repr__(self):
+        """Return string representation of KeystoneToken."""
         desc = ('<%(type)s (audit_id=%(audit_id)s, '
                 'audit_chain_id=%(audit_chain_id)s) at %(loc)s>')
-        return desc % {'type': self.__class__.__name__,
+        self_cls_name = reflection.get_class_name(self,
+                                                  fully_qualified=False)
+        return desc % {'type': self_cls_name,
                        'audit_id': self.audit_id,
                        'audit_chain_id': self.audit_chain_id,
                        'loc': hex(id(self))}
@@ -116,7 +120,7 @@ class KeystoneToken(dict):
                 return self['user']['domain']['name']
             elif 'user' in self:
                 return "Default"
-        except KeyError:
+        except KeyError:  # nosec
             # Do not raise KeyError, raise UnexpectedError
             pass
         raise exception.UnexpectedError()
@@ -128,7 +132,7 @@ class KeystoneToken(dict):
                 return self['user']['domain']['id']
             elif 'user' in self:
                 return CONF.identity.default_domain_id
-        except KeyError:
+        except KeyError:  # nosec
             # Do not raise KeyError, raise UnexpectedError
             pass
         raise exception.UnexpectedError()
@@ -184,7 +188,7 @@ class KeystoneToken(dict):
                 return self['project']['domain']['id']
             elif 'tenant' in self['token']:
                 return CONF.identity.default_domain_id
-        except KeyError:
+        except KeyError:  # nosec
             # Do not raise KeyError, raise UnexpectedError
             pass
 
@@ -197,11 +201,18 @@ class KeystoneToken(dict):
                 return self['project']['domain']['name']
             if 'tenant' in self['token']:
                 return 'Default'
-        except KeyError:
+        except KeyError:  # nosec
             # Do not raise KeyError, raise UnexpectedError
             pass
 
         raise exception.UnexpectedError()
+
+    @property
+    def is_domain(self):
+        if self.version is V3:
+            if 'is_domain' in self:
+                return self['is_domain']
+        return False
 
     @property
     def project_scoped(self):
@@ -251,6 +262,13 @@ class KeystoneToken(dict):
             return self.get('trust', {}).get('trustor_user_id')
 
     @property
+    def trust_impersonation(self):
+        if self.version is V3:
+            return self.get('OS-TRUST:trust', {}).get('impersonation')
+        else:
+            return self.get('trust', {}).get('impersonation')
+
+    @property
     def oauth_scoped(self):
         return 'OS-OAUTH1' in self
 
@@ -289,7 +307,8 @@ class KeystoneToken(dict):
     @property
     def is_federated_user(self):
         try:
-            return self.version is V3 and federation.FEDERATION in self['user']
+            return (self.version is V3 and
+                    constants.FEDERATION in self['user'])
         except KeyError:
             raise exception.UnexpectedError()
 
@@ -298,7 +317,7 @@ class KeystoneToken(dict):
         if self.is_federated_user:
             if self.version is V3:
                 try:
-                    groups = self['user'][federation.FEDERATION].get(
+                    groups = self['user'][constants.FEDERATION].get(
                         'groups', [])
                     return [g['id'] for g in groups]
                 except KeyError:
@@ -309,12 +328,12 @@ class KeystoneToken(dict):
     def federation_idp_id(self):
         if self.version is not V3 or not self.is_federated_user:
             return None
-        return self['user'][federation.FEDERATION]['identity_provider']['id']
+        return self['user'][constants.FEDERATION]['identity_provider']['id']
 
     @property
     def federation_protocol_id(self):
         if self.version is V3 and self.is_federated_user:
-            return self['user'][federation.FEDERATION]['protocol']['id']
+            return self['user'][constants.FEDERATION]['protocol']['id']
         return None
 
     @property

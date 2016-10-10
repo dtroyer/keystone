@@ -12,24 +12,17 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import six
-import webob.dec
+from oslo_log import log
+from oslo_serialization import jsonutils
 
-from keystone.common import authorization
-from keystone.common import config
-from keystone.common import serializer
-from keystone.common import utils
 from keystone.common import wsgi
+import keystone.conf
 from keystone import exception
-from keystone.i18n import _
-from keystone.models import token_model
-from keystone.openstack.common import jsonutils
-from keystone.openstack.common import log
-from keystone.openstack.common import versionutils
+from keystone.i18n import _LW
 
-CONF = config.CONF
+
+CONF = keystone.conf.CONF
 LOG = log.getLogger(__name__)
-
 
 # Header used to transmit the auth token
 AUTH_TOKEN_HEADER = 'X-Auth-Token'
@@ -53,8 +46,7 @@ class TokenAuthMiddleware(wsgi.Middleware):
         context = request.environ.get(CONTEXT_ENV, {})
         context['token_id'] = token
         if SUBJECT_TOKEN_HEADER in request.headers:
-            context['subject_token_id'] = (
-                request.headers.get(SUBJECT_TOKEN_HEADER))
+            context['subject_token_id'] = request.headers[SUBJECT_TOKEN_HEADER]
         request.environ[CONTEXT_ENV] = context
 
 
@@ -66,32 +58,19 @@ class AdminTokenAuthMiddleware(wsgi.Middleware):
 
     """
 
+    def __init__(self, application):
+        super(AdminTokenAuthMiddleware, self).__init__(application)
+        LOG.warning(_LW("The admin_token_auth middleware presents a security "
+                        "risk and should be removed from the "
+                        "[pipeline:api_v3], [pipeline:admin_api], and "
+                        "[pipeline:public_api] sections of your paste ini "
+                        "file."))
+
     def process_request(self, request):
         token = request.headers.get(AUTH_TOKEN_HEADER)
         context = request.environ.get(CONTEXT_ENV, {})
-        context['is_admin'] = (token == CONF.admin_token)
+        context['is_admin'] = CONF.admin_token and (token == CONF.admin_token)
         request.environ[CONTEXT_ENV] = context
-
-
-class PostParamsMiddleware(wsgi.Middleware):
-    """Middleware to allow method arguments to be passed as POST parameters.
-
-    Filters out the parameters `self`, `context` and anything beginning with
-    an underscore.
-
-    """
-
-    def process_request(self, request):
-        params_parsed = request.params
-        params = {}
-        for k, v in six.iteritems(params_parsed):
-            if k in ('self', 'context'):
-                continue
-            if k.startswith('_'):
-                continue
-            params[k] = v
-
-        request.environ[PARAMS_ENV] = params
 
 
 class JsonBodyMiddleware(wsgi.Middleware):
@@ -100,14 +79,11 @@ class JsonBodyMiddleware(wsgi.Middleware):
     Accepting arguments as JSON is useful for accepting data that may be more
     complex than simple primitives.
 
-    In this case we accept it as urlencoded data under the key 'json' as in
-    json=<urlencoded_json> but this could be extended to accept raw JSON
-    in the POST body.
-
     Filters out the parameters `self`, `context` and anything beginning with
     an underscore.
 
     """
+
     def process_request(self, request):
         # Abort early if we don't have any work to do
         params_json = request.body
@@ -138,7 +114,7 @@ class JsonBodyMiddleware(wsgi.Middleware):
             return wsgi.render_exception(e, request=request)
 
         params = {}
-        for k, v in six.iteritems(params_parsed):
+        for k, v in params_parsed.items():
             if k in ('self', 'context'):
                 continue
             if k.startswith('_'):
@@ -148,67 +124,11 @@ class JsonBodyMiddleware(wsgi.Middleware):
         request.environ[PARAMS_ENV] = params
 
 
-class XmlBodyMiddleware(wsgi.Middleware):
-    """De/serializes XML to/from JSON."""
-
-    @versionutils.deprecated(
-        what='keystone.middleware.core.XmlBodyMiddleware',
-        as_of=versionutils.deprecated.ICEHOUSE,
-        in_favor_of='support for "application/json" only',
-        remove_in=+2)
-    def __init__(self, *args, **kwargs):
-        super(XmlBodyMiddleware, self).__init__(*args, **kwargs)
-        self.xmlns = None
-
-    def process_request(self, request):
-        """Transform the request from XML to JSON."""
-        incoming_xml = 'application/xml' in str(request.content_type)
-        if incoming_xml and request.body:
-            request.content_type = 'application/json'
-            try:
-                request.body = jsonutils.dumps(
-                    serializer.from_xml(request.body))
-            except Exception:
-                LOG.exception('Serializer failed')
-                e = exception.ValidationError(attribute='valid XML',
-                                              target='request body')
-                return wsgi.render_exception(e, request=request)
-
-    def process_response(self, request, response):
-        """Transform the response from JSON to XML."""
-        outgoing_xml = 'application/xml' in str(request.accept)
-        if outgoing_xml and response.body:
-            response.content_type = 'application/xml'
-            try:
-                body_obj = jsonutils.loads(response.body)
-                response.body = serializer.to_xml(body_obj, xmlns=self.xmlns)
-            except Exception:
-                LOG.exception('Serializer failed')
-                raise exception.Error(message=response.body)
-        return response
-
-
-class XmlBodyMiddlewareV2(XmlBodyMiddleware):
-    """De/serializes XML to/from JSON for v2.0 API."""
-
-    def __init__(self, *args, **kwargs):
-        super(XmlBodyMiddlewareV2, self).__init__(*args, **kwargs)
-        self.xmlns = 'http://docs.openstack.org/identity/api/v2.0'
-
-
-class XmlBodyMiddlewareV3(XmlBodyMiddleware):
-    """De/serializes XML to/from JSON for v3 API."""
-
-    def __init__(self, *args, **kwargs):
-        super(XmlBodyMiddlewareV3, self).__init__(*args, **kwargs)
-        self.xmlns = 'http://docs.openstack.org/identity/api/v3'
-
-
 class NormalizingFilter(wsgi.Middleware):
     """Middleware filter to handle URL normalization."""
 
     def process_request(self, request):
-        """Normalizes URLs."""
+        """Normalize URLs."""
         # Removes a trailing slash from the given path, if any.
         if (len(request.environ['PATH_INFO']) > 1 and
                 request.environ['PATH_INFO'][-1] == '/'):
@@ -216,66 +136,3 @@ class NormalizingFilter(wsgi.Middleware):
         # Rewrites path to root if no path is given.
         elif not request.environ['PATH_INFO']:
             request.environ['PATH_INFO'] = '/'
-
-
-class RequestBodySizeLimiter(wsgi.Middleware):
-    """Limit the size of an incoming request."""
-
-    def __init__(self, *args, **kwargs):
-        super(RequestBodySizeLimiter, self).__init__(*args, **kwargs)
-
-    @webob.dec.wsgify()
-    def __call__(self, req):
-        if req.content_length is None:
-            if req.is_body_readable:
-                limiter = utils.LimitingReader(req.body_file,
-                                               CONF.max_request_body_size)
-                req.body_file = limiter
-        elif req.content_length > CONF.max_request_body_size:
-            raise exception.RequestTooLarge()
-        return self.application
-
-
-class AuthContextMiddleware(wsgi.Middleware):
-    """Build the authentication context from the request auth token."""
-
-    def _build_auth_context(self, request):
-        token_id = request.headers.get(AUTH_TOKEN_HEADER).strip()
-
-        if token_id == CONF.admin_token:
-            # NOTE(gyee): no need to proceed any further as the special admin
-            # token is being handled by AdminTokenAuthMiddleware. This code
-            # will not be impacted even if AdminTokenAuthMiddleware is removed
-            # from the pipeline as "is_admin" is default to "False". This code
-            # is independent of AdminTokenAuthMiddleware.
-            return {}
-
-        context = {'token_id': token_id}
-        context['environment'] = request.environ
-
-        try:
-            token_ref = token_model.KeystoneToken(
-                token_id=token_id,
-                token_data=self.token_provider_api.validate_token(token_id))
-            # TODO(gyee): validate_token_bind should really be its own
-            # middleware
-            wsgi.validate_token_bind(context, token_ref)
-            return authorization.token_to_auth_context(token_ref)
-        except exception.TokenNotFound:
-            LOG.warning(_('RBAC: Invalid token'))
-            raise exception.Unauthorized()
-
-    def process_request(self, request):
-        if AUTH_TOKEN_HEADER not in request.headers:
-            LOG.debug(('Auth token not in the request header. '
-                       'Will not build auth context.'))
-            return
-
-        if authorization.AUTH_CONTEXT_ENV in request.environ:
-            msg = _('Auth context already exists in the request environment')
-            LOG.warning(msg)
-            return
-
-        auth_context = self._build_auth_context(request)
-        LOG.debug('RBAC: auth_context: %s', auth_context)
-        request.environ[authorization.AUTH_CONTEXT_ENV] = auth_context

@@ -25,36 +25,44 @@ boolean = {
 name = {
     'type': 'string',
     'minLength': 1,
-    'maxLength': 255
+    'maxLength': 255,
+    'pattern': '[\S]+'
 }
 
-hex_uuid = {
+external_id_string = {
     'type': 'string',
-    'maxLength': 32,
-    'minLength': 32,
-    'pattern': '^[a-fA-F0-9]*$'
+    'minLength': 1,
+    'maxLength': 64
+}
+
+id_string = {
+    'type': 'string',
+    'minLength': 1,
+    'maxLength': 64,
+    # TODO(lbragstad): Find a way to make this configurable such that the end
+    # user chooses how much control they want over id_strings with a regex
+    'pattern': '^[a-zA-Z0-9-]+$'
+}
+
+mapping_id_string = {
+    'type': 'string',
+    'minLength': 1,
+    'maxLength': 64,
+    'pattern': '^[a-zA-Z0-9-_]+$'
 }
 
 description = {
-    'type': ['string', 'null']
+    'type': 'string'
 }
 
 url = {
     'type': 'string',
     'minLength': 0,
     'maxLength': 225,
-    # NOTE(lbragstad): Using a regular expression here instead of the
-    # FormatChecker object that is built into jsonschema. The FormatChecker
-    # can validate URI formats but it depends on rfc3987 to do that
-    # validation, and rfc3987 is GPL licensed. For our purposes here we will
-    # use a regex and not rely on rfc3987 to validate URIs.
-    'pattern': '^https?://'
-               '(?:(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)'
-               '+[a-zA-Z]{2,6}\.?|'
-               'localhost|'
-               '\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
-               '(?::\d+)?'
-               '(?:/?|[/?]\S+)$'
+    # NOTE(edmondsw): we could do more to validate per various RFCs, but
+    # decision was made to err on the side of leniency. The following is based
+    # on rfc1738 section 2.1
+    'pattern': '^[a-zA-Z0-9+.-]+:.+'
 }
 
 email = {

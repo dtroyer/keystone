@@ -14,22 +14,174 @@
 
 """Keystone Caching Layer Implementation."""
 
+import os
+
 import dogpile.cache
-from dogpile.cache import proxy
+from dogpile.cache import region
 from dogpile.cache import util
+from oslo_cache import core as cache
 
-from keystone import config
-from keystone import exception
-from keystone.i18n import _
-from keystone.openstack.common import importutils
-from keystone.openstack.common import log
+from keystone.common.cache import _context_cache
+import keystone.conf
 
 
-CONF = config.CONF
-LOG = log.getLogger(__name__)
+CONF = keystone.conf.CONF
 
-make_region = dogpile.cache.make_region
 
+class RegionInvalidationManager(object):
+
+    REGION_KEY_PREFIX = '<<<region>>>:'
+
+    def __init__(self, invalidation_region, region_name):
+        self._invalidation_region = invalidation_region
+        self._region_key = self.REGION_KEY_PREFIX + region_name
+
+    def _generate_new_id(self):
+        return os.urandom(10)
+
+    @property
+    def region_id(self):
+        return self._invalidation_region.get_or_create(
+            self._region_key, self._generate_new_id, expiration_time=-1)
+
+    def invalidate_region(self):
+        new_region_id = self._generate_new_id()
+        self._invalidation_region.set(self._region_key, new_region_id)
+        return new_region_id
+
+    def is_region_key(self, key):
+        return key == self._region_key
+
+
+class DistributedInvalidationStrategy(region.RegionInvalidationStrategy):
+
+    def __init__(self, region_manager):
+        self._region_manager = region_manager
+
+    def invalidate(self, hard=None):
+        self._region_manager.invalidate_region()
+
+    def is_invalidated(self, timestamp):
+        return False
+
+    def was_hard_invalidated(self):
+        return False
+
+    def is_hard_invalidated(self, timestamp):
+        return False
+
+    def was_soft_invalidated(self):
+        return False
+
+    def is_soft_invalidated(self, timestamp):
+        return False
+
+
+def key_mangler_factory(invalidation_manager, orig_key_mangler):
+    def key_mangler(key):
+        # NOTE(dstanek): Since *all* keys go through the key mangler we
+        # need to make sure the region keys don't get the region_id added.
+        # If it were there would be no way to get to it, making the cache
+        # effectively useless.
+        if not invalidation_manager.is_region_key(key):
+            key = '%s:%s' % (key, invalidation_manager.region_id)
+        if orig_key_mangler:
+            key = orig_key_mangler(key)
+        return key
+    return key_mangler
+
+
+def create_region(name):
+    """Create a dopile region.
+
+    Wraps oslo_cache.core.create_region. This is used to ensure that the
+    Region is properly patched and allows us to more easily specify a region
+    name.
+
+    :param str name: The region name
+    :returns: The new region.
+    :rtype: :class:`dogpile.cache.region.CacheRegion`
+
+    """
+    region = cache.create_region()
+    region.name = name  # oslo.cache doesn't allow this yet
+    return region
+
+
+CACHE_REGION = create_region(name='shared default')
+CACHE_INVALIDATION_REGION = create_region(name='invalidation region')
+
+register_model_handler = _context_cache._register_model_handler
+
+
+def configure_cache(region=None):
+    if region is None:
+        region = CACHE_REGION
+    # NOTE(morganfainberg): running cache.configure_cache_region()
+    # sets region.is_configured, this must be captured before
+    # cache.configure_cache_region is called.
+    configured = region.is_configured
+    cache.configure_cache_region(CONF, region)
+    # Only wrap the region if it was not configured. This should be pushed
+    # to oslo_cache lib somehow.
+    if not configured:
+        region.wrap(_context_cache._ResponseCacheProxy)
+
+        region_manager = RegionInvalidationManager(
+            CACHE_INVALIDATION_REGION, region.name)
+        region.key_mangler = key_mangler_factory(
+            region_manager, region.key_mangler)
+        region.region_invalidator = DistributedInvalidationStrategy(
+            region_manager)
+
+
+def _sha1_mangle_key(key):
+    """Wrapper for dogpile's sha1_mangle_key.
+
+    dogpile's sha1_mangle_key function expects an encoded string, so we
+    should take steps to properly handle multiple inputs before passing
+    the key through.
+
+    NOTE(dstanek): this was copied directly from olso_cache
+    """
+    try:
+        key = key.encode('utf-8', errors='xmlcharrefreplace')
+    except (UnicodeError, AttributeError):
+        # NOTE(stevemar): if encoding fails just continue anyway.
+        pass
+    return util.sha1_mangle_key(key)
+
+
+def configure_invalidation_region():
+    if CACHE_INVALIDATION_REGION.is_configured:
+        return
+
+    # NOTE(dstanek): Configuring this region manually so that we control the
+    # expiration and can ensure that the keys don't expire.
+    config_dict = cache._build_cache_config(CONF)
+    config_dict['expiration_time'] = None  # we don't want an expiration
+
+    CACHE_INVALIDATION_REGION.configure_from_config(
+        config_dict, '%s.' % CONF.cache.config_prefix)
+
+    # NOTE(morganfainberg): if the backend requests the use of a
+    # key_mangler, we should respect that key_mangler function.  If a
+    # key_mangler is not defined by the backend, use the sha1_mangle_key
+    # mangler provided by dogpile.cache. This ensures we always use a fixed
+    # size cache-key.
+    if CACHE_INVALIDATION_REGION.key_mangler is None:
+        CACHE_INVALIDATION_REGION.key_mangler = _sha1_mangle_key
+
+
+def get_memoization_decorator(group, expiration_group=None, region=None):
+    if region is None:
+        region = CACHE_REGION
+    return cache.get_memoization_decorator(CONF, region, group,
+                                           expiration_group=expiration_group)
+
+
+# NOTE(stevemar): When memcache_pool, mongo and noop backends are removed
+# we no longer need to register the backends here.
 dogpile.cache.register_backend(
     'keystone.common.cache.noop',
     'keystone.common.cache.backends.noop',
@@ -40,164 +192,7 @@ dogpile.cache.register_backend(
     'keystone.common.cache.backends.mongo',
     'MongoCacheBackend')
 
-
-class DebugProxy(proxy.ProxyBackend):
-    """Extra Logging ProxyBackend."""
-    # NOTE(morganfainberg): Pass all key/values through repr to ensure we have
-    # a clean description of the information.  Without use of repr, it might
-    # be possible to run into encode/decode error(s). For logging/debugging
-    # purposes encode/decode is irrelevant and we should be looking at the
-    # data exactly as it stands.
-
-    def get(self, key):
-        value = self.proxied.get(key)
-        LOG.debug('CACHE_GET: Key: "%(key)r" Value: "%(value)r"',
-                  {'key': key, 'value': value})
-        return value
-
-    def get_multi(self, keys):
-        values = self.proxied.get_multi(keys)
-        LOG.debug('CACHE_GET_MULTI: "%(keys)r" Values: "%(values)r"',
-                  {'keys': keys, 'values': values})
-        return values
-
-    def set(self, key, value):
-        LOG.debug('CACHE_SET: Key: "%(key)r" Value: "%(value)r"',
-                  {'key': key, 'value': value})
-        return self.proxied.set(key, value)
-
-    def set_multi(self, keys):
-        LOG.debug('CACHE_SET_MULTI: "%r"', keys)
-        self.proxied.set_multi(keys)
-
-    def delete(self, key):
-        self.proxied.delete(key)
-        LOG.debug('CACHE_DELETE: "%r"', key)
-
-    def delete_multi(self, keys):
-        LOG.debug('CACHE_DELETE_MULTI: "%r"', keys)
-        self.proxied.delete_multi(keys)
-
-
-def build_cache_config():
-    """Build the cache region dictionary configuration.
-
-    :param conf: configuration object for keystone
-    :returns: dict
-    """
-    prefix = CONF.cache.config_prefix
-    conf_dict = {}
-    conf_dict['%s.backend' % prefix] = CONF.cache.backend
-    conf_dict['%s.expiration_time' % prefix] = CONF.cache.expiration_time
-    for argument in CONF.cache.backend_argument:
-        try:
-            (argname, argvalue) = argument.split(':', 1)
-        except ValueError:
-            msg = _('Unable to build cache config-key. Expected format '
-                    '"<argname>:<value>". Skipping unknown format: %s')
-            LOG.error(msg, argument)
-            continue
-
-        arg_key = '.'.join([prefix, 'arguments', argname])
-        conf_dict[arg_key] = argvalue
-
-        LOG.debug('Keystone Cache Config: %s', conf_dict)
-
-    return conf_dict
-
-
-def configure_cache_region(region):
-    """Configure a cache region.
-
-    :param region: optional CacheRegion object, if not provided a new region
-                   will be instantiated
-    :raises: exception.ValidationError
-    :returns: dogpile.cache.CacheRegion
-    """
-    if not isinstance(region, dogpile.cache.CacheRegion):
-        raise exception.ValidationError(
-            _('region not type dogpile.cache.CacheRegion'))
-
-    if not region.is_configured:
-        # NOTE(morganfainberg): this is how you tell if a region is configured.
-        # There is a request logged with dogpile.cache upstream to make this
-        # easier / less ugly.
-
-        config_dict = build_cache_config()
-        region.configure_from_config(config_dict,
-                                     '%s.' % CONF.cache.config_prefix)
-
-        if CONF.cache.debug_cache_backend:
-            region.wrap(DebugProxy)
-
-        # NOTE(morganfainberg): if the backend requests the use of a
-        # key_mangler, we should respect that key_mangler function.  If a
-        # key_mangler is not defined by the backend, use the sha1_mangle_key
-        # mangler provided by dogpile.cache. This ensures we always use a fixed
-        # size cache-key.
-        if region.key_mangler is None:
-            region.key_mangler = util.sha1_mangle_key
-
-        for class_path in CONF.cache.proxies:
-            # NOTE(morganfainberg): if we have any proxy wrappers, we should
-            # ensure they are added to the cache region's backend.  Since
-            # configure_from_config doesn't handle the wrap argument, we need
-            # to manually add the Proxies. For information on how the
-            # ProxyBackends work, see the dogpile.cache documents on
-            # "changing-backend-behavior"
-            cls = importutils.import_class(class_path)
-            LOG.debug("Adding cache-proxy '%s' to backend.", class_path)
-            region.wrap(cls)
-
-    return region
-
-
-def should_cache_fn(section):
-    """Build a function that returns a config section's caching status.
-
-    For any given driver in keystone that has caching capabilities, a boolean
-    config option for that driver's section (e.g. ``token``) should exist and
-    default to ``True``.  This function will use that value to tell the caching
-    decorator if caching for that driver is enabled.  To properly use this
-    with the decorator, pass this function the configuration section and assign
-    the result to a variable.  Pass the new variable to the caching decorator
-    as the named argument ``should_cache_fn``.  e.g.::
-
-        from keystone.common import cache
-
-        SHOULD_CACHE = cache.should_cache_fn('token')
-
-        @cache.on_arguments(should_cache_fn=SHOULD_CACHE)
-        def function(arg1, arg2):
-            ...
-
-    :param section: name of the configuration section to examine
-    :type section: string
-    :returns: function reference
-    """
-    def should_cache(value):
-        if not CONF.cache.enabled:
-            return False
-        conf_group = getattr(CONF, section)
-        return getattr(conf_group, 'caching', True)
-    return should_cache
-
-
-def key_generate_to_str(s):
-    # NOTE(morganfainberg): Since we need to stringify all arguments, attempt
-    # to stringify and handle the Unicode error explicitly as needed.
-    try:
-        return str(s)
-    except UnicodeEncodeError:
-        return s.encode('utf-8')
-
-
-def function_key_generator(namespace, fn, to_str=key_generate_to_str):
-    # NOTE(morganfainberg): This wraps dogpile.cache's default
-    # function_key_generator to change the default to_str mechanism.
-    return util.function_key_generator(namespace, fn, to_str=to_str)
-
-
-REGION = dogpile.cache.make_region(
-    function_key_generator=function_key_generator)
-on_arguments = REGION.cache_on_arguments
+dogpile.cache.register_backend(
+    'keystone.cache.memcache_pool',
+    'keystone.common.cache.backends.memcache_pool',
+    'PooledMemcachedBackend')

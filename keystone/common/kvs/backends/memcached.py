@@ -12,31 +12,30 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-"""
-Keystone Memcached dogpile.cache backend implementation.
-"""
+"""Keystone Memcached dogpile.cache backend implementation."""
 
-import random
+import random as _random
 import time
 
 from dogpile.cache import api
 from dogpile.cache.backends import memcached
+from oslo_cache.backends import memcache_pool
+from six.moves import range
 
-from keystone.common import manager
-from keystone import config
+import keystone.conf
 from keystone import exception
 from keystone.i18n import _
-from keystone.openstack.common import log
 
 
-CONF = config.CONF
-LOG = log.getLogger(__name__)
+CONF = keystone.conf.CONF
 NO_VALUE = api.NO_VALUE
+random = _random.SystemRandom()
 
-
-VALID_DOGPILE_BACKENDS = dict(pylibmc=memcached.PylibmcBackend,
-                              bmemcached=memcached.BMemcachedBackend,
-                              memcached=memcached.MemcachedBackend)
+VALID_DOGPILE_BACKENDS = dict(
+    pylibmc=memcached.PylibmcBackend,
+    bmemcached=memcached.BMemcachedBackend,
+    memcached=memcached.MemcachedBackend,
+    pooled_memcached=memcache_pool.PooledMemcachedBackend)
 
 
 class MemcachedLock(object):
@@ -46,6 +45,7 @@ class MemcachedLock(object):
     http://amix.dk/blog/post/19386
 
     """
+
     def __init__(self, client_fn, key, lock_timeout, max_lock_attempts):
         self.client_fn = client_fn
         self.key = "_lock" + key
@@ -54,33 +54,33 @@ class MemcachedLock(object):
 
     def acquire(self, wait=True):
         client = self.client_fn()
-        i = 0
-        while True:
+        for i in range(self.max_lock_attempts):
             if client.add(self.key, 1, self.lock_timeout):
                 return True
             elif not wait:
                 return False
             else:
-                sleep_time = (((i + 1) * random.random()) + 2 ** i) / 2.5
+                sleep_time = random.random()  # nosec : random is not used for
+                # crypto or security, it's just the time to delay between
+                # retries.
                 time.sleep(sleep_time)
-            if i <= self.max_lock_attempts:
-                i += 1
-            else:
-                raise exception.UnexpectedError(
-                    _('Maximum lock attempts on %s occurred.') % self.key)
+        raise exception.UnexpectedError(
+            _('Maximum lock attempts on %s occurred.') % self.key)
 
     def release(self):
         client = self.client_fn()
         client.delete(self.key)
 
 
-class MemcachedBackend(manager.Manager):
+class MemcachedBackend(object):
     """Pivot point to leverage the various dogpile.cache memcached backends.
 
-    To specify a specific dogpile.cache memcached driver, pass the argument
-    `memcached_driver` set to one of the provided memcached drivers (at this
-    time `memcached`, `bmemcached`, `pylibmc` are valid).
+    To specify a specific dogpile.cache memcached backend, pass the argument
+    `memcached_backend` set to one of the provided memcached backends (at this
+    time `memcached`, `bmemcached`, `pylibmc` and `pooled_memcached` are
+    valid).
     """
+
     def __init__(self, arguments):
         self._key_mangler = None
         self.raw_no_expiry_keys = set(arguments.pop('no_expiry_keys', set()))
@@ -106,12 +106,18 @@ class MemcachedBackend(manager.Manager):
         else:
             if backend not in VALID_DOGPILE_BACKENDS:
                 raise ValueError(
-                    _('Backend `%(driver)s` is not a valid memcached '
-                      'backend. Valid drivers: %(driver_list)s') %
-                    {'driver': backend,
-                     'driver_list': ','.join(VALID_DOGPILE_BACKENDS.keys())})
+                    _('Backend `%(backend)s` is not a valid memcached '
+                      'backend. Valid backends: %(backend_list)s') %
+                    {'backend': backend,
+                     'backend_list': ','.join(VALID_DOGPILE_BACKENDS.keys())})
             else:
                 self.driver = VALID_DOGPILE_BACKENDS[backend](arguments)
+
+    def __getattr__(self, name):
+        """Forward calls to the underlying driver."""
+        f = getattr(self.driver, name)
+        setattr(self, name, f)
+        return f
 
     def _get_set_arguments_driver_attr(self, exclude_expiry=False):
 
@@ -143,22 +149,21 @@ class MemcachedBackend(manager.Manager):
             # all ``set`` and ``set_multi`` calls by the driver, by calling
             # the client directly it is possible to exclude the ``time``
             # argument to the memcached server.
-            new_mapping = dict((k, mapping[k]) for k in no_expiry_keys)
+            new_mapping = {k: mapping[k] for k in no_expiry_keys}
             set_arguments = self._get_set_arguments_driver_attr(
                 exclude_expiry=True)
             self.driver.client.set_multi(new_mapping, **set_arguments)
 
         if has_expiry_keys:
-            new_mapping = dict((k, mapping[k]) for k in has_expiry_keys)
+            new_mapping = {k: mapping[k] for k in has_expiry_keys}
             self.driver.set_multi(new_mapping)
 
     @classmethod
     def from_config_dict(cls, config_dict, prefix):
         prefix_len = len(prefix)
         return cls(
-            dict((key[prefix_len:], config_dict[key])
-                 for key in config_dict
-                 if key.startswith(prefix)))
+            {key[prefix_len:]: config_dict[key] for key in config_dict
+             if key.startswith(prefix)})
 
     @property
     def key_mangler(self):

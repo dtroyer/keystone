@@ -28,15 +28,35 @@ To configure the plugin that should be used set the ``external`` option again
 in the ``auth`` section. There are two external authentication method plugins
 provided by Keystone:
 
-* ``keystone.auth.plugins.external.Default``: This plugin won't take into
-  account the domain information that the external authentication method may
-  pass down to Keystone and will always use the configured default domain. The
-  ``REMOTE_USER`` variable is the username.
+* ``DefaultDomain``: This plugin won't take into account the domain information
+  that the external authentication method may pass down to Keystone and will
+  always use the configured default domain. The ``REMOTE_USER`` variable is the
+  username. This is the default if no plugin is given.
 
-* ``keystone.auth.plugins.external.Domain``: This plugin expects that the
-  ``REMOTE_DOMAIN`` variable contains the domain for the user. If this variable
-  is not present, the configured default domain will be used. The
-  ``REMOTE_USER`` variable is the username.
+* ``Domain``: This plugin expects that the ``REMOTE_DOMAIN`` variable contains
+  the domain for the user. If this variable is not present, the configured
+  default domain will be used. The ``REMOTE_USER`` variable is the username.
+
+.. CAUTION::
+
+    You should disable the external auth method if you are currently using
+    federation. External auth and federation both use the ``REMOTE_USER``
+    variable. Since both the mapped and external plugin are being invoked to
+    validate attributes in the request environment, it can cause conflicts.
+
+    For example, imagine there are two distinct users with the same username
+    `foo`, one in the `Default` domain while the other is in the `BAR` domain.
+    The external Federation modules (i.e. mod_shib) sets the ``REMOTE_USER``
+    attribute to `foo`. The external auth module also tries to set the
+    ``REMOTE_USER`` attribute to `foo` for the `Default` domain. The
+    federated mapping engine maps the incoming identity to `foo` in the `BAR`
+    domain. This results in user_id conflict since both are using different
+    user_ids to set `foo` in the `Default` domain and the `BAR` domain.
+
+    To disable this, simply remove `external` from the `methods` option in
+    `keystone.conf`::
+
+       methods = external,password,token,oauth1
 
 Using HTTPD authentication
 ==========================
@@ -97,7 +117,7 @@ be issued.
 Your code should set the ``REMOTE_USER`` if the user is properly authenticated,
 following the semantics below:
 
-.. code:: python
+.. code-block:: python
 
     from keystone.common import wsgi
     from keystone import exception
@@ -147,9 +167,9 @@ authentication.
 For example, if the original pipeline looks like this::
 
     [pipeline:public_api]
-    pipeline = stats_monitoring url_normalize token_auth admin_token_auth xml_body json_body debug ec2_extension user_crud_extension public_service
+    pipeline = url_normalize token_auth admin_token_auth json_body debug ec2_extension user_crud_extension public_service
 
 Your modified pipeline might then look like this::
 
     [pipeline:public_api]
-    pipeline = stats_monitoring url_normalize token_auth admin_token_auth xml_body json_body my_auth debug ec2_extension user_crud_extension public_service
+    pipeline = url_normalize token_auth admin_token_auth json_body my_auth debug ec2_extension user_crud_extension public_service

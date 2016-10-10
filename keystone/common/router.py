@@ -19,12 +19,14 @@ from keystone.common import wsgi
 class Router(wsgi.ComposableRouter):
     def __init__(self, controller, collection_key, key,
                  resource_descriptions=None,
-                 is_entity_implemented=True):
+                 is_entity_implemented=True,
+                 method_template=None):
         self.controller = controller
         self.key = key
         self.collection_key = collection_key
         self._resource_descriptions = resource_descriptions
         self._is_entity_implemented = is_entity_implemented
+        self.method_template = method_template or '%s'
 
     def add_routes(self, mapper):
         collection_path = '/%(collection_key)s' % {
@@ -36,52 +38,45 @@ class Router(wsgi.ComposableRouter):
         mapper.connect(
             collection_path,
             controller=self.controller,
-            action='create_%s' % self.key,
+            action=self.method_template % 'create_%s' % self.key,
             conditions=dict(method=['POST']))
         mapper.connect(
             collection_path,
             controller=self.controller,
-            action='list_%s' % self.collection_key,
-            conditions=dict(method=['GET']))
+            action=self.method_template % 'list_%s' % self.collection_key,
+            conditions=dict(method=['GET', 'HEAD']))
         mapper.connect(
             entity_path,
             controller=self.controller,
-            action='get_%s' % self.key,
-            conditions=dict(method=['GET']))
+            action=self.method_template % 'get_%s' % self.key,
+            conditions=dict(method=['GET', 'HEAD']))
         mapper.connect(
             entity_path,
             controller=self.controller,
-            action='update_%s' % self.key,
+            action=self.method_template % 'update_%s' % self.key,
             conditions=dict(method=['PATCH']))
         mapper.connect(
             entity_path,
             controller=self.controller,
-            action='delete_%s' % self.key,
+            action=self.method_template % 'delete_%s' % self.key,
             conditions=dict(method=['DELETE']))
 
-        if self._resource_descriptions is not None:
-            # Add the collection resource and entity resource to the resource
-            # descriptions.
+        # Add the collection resource and entity resource to the resource
+        # descriptions.
 
-            collection_rel = json_home.build_v3_resource_relation(
-                self.collection_key)
-            self._resource_descriptions.append(
-                (collection_rel,
-                 {
-                     'href': collection_path,
-                 }
-                 ))
+        collection_rel = json_home.build_v3_resource_relation(
+            self.collection_key)
+        rel_data = {'href': collection_path, }
+        self._resource_descriptions.append((collection_rel, rel_data))
 
-            if self._is_entity_implemented:
-                entity_rel = json_home.build_v3_resource_relation(self.key)
-                id_str = '%s_id' % self.key
-                id_param_rel = json_home.build_v3_parameter_relation(id_str)
-                self._resource_descriptions.append(
-                    (entity_rel,
-                     {
-                         'href-template': entity_path,
-                         'href-vars': {
-                             id_str: id_param_rel,
-                         },
-                     }
-                     ))
+        if self._is_entity_implemented:
+            entity_rel = json_home.build_v3_resource_relation(self.key)
+            id_str = '%s_id' % self.key
+            id_param_rel = json_home.build_v3_parameter_relation(id_str)
+            entity_rel_data = {
+                'href-template': entity_path,
+                'href-vars': {
+                    id_str: id_param_rel,
+                },
+            }
+            self._resource_descriptions.append((entity_rel, entity_rel_data))

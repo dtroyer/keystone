@@ -22,21 +22,21 @@ from dogpile.cache import proxy
 from dogpile.cache import region
 from dogpile.cache import util as dogpile_util
 from dogpile.core import nameregistry
-import six
+from oslo_log import log
+from oslo_log import versionutils
+from oslo_utils import importutils
+from oslo_utils import reflection
 
-from keystone.common import config
+import keystone.conf
 from keystone import exception
-from keystone.i18n import _
-from keystone.openstack.common import importutils
-from keystone.openstack.common import log
+from keystone.i18n import _, _LI, _LW
 
-
-__all__ = ['KeyValueStore', 'KeyValueStoreLock', 'LockTimeout',
-           'get_key_value_store']
+__all__ = ('KeyValueStore', 'KeyValueStoreLock', 'LockTimeout',
+           'get_key_value_store')
 
 
 BACKENDS_REGISTERED = False
-CONF = config.CONF
+CONF = keystone.conf.CONF
 KEY_VALUE_STORE_REGISTRY = weakref.WeakValueDictionary()
 LOCK_WINDOW = 1
 LOG = log.getLogger(__name__)
@@ -65,6 +65,23 @@ def _register_backends():
         BACKENDS_REGISTERED = True
 
 
+def sha1_mangle_key(key):
+    """Wrapper for dogpile's sha1_mangle_key.
+
+    Taken from oslo_cache.core._sha1_mangle_key
+
+    dogpile's sha1_mangle_key function expects an encoded string, so we
+    should take steps to properly handle multiple inputs before passing
+    the key through.
+    """
+    try:
+        key = key.encode('utf-8', errors='xmlcharrefreplace')
+    except (UnicodeError, AttributeError):  # nosec
+        # NOTE(stevemar): if encoding fails just continue anyway.
+        pass
+    return dogpile_util.sha1_mangle_key(key)
+
+
 class LockTimeout(exception.UnexpectedError):
     debug_message_format = _('Lock Timeout occurred for key, %(target)s')
 
@@ -74,7 +91,14 @@ class KeyValueStore(object):
 
     This manager also supports the concept of locking a given key resource to
     allow for a guaranteed atomic transaction to the backend.
+
+    Deprecated as of Newton.
     """
+
+    @versionutils.deprecated(
+        versionutils.deprecated.NEWTON,
+        what='keystone key-value-store common code',
+        remove_in=+2)
     def __init__(self, kvs_region):
         self.locking = True
         self._lock_timeout = 0
@@ -94,7 +118,6 @@ class KeyValueStore(object):
                         this instantiation
         :param region_config_args: key-word args passed to the dogpile.cache
                                    backend for configuration
-        :return:
         """
         if self.is_configured:
             # NOTE(morganfainberg): It is a bad idea to reconfigure a backend,
@@ -129,12 +152,16 @@ class KeyValueStore(object):
                 if issubclass(pxy, proxy.ProxyBackend):
                     proxies.append(pxy)
                 else:
-                    LOG.warning(_('%s is not a dogpile.proxy.ProxyBackend'),
-                                pxy.__name__)
+                    pxy_cls_name = reflection.get_class_name(
+                        pxy, fully_qualified=False)
+                    LOG.warning(_LW('%s is not a dogpile.proxy.ProxyBackend'),
+                                pxy_cls_name)
 
             for proxy_cls in reversed(proxies):
-                LOG.info(_('Adding proxy \'%(proxy)s\' to KVS %(name)s.'),
-                         {'proxy': proxy_cls.__name__,
+                proxy_cls_name = reflection.get_class_name(
+                    proxy_cls, fully_qualified=False)
+                LOG.info(_LI('Adding proxy \'%(proxy)s\' to KVS %(name)s.'),
+                         {'proxy': proxy_cls_name,
                           'name': self._region.name})
                 self._region.wrap(proxy_cls)
 
@@ -145,24 +172,24 @@ class KeyValueStore(object):
                                             self._region.name)
 
     def _set_keymangler_on_backend(self, key_mangler):
-            try:
-                self._region.backend.key_mangler = key_mangler
-            except Exception as e:
-                # NOTE(morganfainberg): The setting of the key_mangler on the
-                # backend is used to allow the backend to
-                # calculate a hashed key value as needed. Not all backends
-                # require the ability to calculate hashed keys. If the
-                # backend does not support/require this feature log a
-                # debug line and move on otherwise raise the proper exception.
-                # Support of the feature is implied by the existence of the
-                # 'raw_no_expiry_keys' attribute.
-                if not hasattr(self._region.backend, 'raw_no_expiry_keys'):
-                    LOG.debug(('Non-expiring keys not supported/required by '
-                               '%(region)s backend; unable to set '
-                               'key_mangler for backend: %(err)s'),
-                              {'region': self._region.name, 'err': e})
-                else:
-                    raise
+        try:
+            self._region.backend.key_mangler = key_mangler
+        except Exception as e:
+            # NOTE(morganfainberg): The setting of the key_mangler on the
+            # backend is used to allow the backend to
+            # calculate a hashed key value as needed. Not all backends
+            # require the ability to calculate hashed keys. If the
+            # backend does not support/require this feature log a
+            # debug line and move on otherwise raise the proper exception.
+            # Support of the feature is implied by the existence of the
+            # 'raw_no_expiry_keys' attribute.
+            if not hasattr(self._region.backend, 'raw_no_expiry_keys'):
+                LOG.debug(('Non-expiring keys not supported/required by '
+                           '%(region)s backend; unable to set '
+                           'key_mangler for backend: %(err)s'),
+                          {'region': self._region.name, 'err': e})
+            else:
+                raise
 
     def _set_key_mangler(self, key_mangler):
         # Set the key_mangler that is appropriate for the given region being
@@ -183,7 +210,7 @@ class KeyValueStore(object):
 
         if CONF.kvs.enable_key_mangler:
             if key_mangler is not None:
-                msg = _('Using %(func)s as KVS region %(name)s key_mangler')
+                msg = _LI('Using %(func)s as KVS region %(name)s key_mangler')
                 if callable(key_mangler):
                     self._region.key_mangler = key_mangler
                     LOG.info(msg, {'func': key_mangler.__name__,
@@ -195,17 +222,17 @@ class KeyValueStore(object):
                     raise exception.ValidationError(
                         _('`key_mangler` option must be a function reference'))
             else:
-                LOG.info(_('Using default dogpile sha1_mangle_key as KVS '
-                           'region %s key_mangler'), self._region.name)
-                # NOTE(morganfainberg): Sane 'default' keymangler is the
-                # dogpile sha1_mangle_key function.  This ensures that unless
-                # explicitly changed, we mangle keys.  This helps to limit
-                # unintended cases of exceeding cache-key in backends such
-                # as memcache.
-                self._region.key_mangler = dogpile_util.sha1_mangle_key
+                msg = _LI('Using default keystone.common.kvs.sha1_mangle_key '
+                          'as KVS region %s key_mangler')
+                LOG.info(msg, self._region.name)
+                # NOTE(morganfainberg): Use 'default' keymangler to ensure
+                # that unless explicitly changed, we mangle keys.  This helps
+                # to limit unintended cases of exceeding cache-key in backends
+                # such as memcache.
+                self._region.key_mangler = sha1_mangle_key
             self._set_keymangler_on_backend(self._region.key_mangler)
         else:
-            LOG.info(_('KVS region %s key_mangler disabled.'),
+            LOG.info(_LI('KVS region %s key_mangler disabled.'),
                      self._region.name)
             self._set_keymangler_on_backend(None)
 
@@ -230,7 +257,7 @@ class KeyValueStore(object):
         if config_args['lock_timeout'] > 0:
             config_args['lock_timeout'] += LOCK_WINDOW
 
-        for argument, value in six.iteritems(config_args):
+        for argument, value in config_args.items():
             arg_key = '.'.join([prefix, 'arguments', argument])
             conf_dict[arg_key] = value
 
@@ -250,6 +277,7 @@ class KeyValueStore(object):
 
     class _LockWrapper(object):
         """weakref-capable threading.Lock wrapper."""
+
         def __init__(self, lock_timeout):
             self.lock = threading.Lock()
             self.lock_timeout = lock_timeout
@@ -333,12 +361,14 @@ class KeyValueStore(object):
         timeout.
         """
         self._assert_configured()
-        return KeyValueStoreLock(self._mutex(key), key, self.locking)
+        return KeyValueStoreLock(self._mutex(key), key, self.locking,
+                                 self._lock_timeout)
 
     @contextlib.contextmanager
     def _action_with_lock(self, key, lock=None):
-        """Wrapper context manager to validate and handle the lock and lock
-        timeout if passed in.
+        """Wrapper context manager.
+
+        Validates and handles the lock and lock timeout if passed in.
         """
         if not isinstance(lock, KeyValueStoreLock):
             # NOTE(morganfainberg): Locking only matters if a lock is passed in
@@ -360,15 +390,18 @@ class KeyValueStore(object):
 
 
 class KeyValueStoreLock(object):
-    """Basic KeyValueStoreLock context manager that hooks into the
-    dogpile.cache backend mutex allowing for distributed locking on resources.
+    """Basic KeyValueStoreLock context manager.
 
-    This is only a write lock, and will not prevent reads from occurring.
+    Hooks into the dogpile.cache backend mutex allowing for distributed locking
+    on resources. This is only a write lock, and will not prevent reads from
+    occurring.
     """
-    def __init__(self, mutex, key, locking_enabled=True):
+
+    def __init__(self, mutex, key, locking_enabled=True, lock_timeout=0):
         self.mutex = mutex
         self.key = key
         self.enabled = locking_enabled
+        self.lock_timeout = lock_timeout
         self.active = False
         self.acquire_time = 0
 
@@ -384,11 +417,11 @@ class KeyValueStoreLock(object):
 
     @property
     def expired(self):
-        if self.mutex.lock_timeout == 0:
-            return False
-        else:
+        if self.lock_timeout:
             calculated = time.time() - self.acquire_time + LOCK_WINDOW
-            return calculated > self.mutex.lock_timeout
+            return calculated > self.lock_timeout
+        else:
+            return False
 
     def release(self):
         if self.enabled:
@@ -396,15 +429,18 @@ class KeyValueStoreLock(object):
             if not self.expired:
                 LOG.debug('KVS lock released for: %s', self.key)
             else:
-                LOG.warning(_('KVS lock released (timeout reached) for: %s'),
+                LOG.warning(_LW('KVS lock released (timeout reached) for: %s'),
                             self.key)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        """Release the lock."""
         self.release()
 
 
 def get_key_value_store(name, kvs_region=None):
-    """Instantiate a new :class:`.KeyValueStore` or return a previous
+    """Retrieve key value store.
+
+    Instantiate a new :class:`.KeyValueStore` or return a previous
     instantiation that has the same name.
     """
     global KEY_VALUE_STORE_REGISTRY

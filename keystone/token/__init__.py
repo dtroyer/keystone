@@ -13,7 +13,5 @@
 # under the License.
 
 from keystone.token import controllers  # noqa
-from keystone.token.core import *  # noqa
 from keystone.token import persistence  # noqa
 from keystone.token import provider  # noqa
-from keystone.token import routers  # noqa

@@ -21,17 +21,18 @@ Developing with Keystone
 Setup
 -----
 
-Get your development environment set up according to :doc:`setup`. The
-instructions from here will assume that you have installed keystone into a
-virtualenv. If you chose not to, simply exclude "tools/with_venv.sh" from the
-example commands below.
+Get your development environment set up according to
+:doc:`devref/development.environment`. It is recommended that you install
+Keystone into a virtualenv.
 
 
 Configuring Keystone
 --------------------
 
-keystone requires a configuration file.  There is a sample configuration file
-that can be used to get started::
+Keystone requires a configuration file.  There is a sample configuration file
+that can be used to get started:
+
+.. code-block:: bash
 
     $ cp etc/keystone.conf.sample etc/keystone.conf
 
@@ -42,13 +43,15 @@ needed.
 Running Keystone
 ----------------
 
-To run the keystone Admin and API server instances, use::
+To run the Keystone Admin and API server instances, use:
 
-    $ tools/with_venv.sh bin/keystone-all
+.. code-block:: bash
 
-this runs keystone with the configuration the etc/ directory of the project.
+    $ uwsgi --http 127.0.0.1:35357 --wsgi-file $(which keystone-wsgi-admin)
+
+This runs Keystone with the configuration the etc/ directory of the project.
 See :doc:`configuration` for details on how Keystone is configured. By default,
-keystone is configured with SQL backends.
+Keystone is configured with SQL backends.
 
 
 Interacting with Keystone
@@ -58,17 +61,20 @@ You can interact with Keystone through the command line using
 :doc:`man/keystone-manage` which allows you to initialize keystone, etc.
 
 You can also interact with Keystone through its REST API. There is a Python
-keystone client library `python-keystoneclient`_ which interacts exclusively
-through the REST API, and which keystone itself uses to provide its
+Keystone client library `python-keystoneclient`_ which interacts exclusively
+through the REST API, and which Keystone itself uses to provide its
 command-line interface.
 
 When initially getting set up, after you've configured which databases to use,
 you're probably going to need to run the following to your database schema in
-place::
+place:
 
-    $ bin/keystone-manage db_sync
+.. code-block:: bash
 
-.. _`python-keystoneclient`: https://github.com/openstack/python-keystoneclient
+    $ keystone-manage db_sync
+
+.. _`python-keystoneclient`: https://git.openstack.org/cgit/openstack/python-keystoneclient
+.. _`openstackclient`: https://git.openstack.org/cgit/openstack/python-openstackclient
 
 If the above commands result in a ``KeyError``, or they fail on a
 ``.pyc`` file with the message, ``You can only have one Python script per
@@ -76,60 +82,118 @@ version``, then it is possible that there are out-of-date compiled Python
 bytecode files in the Keystone directory tree that are causing problems. This
 can occur if you have previously installed and ran older versions of Keystone.
 These out-of-date files can be easily removed by running a command like the
-following from the Keystone root project directory::
+following from the Keystone root project directory:
+
+.. code-block:: bash
 
     $ find . -name "*.pyc" -delete
 
-Database Schema Migrations
---------------------------
+Database Migrations
+-------------------
 
-Keystone uses SQLAlchemy-migrate_ to migrate
-the SQL database between revisions. For core components, the migrations are
-kept in a central repository under ``keystone/common/sql/migrate_repo``.
+Starting with Newton, keystone supports upgrading both with and without
+downtime. In order to support this, there are three separate migration
+repositories (all under ``keystone/common/sql/``) that match the three phases
+of an upgrade (schema expansion, data migration, and schema contraction):
 
-.. _SQLAlchemy-migrate: http://code.google.com/p/sqlalchemy-migrate/
+``expand_repo``
+    For additive schema modifications and triggers to ensure data is kept in
+    sync between the old and new schema until the point when there are no
+    keystone instances running old code.
 
-Extensions should be created as directories under ``keystone/contrib``. An
-extension that requires SQL migrations should not change the common repository,
-but should instead have its own repository. This repository must be in the
-extension's directory in ``keystone/contrib/<extension>/migrate_repo``. In
-addition, it needs a subdirectory named ``versions``. For example, if the
-extension name is ``my_extension`` then the directory structure would be
-``keystone/contrib/my_extension/migrate_repo/versions/``. For the migration to
-work, both the ``migrate_repo`` and ``versions`` subdirectories must have
-``__init__.py`` files. SQLAlchemy-migrate will look for a configuration file in
-the ``migrate_repo`` named ``migrate.cfg``. This conforms to a key/value `ini`
-file format. A sample configuration file with the minimal set of values is::
+``data_migration_repo``
+    To ensure new tables/columns are fully populated with data from the old
+    schema.
 
-    [db_settings]
-    repository_id=my_extension
-    version_table=migrate_version
-    required_dbs=[]
+``contract_repo``
+    Run after all old code versions have been upgraded to running the new code,
+    so remove any old schema columns/tables that are not used by the new
+    version of the code. Drop any triggers added in the expand phase.
 
-The directory ``keystone/contrib/example`` contains a sample extension
-migration.
+All migrations are required to have a migration script in each of these repos,
+each with the same version number (which is indicated by the first three digits
+of the name of the script, e.g. ``003_add_X_table.py``). If there is no work to
+do in a specific phase, then include a no-op migration to simply ``pass`` (in
+fact the ``001`` migration in each of these repositories is a no-op migration,
+so that can be used as a template).
 
-Migrations must be explicitly run for each extension individually. To run a
-migration for a specific extension, simply run::
+.. NOTE::
 
-    $ keystone-manage db_sync --extension <name>
+    Since rolling upgrade support was added part way through the Newton cycle,
+    some migrations had already been added to the legacy repository
+    (``keystone/common/sql/migrate_repo``). This repository is now closed and
+    no new migrations should be added (except for backporting of previous
+    placeholders).
+
+In order to support rolling upgrades, where two releases of keystone briefly
+operate side-by-side using the same database without downtime, each phase of
+the migration must adhere to following constraints:
+
+These triggers should be removed in the contract phase. There are further
+restrictions as to what can and cannot be included in migration scripts in each
+phase:
+
+Expand phase:
+    Only additive schema changes are allowed, such as new columns, tables,
+    indices, and triggers.
+
+    Data insertion, alteration, and removal is not allowed.
+
+    Triggers must be created to keep data in sync between the previous release
+    and the next release. Data written by the previous release must be readable
+    by both the previous release and the next release. Data written by the next
+    release must be readable by both the next release and the previous release.
+
+    In cases it is not possible for triggers to maintain data integrity across
+    multiple schemas, writing data should be forbidden using triggers.
+
+Data Migration phase:
+    Data is allowed to be inserted, updated, and deleted.
+
+    No schema changes are allowed.
+
+Contract phase:
+    Only contractive schema changes are allowed, such as dropping or altering
+    columns, tables, indices, and triggers.
+
+    Data insertion, alteration, and removal is not allowed.
+
+    Triggers created during the expand phase must be dropped.
+
+For more information on writing individual migration scripts refer to
+`SQLAlchemy-migrate`_.
+
+.. _SQLAlchemy-migrate: https://git.openstack.org/cgit/openstack/sqlalchemy-migrate
 
 Initial Sample Data
 -------------------
 
 There is an included script which is helpful in setting up some initial sample
-data for use with keystone::
+data for use with keystone:
 
-    $ OS_SERVICE_TOKEN=ADMIN tools/with_venv.sh tools/sample_data.sh
+.. code-block:: bash
 
-Notice it requires a service token read from an environment variable for
-authentication.  The default value "ADMIN" is from the ``admin_token``
-option in the ``[DEFAULT]`` section in ``etc/keystone.conf``.
+    $ ADMIN_PASSWORD=s3cr3t tools/sample_data.sh
 
 Once run, you can see the sample data that has been created by using the
-`python-keystoneclient`_ command-line interface::
+`openstackclient`_ command-line interface:
 
-    $ tools/with_venv.sh keystone --os-token ADMIN --os-endpoint http://127.0.0.1:35357/v2.0/ user-list
+.. code-block:: bash
+
+    $ export OS_USERNAME=admin
+    $ export OS_PASSWORD=s3cr3t
+    $ export OS_PROJECT_NAME=admin
+    $ export OS_USER_DOMAIN_ID=default
+    $ export OS_PROJECT_DOMAIN_ID=default
+    $ export OS_IDENTITY_API_VERSION=3
+    $ export OS_AUTH_URL=http://localhost:5000/v3
+    $ openstack user list
+
+The `openstackclient`_ can be installed using the following:
+
+.. code-block:: bash
+
+    $ pip install python-openstackclient
 
 Filtering responsibilities between controllers and drivers
 ----------------------------------------------------------
@@ -200,7 +264,10 @@ Running Tests
 =============
 
 Before running tests, you should have ``tox`` installed and available in your
-environment (in addition to the other external dependencies in :doc:`setup`)::
+environment (in addition to the other external dependencies in
+:doc:`devref/development.environment`):
+
+.. code-block:: bash
 
     $ pip install tox
 
@@ -210,7 +277,9 @@ environment (in addition to the other external dependencies in :doc:`setup`)::
     python virtualenv, or prefix the above command with ``sudo``, depending on
     your preference.
 
-To execute the full suite of tests maintained within Keystone, simply run::
+To execute the full suite of tests maintained within Keystone, simply run:
+
+.. code-block:: bash
 
     $ tox
 
@@ -226,7 +295,9 @@ other projects.
 
 To run tests for one or more specific test environments (for example, the most
 common configuration of Python 2.7 and PEP-8), list the environments with the
-``-e`` option, separated by spaces::
+``-e`` option, separated by spaces:
+
+.. code-block:: bash
 
     $ tox -e py27,pep8
 
@@ -240,9 +311,11 @@ just fail with a BdbQuit exception rather than stopping at the breakpoint.
 
 To run with PDB breakpoints during testing, use the ``debug`` tox environment
 rather than ``py27``. Here's an example, passing the name of a test since
-you'll normally only want to run the test that hits your breakpoint::
+you'll normally only want to run the test that hits your breakpoint:
 
-    $ tox -e debug keystone.tests.test_auth.AuthWithToken.test_belongs_to
+.. code-block:: bash
+
+    $ tox -e debug keystone.tests.unit.test_auth.AuthWithToken.test_belongs_to
 
 For reference, the ``debug`` tox environment implements the instructions
 here: https://wiki.openstack.org/wiki/Testr#Debugging_.28pdb.29_Tests
@@ -260,38 +333,38 @@ data to be discarded even if the test fails: `OS_STDOUT_CAPTURE` for stdout,
 of the environment variable is not one of (True, true, 1, yes) the stream will
 be discarded. All three variables default to 1.
 
-For example, to discard logging data during a test run::
+For example, to discard logging data during a test run:
+
+.. code-block:: bash
 
     $ OS_LOG_CAPTURE=0 tox -e py27
 
 Test Structure
 ==============
 
-Not all of the tests in the tests directory are strictly unit tests. Keystone
-intentionally includes tests that run the service locally and drives the entire
-configuration to achieve basic functional testing.
+Not all of the tests in the keystone/tests/unit directory are strictly unit
+tests. Keystone intentionally includes tests that run the service locally and
+drives the entire configuration to achieve basic functional testing.
 
-For the functional tests, an in-memory key-value store is used to keep the
-tests fast.
+For the functional tests, an in-memory key-value store or in-memory SQLite
+database is used to keep the tests fast.
 
-Within the tests directory, the general structure of the tests is a basic
-set of tests represented under a test class, and then subclasses of those
+Within the tests directory, the general structure of the backend tests is a
+basic set of tests represented under a test class, and then subclasses of those
 tests under other classes with different configurations to drive different
 backends through the APIs.
 
 For example, ``test_backend.py`` has a sequence of tests under the class
-``IdentityTests`` that will work with the default drivers as configured in
-this projects etc/ directory. ``test_backend_sql.py`` subclasses those tests,
-changing the configuration by overriding with configuration files stored in
-the tests directory aimed at enabling the SQL backend for the Identity module.
+:class:`~keystone.tests.unit.test_backend.IdentityTests` that will work with
+the default drivers as configured in this project's etc/ directory.
+``test_backend_sql.py`` subclasses those tests, changing the configuration by
+overriding with configuration files stored in the ``tests/unit/config_files``
+directory aimed at enabling the SQL backend for the Identity module.
 
-Likewise, ``test_keystoneclient.py`` takes advantage of the tests written
-against ``KeystoneClientTests`` to verify the same tests function through
-different drivers and releases of the Keystone client.
-
-The class ``CompatTestCase`` does the work of checking out a specific version
-of python-keystoneclient, and then verifying it against a temporarily running
-local instance to explicitly verify basic functional testing across the API.
+:class:`keystone.tests.unit.test_v2_keystoneclient.ClientDrivenTestCase`
+uses the installed python-keystoneclient, verifying it against a temporarily
+running local keystone instance to explicitly verify basic functional testing
+across the API.
 
 Testing Schema Migrations
 =========================
@@ -301,13 +374,15 @@ built-in test runner, one migration at a time.
 
 .. WARNING::
 
-    This may leave your database in an inconsistent state; attempt this in non-production environments only!
+    This may leave your database in an inconsistent state; attempt this in
+    non-production environments only!
 
 This is useful for testing the *next* migration in sequence (both forward &
-backward) in a database under version control::
+backward) in a database under version control:
 
+.. code-block:: bash
 
-    python keystone/common/sql/migrate_repo/manage.py test \
+    $ python keystone/common/sql/migrate_repo/manage.py test \
     --url=sqlite:///test.db \
     --repository=keystone/common/sql/migrate_repo/
 
@@ -319,9 +394,17 @@ of your data during migration.
 Writing Tests
 =============
 
-To add tests covering all drivers, update the relevant base test class
-(``test_backend.py``, ``test_legacy_compat.py``, and
-``test_keystoneclient.py``).
+To add tests covering all drivers, update the base test class in
+``test_backend.py``.
+
+.. NOTE::
+
+    The structure of backend testing is in transition, migrating from having
+    all classes in a single file (test_backend.py) to one where there is a
+    directory structure to reduce the size of the test files. See:
+
+        - :mod:`keystone.tests.unit.backend.role`
+        - :mod:`keystone.tests.unit.backend.domain_config`
 
 To add new drivers, subclass the ``test_backend.py`` (look towards
 ``test_backend_sql.py`` or ``test_backend_kvs.py`` for examples) and update the
@@ -331,16 +414,16 @@ configuration of the test class in ``setUp()``.
 Further Testing
 ===============
 
-devstack_ is the *best* way to quickly deploy keystone with the rest of the
+devstack_ is the *best* way to quickly deploy Keystone with the rest of the
 OpenStack universe and should be critical step in your development workflow!
 
 You may also be interested in either the
 `OpenStack Continuous Integration Infrastructure`_ or the
 `OpenStack Integration Testing Project`_.
 
-.. _devstack: http://devstack.org/
-.. _OpenStack Continuous Integration Infrastructure: http://ci.openstack.org
-.. _OpenStack Integration Testing Project: https://github.com/openstack/tempest
+.. _devstack: http://docs.openstack.org/developer/devstack/
+.. _OpenStack Continuous Integration Infrastructure: http://docs.openstack.org/infra/system-config
+.. _OpenStack Integration Testing Project: https://git.openstack.org/cgit/openstack/tempest
 
 
 LDAP Tests
@@ -354,16 +437,60 @@ and set environment variables ``KEYSTONE_IDENTITY_BACKEND=ldap`` and
 ``KEYSTONE_CLEAR_LDAP=yes`` in your ``localrc`` file.
 
 The unit tests can be run against a live server with
-``keystone/tests/test_ldap_livetest.py`` and
-``keystone/tests/test_ldap_pool_livetest.py``. The default password is ``test``
-but if you have installed devstack with a different LDAP password, modify the
-file ``keystone/tests/config_files/backend_liveldap.conf`` and
-``keystone/tests/config_files/backend_pool_liveldap.conf`` to reflect your password.
+``keystone/tests/unit/test_ldap_livetest.py`` and
+``keystone/tests/unit/test_ldap_pool_livetest.py``. The default password is
+``test`` but if you have installed devstack with a different LDAP password,
+modify the file ``keystone/tests/unit/config_files/backend_liveldap.conf`` and
+``keystone/tests/unit/config_files/backend_pool_liveldap.conf`` to reflect your
+password.
 
 .. NOTE::
-    To run the live tests you need to set the environment variable ``ENABLE_LDAP_LIVE_TEST``
-    to a non-negative value.
+    To run the live tests you need to set the environment variable
+    ``ENABLE_LDAP_LIVE_TEST`` to a non-negative value.
 
+
+"Work in progress" Tests
+========================
+
+Work in progress (WIP) tests are very useful in a variety of situations
+including:
+
+* During a TDD process they can be used to add tests to a review while
+  they are not yet working and will not cause test failures. (They should
+  be removed before the final merge.)
+* Often bug reports include small snippets of code to show broken
+  behaviors. Some of these can be converted into WIP tests that can later
+  be worked on by a developer. This allows us to take code that can be
+  used to catch bug regressions and commit it before any code is
+  written.
+
+The :func:`keystone.tests.unit.utils.wip` decorator can be used to mark a test
+as WIP. A WIP test will always be run. If the test fails then a TestSkipped
+exception is raised because we expect the test to fail. We do not pass
+the test in this case so that it doesn't count toward the number of
+successfully run tests. If the test passes an AssertionError exception is
+raised so that the developer knows they made the test pass. This is a
+reminder to remove the decorator.
+
+The :func:`~keystone.tests.unit.utils.wip` decorator requires that the author
+provides a message. This message is important because it will tell other
+developers why this test is marked as a work in progress. Reviewers will
+require that these messages are descriptive and accurate.
+
+.. NOTE::
+    The :func:`~keystone.tests.unit.utils.wip` decorator is not a replacement for
+    skipping tests.
+
+.. code-block:: python
+
+    @wip('waiting on bug #000000')
+    def test():
+        pass
+
+.. NOTE::
+   Another strategy is to not use the wip decorator and instead show how the
+   code currently incorrectly works. Which strategy is chosen is up to the
+   developer.
 
 Generating Updated Sample Config File
 -------------------------------------
@@ -372,17 +499,23 @@ Keystone's sample configuration file ``etc/keystone.conf.sample`` is automatical
 generated based upon all of the options available within Keystone. These options
 are sourced from the many files around Keystone as well as some external libraries.
 
-If new options are added, primarily located in ``keystone.common.config``, a new
-sample configuration file needs to be generated. Generating a new sample configuration
-to be included in a commit run::
+The sample configuration file is now kept up to date by an infra job that
+generates the config file and if there are any changes will propose a review
+as the OpenStack Proposal Bot. Developers should *NOT* generate the config file
+and propose it as part of their patches since the proposal bot will do this for
+you.
 
-    $ tox -esample_config -r
+To generate a new sample configuration to see what it looks like, run:
+
+.. code-block:: bash
+
+    $ tox -egenconfig -r
 
 The tox command will place an updated sample config in ``etc/keystone.conf.sample``.
 
 If there is a new external library (e.g. ``oslo.messaging``) that utilizes the
 ``oslo.config`` package for configuration, it can be added to the list of libraries
-found in ``tools/config/oslo.config.generator.rc``.
+found in ``config-generator/keystone.conf``.
 
 
 Translated responses
@@ -393,18 +526,25 @@ the ``Accept-Language`` header of the request. In order to test this in your
 development environment, there's a couple of things you need to do.
 
 1. Build the message files. Run the following command in your keystone
-   directory::
+   directory:
+
+.. code-block:: bash
 
    $ python setup.py compile_catalog
 
 This will generate .mo files like keystone/locale/[lang]/LC_MESSAGES/[lang].mo
 
 2. When running Keystone, set the ``KEYSTONE_LOCALEDIR`` environment variable
-   to the keystone/locale directory. For example::
+   to the keystone/locale directory. For example:
 
-   $ KEYSTONE_LOCALEDIR=/opt/stack/keystone/keystone/locale keystone-all
+.. code-block:: bash
 
-Now you can get a translated error response::
+    $ KEYSTONE_LOCALEDIR=/opt/stack/keystone/keystone/locale uwsgi --http 127.0.0.1:35357 --wsgi-file $(which keystone-wsgi-admin)
+
+
+Now you can get a translated error response:
+
+.. code-block:: bash
 
  $ curl -s -H "Accept-Language: zh" http://localhost:5000/notapath | python -mjson.tool
  {
@@ -440,7 +580,7 @@ which will provide a reference, to a function, that will consult the global cach
 
 Example use of cache and ``should_cache_fn`` (in this example, ``token`` is the manager):
 
-.. code:: python
+.. code-block:: python
 
     from keystone.common import cache
     SHOULD_CACHE = cache.should_cache_fn('token')
@@ -468,7 +608,7 @@ configuration section.
 
 Example of using a section specific ``cache_time`` (in this example, ``identity`` is the manager):
 
-.. code:: python
+.. code-block:: python
 
     from keystone.common import cache
     SHOULD_CACHE = cache.should_cache_fn('identity')
@@ -485,7 +625,7 @@ to the ``invalidate`` method as you would the normal function.
 
 Example (using the above cacheable_function):
 
-.. code:: python
+.. code-block:: python
 
     def invalidate_cache(arg1, arg2, arg3):
         cacheable_function.invalidate(arg1, arg2, arg3)
@@ -520,7 +660,7 @@ match the object to the name).
 
 Example Instantiation and Configuration:
 
-.. code:: python
+.. code-block:: python
 
     kvs_store = kvs.get_key_value_store('TestKVSRegion')
     kvs_store.configure('openstack.kvs.Memory', ...)
@@ -537,7 +677,7 @@ By default the ``memcached`` backend is used.  Currently the Memcache URLs come 
 The following is an example showing how to configure the KVS system to use a
 KeyValueStore object named "TestKVSRegion" and a specific Memcached driver:
 
-.. code:: python
+.. code-block:: python
 
     kvs_store = kvs.get_key_value_store('TestKVSRegion')
     kvs_store.configure('openstack.kvs.Memcached', memcached_backend='Memcached')
@@ -549,7 +689,7 @@ will cause the ``time`` argument to be added to all ``set`` and ``set_multi`` ca
 the memcached client. ``memcached_expire_time`` is an argument exclusive to the memcached dogpile
 backend, and will be ignored if passed to another backend:
 
-.. code:: python
+.. code-block:: python
 
     kvs_store.configure('openstack.kvs.Memcached', memcached_backend='Memcached',
                         memcached_expire_time=86400)
@@ -559,7 +699,7 @@ exempt specific keys from receiving the TTL by passing the argument ``no_expiry_
 as a keyword argument to the ``configure`` method. ``no_expiry_keys`` should be supported by
 all OpenStack-specific dogpile backends (memcached) that have the ability to set an explicit TTL:
 
-.. code:: python
+.. code-block:: python
 
     kvs_store.configure('openstack.kvs.Memcached', memcached_backend='Memcached',
                     memcached_expire_time=86400, no_expiry_keys=['key', 'second_key', ...])
@@ -589,7 +729,7 @@ all OpenStack-specific dogpile backends (memcached) that have the ability to set
 Once a KVS object has been instantiated the method of interacting is the same as most memcache
 implementations:
 
-.. code:: python
+.. code-block:: python
 
     kvs_store = kvs.get_key_value_store('TestKVSRegion')
     kvs_store.configure(...)
@@ -636,7 +776,7 @@ All registered backends will receive the "short name" of "openstack.kvs.<class n
 globally unique.
 
 dogpile.cache based MongoDB (NoSQL) backend
---------------------------------------------
+-------------------------------------------
 
 The ``dogpile.cache`` based MongoDB backend implementation allows for various MongoDB
 configurations, e.g., standalone, a replica set, sharded replicas, with or without SSL,
@@ -644,7 +784,7 @@ use of TTL type collections, etc.
 
 Example of typical configuration for MongoDB backend:
 
-.. code:: python
+.. code-block:: python
 
     from dogpile.cache import region
 
@@ -667,7 +807,7 @@ or retrieved from MongoDB. If the dogpile cached values contain built-in data ty
 custom classes, then the provided implementation class is sufficient. For further details, refer
 http://api.mongodb.org/python/current/examples/custom_type.html#automatic-encoding-and-decoding
 
-Similar to other backends, this backend can be added via keystone configuration in
+Similar to other backends, this backend can be added via Keystone configuration in
 ``keystone.conf``::
 
     [cache]
@@ -691,8 +831,51 @@ is similar to other dogpile caching backends as it implements the same dogpile A
 Building the Documentation
 --------------------------
 
-The documentation is generated with Sphinx using the tox command.  To create HTML docs and man pages::
+The documentation is generated with Sphinx using the tox command.  To create HTML docs and man pages:
+
+.. code-block:: bash
 
     $ tox -e docs
 
-The results are in the docs/build/html and docs/build/man directories respectively.
+The results are in the doc/build/html and doc/build/man directories respectively.
+
+
+Release Notes
+-------------
+
+The release notes for a patch should be included in the patch. If not, the
+release notes should be in a follow-on review.
+
+If the following applies to the patch, a release note is required:
+
+* The deployer needs to take an action when upgrading
+* The backend driver interface changes
+* A new feature is implemented
+* Function was removed (hopefully it was deprecated)
+* Current behavior is changed
+* A new config option is added that the deployer should consider changing from
+  the default
+* A security bug is fixed
+
+A release note is suggested if a long-standing or important bug is fixed.
+Otherwise, a release note is not required.
+
+Keystone uses `reno <http://docs.openstack.org/developer/reno/usage.html>`_ to
+generate release notes. Please read the docs for details. In summary, use
+
+.. code-block:: bash
+
+  $ tox -e venv -- reno new <bug-,bp-,whatever>
+
+Then edit the sample file that was created and push it with your change.
+
+To see the results:
+
+.. code-block:: bash
+
+  $ git commit  # Commit the change because reno scans git log.
+
+  $ tox -e releasenotes
+
+Then look at the generated release notes files in releasenotes/build/html in
+your favorite browser.

@@ -12,34 +12,22 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from oslo.utils import timeutils
+from oslo_utils import timeutils
 
-from keystone import auth
+from keystone.auth.plugins import base
 from keystone.common import controller
 from keystone.common import dependency
-from keystone.contrib.oauth1 import core as oauth
-from keystone.contrib.oauth1 import validator
 from keystone import exception
 from keystone.i18n import _
-from keystone.openstack.common import log
+from keystone.oauth1 import core as oauth
+from keystone.oauth1 import validator
 
 
-LOG = log.getLogger(__name__)
-
-
-@dependency.optional('oauth_api')
-class OAuth(auth.AuthMethodHandler):
-
-    method = 'oauth1'
-
-    def authenticate(self, context, auth_info, auth_context):
+@dependency.requires('oauth_api')
+class OAuth(base.AuthMethodHandler):
+    def authenticate(self, request, auth_info, auth_context):
         """Turn a signed request with an access key into a keystone token."""
-
-        if not self.oauth_api:
-            raise exception.Unauthorized(_('%s not supported') % self.method)
-
-        headers = context['headers']
-        oauth_headers = oauth.get_oauth_headers(headers)
+        oauth_headers = oauth.get_oauth_headers(request.headers)
         access_token_id = oauth_headers.get('oauth_token')
 
         if not access_token_id:
@@ -56,15 +44,16 @@ class OAuth(auth.AuthMethodHandler):
             if now > expires:
                 raise exception.Unauthorized(_('Access token is expired'))
 
-        url = controller.V3Controller.base_url(context, context['path'])
+        url = controller.V3Controller.base_url(request.context_dict,
+                                               request.path_info)
         access_verifier = oauth.ResourceEndpoint(
             request_validator=validator.OAuthValidator(),
             token_generator=oauth.token_generator)
         result, request = access_verifier.validate_protected_resource_request(
             url,
             http_method='POST',
-            body=context['query_string'],
-            headers=headers,
+            body=request.params,
+            headers=request.headers,
             realms=None
         )
         if not result:

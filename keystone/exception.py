@@ -12,19 +12,35 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from oslo.utils import encodeutils
+from oslo_log import log
+from oslo_utils import encodeutils
 import six
 
-from keystone.common import config
-from keystone.i18n import _
-from keystone.openstack.common import log
+import keystone.conf
+from keystone.i18n import _, _LW
 
 
-CONF = config.CONF
+CONF = keystone.conf.CONF
 LOG = log.getLogger(__name__)
 
 # Tests use this to make exception message format errors fatal
 _FATAL_EXCEPTION_FORMAT_ERRORS = False
+
+
+def _format_with_unicode_kwargs(msg_format, kwargs):
+    try:
+        return msg_format % kwargs
+    except UnicodeDecodeError:
+        try:
+            kwargs = {k: encodeutils.safe_decode(v)
+                      for k, v in kwargs.items()}
+        except UnicodeDecodeError:
+            # NOTE(jamielennox): This is the complete failure case
+            # at least by showing the template we have some idea
+            # of where the error is coming from
+            return msg_format
+
+        return msg_format % kwargs
 
 
 class Error(Exception):
@@ -34,6 +50,7 @@ class Error(Exception):
     message_format.
 
     """
+
     code = None
     title = None
     message_format = None
@@ -46,33 +63,20 @@ class Error(Exception):
             if _FATAL_EXCEPTION_FORMAT_ERRORS:
                 raise
             else:
-                LOG.warning(_('missing exception kwargs (programmer error)'))
+                LOG.warning(_LW('missing exception kwargs (programmer error)'))
                 message = self.message_format
 
         super(Error, self).__init__(message)
 
     def _build_message(self, message, **kwargs):
-        """Builds and returns an exception message.
+        """Build and returns an exception message.
 
-        :raises: KeyError given insufficient kwargs
+        :raises KeyError: given insufficient kwargs
 
         """
-        if not message:
-            try:
-                message = self.message_format % kwargs
-            except UnicodeDecodeError:
-                try:
-                    kwargs = dict([(k, encodeutils.safe_decode(v)) for k, v in
-                                   six.iteritems(kwargs)])
-                except UnicodeDecodeError:
-                    # NOTE(jamielennox): This is the complete failure case
-                    # at least by showing the template we have some idea
-                    # of where the error is coming from
-                    message = self.message_format
-                else:
-                    message = self.message_format % kwargs
-
-        return message
+        if message:
+            return message
+        return _format_with_unicode_kwargs(self.message_format, kwargs)
 
 
 class ValidationError(Error):
@@ -84,6 +88,24 @@ class ValidationError(Error):
     title = 'Bad Request'
 
 
+class URLValidationError(ValidationError):
+    message_format = _("Cannot create an endpoint with an invalid URL:"
+                       " %(url)s")
+
+
+class PasswordValidationError(ValidationError):
+    message_format = _("Password validation error: %(detail)s")
+
+
+class PasswordAgeValidationError(PasswordValidationError):
+    message_format = _("You cannot change your password at this time due "
+                       "to the minimum password age. Once you change your "
+                       "password, it must be used for %(min_age_days)d day(s) "
+                       "before it can be changed. Please try again in "
+                       "%(days_left)d day(s) or contact your administrator to "
+                       "reset your password.")
+
+
 class SchemaValidationError(ValidationError):
     # NOTE(lbragstad): For whole OpenStack message consistency, this error
     # message has been written in a format consistent with WSME.
@@ -92,6 +114,15 @@ class SchemaValidationError(ValidationError):
 
 class ValidationTimeStampError(Error):
     message_format = _("Timestamp not in expected format."
+                       " The server could not comply with the request"
+                       " since it is either malformed or otherwise"
+                       " incorrect. The client is assumed to be in error.")
+    code = 400
+    title = 'Bad Request'
+
+
+class ValidationExpirationError(Error):
+    message_format = _("The 'expires_at' must not be before now."
                        " The server could not comply with the request"
                        " since it is either malformed or otherwise"
                        " incorrect. The client is assumed to be in error.")
@@ -115,40 +146,104 @@ class ValidationSizeError(Error):
     title = 'Bad Request'
 
 
-class PasswordVerificationError(Error):
-    message_format = _("The password length must be less than or equal "
-                       "to %(size)i. The server could not comply with the "
-                       "request because the password is invalid.")
+class CircularRegionHierarchyError(Error):
+    message_format = _("The specified parent region %(parent_region_id)s "
+                       "would create a circular region hierarchy.")
+    code = 400
+    title = 'Bad Request'
+
+
+class ForbiddenNotSecurity(Error):
+    """When you want to return a 403 Forbidden response but not security.
+
+    Use this for errors where the message is always safe to present to the user
+    and won't give away extra information.
+
+    """
+
     code = 403
     title = 'Forbidden'
 
 
-class PKITokenExpected(Error):
+class PasswordVerificationError(ForbiddenNotSecurity):
+    message_format = _("The password length must be less than or equal "
+                       "to %(size)i. The server could not comply with the "
+                       "request because the password is invalid.")
+
+
+class RegionDeletionError(ForbiddenNotSecurity):
+    message_format = _("Unable to delete region %(region_id)s because it or "
+                       "its child regions have associated endpoints.")
+
+
+class PKITokenExpected(ForbiddenNotSecurity):
     message_format = _('The certificates you requested are not available. '
                        'It is likely that this server does not use PKI tokens '
                        'otherwise this is the result of misconfiguration.')
-    code = 403
-    title = 'Cannot retrieve certificates'
 
 
 class SecurityError(Error):
-    """Avoids exposing details of security failures, unless in debug mode."""
-    amendment = _('(Disable debug mode to suppress these details.)')
+    """Security error exception.
+
+    Avoids exposing details of security errors, unless in insecure_debug mode.
+
+    """
+
+    amendment = _('(Disable insecure_debug mode to suppress these details.)')
+
+    def __deepcopy__(self):
+        """Override the default deepcopy.
+
+        Keystone :class:`keystone.exception.Error` accepts an optional message
+        that will be used when rendering the exception object as a string. If
+        not provided the object's message_format attribute is used instead.
+        :class:`keystone.exception.SecurityError` is a little different in
+        that it only uses the message provided to the initializer when
+        keystone is in `insecure_debug` mode. Instead it will use its
+        `message_format`. This is to ensure that sensitive details are not
+        leaked back to the caller in a production deployment.
+
+        This dual mode for string rendering causes some odd behaviour when
+        combined with oslo_i18n translation. Any object used as a value for
+        formatting a translated string is deep copied.
+
+        The copy causes an issue. The deep copy process actually creates a new
+        exception instance with the rendered string. Then when that new
+        instance is rendered as a string to use for substitution a warning is
+        logged. This is because the code tries to use the `message_format` in
+        secure mode, but the required kwargs are not in the deep copy.
+
+        The end result is not an error because when the KeyError is caught the
+        instance's ``message`` is used instead and this has the properly
+        translated message. The only indication that something is wonky is a
+        message in the warning log.
+        """
+        return self
 
     def _build_message(self, message, **kwargs):
-        """Only returns detailed messages in debug mode."""
-        if CONF.debug:
+        """Only returns detailed messages in insecure_debug mode."""
+        if message and CONF.insecure_debug:
+            if isinstance(message, six.string_types):
+                # Only do replacement if message is string. The message is
+                # sometimes a different exception or bytes, which would raise
+                # TypeError.
+                message = _format_with_unicode_kwargs(message, kwargs)
             return _('%(message)s %(amendment)s') % {
-                'message': message or self.message_format % kwargs,
+                'message': message,
                 'amendment': self.amendment}
-        else:
-            return self.message_format % kwargs
+
+        return _format_with_unicode_kwargs(self.message_format, kwargs)
 
 
 class Unauthorized(SecurityError):
     message_format = _("The request you have made requires authentication.")
     code = 401
     title = 'Unauthorized'
+
+
+class PasswordExpired(Unauthorized):
+    message_format = _("The password is expired and needs to be reset by an "
+                       "administrator for user: %(user_id)s")
 
 
 class AuthPluginException(Unauthorized):
@@ -159,9 +254,12 @@ class AuthPluginException(Unauthorized):
         self.authentication = {}
 
 
-class MissingGroups(Unauthorized):
-    message_format = _("Unable to find valid groups while using "
-                       "mapping %(mapping_id)s")
+class UserDisabled(Unauthorized):
+    message_format = _("The account is disabled for user: %(user_id)s")
+
+
+class AccountLocked(Unauthorized):
+    message_format = _("The account is locked for user: %(user_id)s")
 
 
 class AuthMethodNotSupported(AuthPluginException):
@@ -203,6 +301,17 @@ class CrossBackendNotAllowed(Forbidden):
                        "user is %(user_id)s")
 
 
+class InvalidPolicyAssociation(Forbidden):
+    message_format = _("Invalid mix of entities for policy association - "
+                       "only Endpoint, Service or Region+Service allowed. "
+                       "Request was - Endpoint: %(endpoint_id)s, "
+                       "Service: %(service_id)s, Region: %(region_id)s")
+
+
+class InvalidDomainConfig(Forbidden):
+    message_format = _("Invalid domain specific configuration: %(reason)s")
+
+
 class NotFound(Error):
     message_format = _("Could not find: %(target)s")
     code = 404
@@ -214,9 +323,9 @@ class EndpointNotFound(NotFound):
 
 
 class MetadataNotFound(NotFound):
-    """(dolph): metadata is not a user-facing concept,
-    so this exception should not be exposed
-    """
+    # NOTE (dolph): metadata is not a user-facing concept,
+    # so this exception should not be exposed.
+
     message_format = _("An unhandled exception has occurred:"
                        " Could not find metadata.")
 
@@ -225,8 +334,31 @@ class PolicyNotFound(NotFound):
     message_format = _("Could not find policy: %(policy_id)s")
 
 
+class PolicyAssociationNotFound(NotFound):
+    message_format = _("Could not find policy association")
+
+
 class RoleNotFound(NotFound):
     message_format = _("Could not find role: %(role_id)s")
+
+
+class ImpliedRoleNotFound(NotFound):
+    message_format = _("%(prior_role_id)s does not imply %(implied_role_id)s")
+
+
+class InvalidImpliedRole(Forbidden):
+    message_format = _("%(role_id)s cannot be an implied roles")
+
+
+class DomainSpecificRoleMismatch(Forbidden):
+    message_format = _("project: %(project_id)s must be in the same domain "
+                       " as the role: %(role_id)s being assigned.")
+
+
+class RoleAssignmentNotFound(NotFound):
+    message_format = _("Could not find role assignment with role: "
+                       "%(role_id)s, user or group: %(actor_id)s, "
+                       "project or domain: %(target_id)s")
 
 
 class RegionNotFound(NotFound):
@@ -243,6 +375,10 @@ class DomainNotFound(NotFound):
 
 class ProjectNotFound(NotFound):
     message_format = _("Could not find project: %(project_id)s")
+
+
+class InvalidParentProject(NotFound):
+    message_format = _("Cannot create project with parent: %(project_id)s")
 
 
 class TokenNotFound(NotFound):
@@ -277,8 +413,16 @@ class VersionNotFound(NotFound):
     message_format = _("Could not find version: %(version)s")
 
 
+class EndpointGroupNotFound(NotFound):
+    message_format = _("Could not find Endpoint Group: %(endpoint_group_id)s")
+
+
 class IdentityProviderNotFound(NotFound):
     message_format = _("Could not find Identity Provider: %(idp_id)s")
+
+
+class ServiceProviderNotFound(NotFound):
+    message_format = _("Could not find Service Provider: %(sp_id)s")
 
 
 class FederatedProtocolNotFound(NotFound):
@@ -292,6 +436,24 @@ class PublicIDNotFound(NotFound):
     message_format = "%(id)s"
 
 
+class DomainConfigNotFound(NotFound):
+    message_format = _('Could not find %(group_or_option)s in domain '
+                       'configuration for domain %(domain_id)s')
+
+
+class ConfigRegistrationNotFound(Exception):
+    # This is used internally between the domain config backend and the
+    # manager, so should not escape to the client.  If it did, it is a coding
+    # error on our part, and would end up, appropriately, as a 500 error.
+    pass
+
+
+class KeystoneConfigurationError(Exception):
+    # This is an exception to be used in the case that Keystone config is
+    # invalid and Keystone should not start.
+    pass
+
+
 class Conflict(Error):
     message_format = _("Conflict occurred attempting to store %(type)s -"
                        " %(details)s")
@@ -299,34 +461,24 @@ class Conflict(Error):
     title = 'Conflict'
 
 
-class RequestTooLarge(Error):
-    message_format = _("Request is too large.")
-    code = 413
-    title = 'Request is too large.'
-
-
 class UnexpectedError(SecurityError):
-    """Avoids exposing details of failures, unless in debug mode."""
-    _message_format = _("An unexpected error prevented the server "
-                        "from fulfilling your request.")
+    """Avoids exposing details of failures, unless in insecure_debug mode."""
+
+    message_format = _("An unexpected error prevented the server "
+                       "from fulfilling your request.")
 
     debug_message_format = _("An unexpected error prevented the server "
                              "from fulfilling your request: %(exception)s")
 
-    @property
-    def message_format(self):
-        """Return the generic message format string unless debug is enabled."""
-        if CONF.debug:
-            return self.debug_message_format
-        return self._message_format
-
     def _build_message(self, message, **kwargs):
-        if CONF.debug and 'exception' not in kwargs:
-            # Ensure that exception has a value to be extra defensive for
-            # substitutions and make sure the exception doesn't raise an
-            # exception.
-            kwargs['exception'] = ''
-        return super(UnexpectedError, self)._build_message(message, **kwargs)
+
+        # Ensure that exception has a value to be extra defensive for
+        # substitutions and make sure the exception doesn't raise an
+        # exception.
+        kwargs.setdefault('exception', '')
+
+        return super(UnexpectedError, self)._build_message(
+            message or self.debug_message_format, **kwargs)
 
     code = 500
     title = 'Internal Server Error'
@@ -353,6 +505,23 @@ class MappedGroupNotFound(UnexpectedError):
                              "%(mapping_id)s was not found in the backend.")
 
 
+class MetadataFileError(UnexpectedError):
+    debug_message_format = _("Error while reading metadata file, %(reason)s")
+
+
+class DirectMappingError(UnexpectedError):
+    message_format = _("Local section in mapping %(mapping_id)s refers to a "
+                       "remote match that doesn't exist "
+                       "(e.g. {0} in a local section).")
+
+
+class AssignmentTypeCalculationError(UnexpectedError):
+    debug_message_format = _(
+        'Unexpected combination of grant attributes - '
+        'User: %(user_id)s, Group: %(group_id)s, Project: %(project_id)s, '
+        'Domain: %(domain_id)s')
+
+
 class NotImplemented(Error):
     message_format = _("The action you have requested has not"
                        " been implemented.")
@@ -372,6 +541,17 @@ class ConfigFileNotFound(UnexpectedError):
                              "could not be found.")
 
 
+class KeysNotFound(UnexpectedError):
+    debug_message_format = _('No encryption keys found; run keystone-manage '
+                             'fernet_setup to bootstrap one.')
+
+
+class MultipleSQLDriversInConfig(UnexpectedError):
+    debug_message_format = _('The Keystone domain-specific configuration has '
+                             'specified more than one SQL driver (only one is '
+                             'permitted): %(source)s.')
+
+
 class MigrationNotProvided(Exception):
     def __init__(self, mod_name, path):
         super(MigrationNotProvided, self).__init__(_(
@@ -380,6 +560,35 @@ class MigrationNotProvided(Exception):
         ) % {'mod_name': mod_name, 'path': path})
 
 
-class UnsupportedTokenVersionException(Exception):
-    """Token version is unrecognizable or unsupported."""
-    pass
+class UnsupportedTokenVersionException(UnexpectedError):
+    debug_message_format = _('Token version is unrecognizable or '
+                             'unsupported.')
+
+
+class SAMLSigningError(UnexpectedError):
+    debug_message_format = _('Unable to sign SAML assertion. It is likely '
+                             'that this server does not have xmlsec1 '
+                             'installed, or this is the result of '
+                             'misconfiguration. Reason %(reason)s')
+
+
+class OAuthHeadersMissingError(UnexpectedError):
+    debug_message_format = _('No Authorization headers found, cannot proceed '
+                             'with OAuth related calls, if running under '
+                             'HTTPd or Apache, ensure WSGIPassAuthorization '
+                             'is set to On.')
+
+
+class TokenlessAuthConfigError(ValidationError):
+    message_format = _('Could not determine Identity Provider ID. The '
+                       'configuration option %(issuer_attribute)s '
+                       'was not found in the request environment.')
+
+
+class UnsupportedDriverVersion(UnexpectedError):
+    debug_message_format = _('%(driver)s is not supported driver version')
+
+
+class CredentialEncryptionError(Exception):
+    message_format = _("An unexpected error prevented the server "
+                       "from accessing encrypted credentials.")

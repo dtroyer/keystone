@@ -14,18 +14,14 @@
 
 """Main entry point into the Policy service."""
 
-import abc
-
-import six
-
 from keystone.common import dependency
 from keystone.common import manager
-from keystone import config
+import keystone.conf
 from keystone import exception
 from keystone import notifications
 
 
-CONF = config.CONF
+CONF = keystone.conf.CONF
 
 
 @dependency.provider('policy_api')
@@ -36,14 +32,18 @@ class Manager(manager.Manager):
     dynamically calls the backend.
 
     """
+
+    driver_namespace = 'keystone.policy'
+
     _POLICY = 'policy'
 
     def __init__(self):
         super(Manager, self).__init__(CONF.policy.driver)
 
-    @notifications.created(_POLICY, public=False)
-    def create_policy(self, policy_id, policy):
-            return self.driver.create_policy(policy_id, policy)
+    def create_policy(self, policy_id, policy, initiator=None):
+        ref = self.driver.create_policy(policy_id, policy)
+        notifications.Audit.created(self._POLICY, policy_id, initiator)
+        return ref
 
     def get_policy(self, policy_id):
         try:
@@ -51,14 +51,15 @@ class Manager(manager.Manager):
         except exception.NotFound:
             raise exception.PolicyNotFound(policy_id=policy_id)
 
-    @notifications.updated(_POLICY, public=False)
-    def update_policy(self, policy_id, policy):
+    def update_policy(self, policy_id, policy, initiator=None):
         if 'id' in policy and policy_id != policy['id']:
             raise exception.ValidationError('Cannot change policy ID')
         try:
-            return self.driver.update_policy(policy_id, policy)
+            ref = self.driver.update_policy(policy_id, policy)
         except exception.NotFound:
             raise exception.PolicyNotFound(policy_id=policy_id)
+        notifications.Audit.updated(self._POLICY, policy_id, initiator)
+        return ref
 
     @manager.response_truncated
     def list_policies(self, hints=None):
@@ -67,66 +68,10 @@ class Manager(manager.Manager):
         # caller.
         return self.driver.list_policies()
 
-    @notifications.deleted(_POLICY, public=False)
-    def delete_policy(self, policy_id):
+    def delete_policy(self, policy_id, initiator=None):
         try:
-            return self.driver.delete_policy(policy_id)
+            ret = self.driver.delete_policy(policy_id)
         except exception.NotFound:
             raise exception.PolicyNotFound(policy_id=policy_id)
-
-
-@six.add_metaclass(abc.ABCMeta)
-class Driver(object):
-
-    def _get_list_limit(self):
-        return CONF.policy.list_limit or CONF.list_limit
-
-    @abc.abstractmethod
-    def enforce(self, context, credentials, action, target):
-        """Verify that a user is authorized to perform action.
-
-        For more information on a full implementation of this see:
-        `keystone.common.policy.enforce`.
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
-    def create_policy(self, policy_id, policy):
-        """Store a policy blob.
-
-        :raises: keystone.exception.Conflict
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
-    def list_policies(self):
-        """List all policies."""
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
-    def get_policy(self, policy_id):
-        """Retrieve a specific policy blob.
-
-        :raises: keystone.exception.PolicyNotFound
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
-    def update_policy(self, policy_id, policy):
-        """Update a policy blob.
-
-        :raises: keystone.exception.PolicyNotFound
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
-    def delete_policy(self, policy_id):
-        """Remove a policy blob.
-
-        :raises: keystone.exception.PolicyNotFound
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
+        notifications.Audit.deleted(self._POLICY, policy_id, initiator)
+        return ret

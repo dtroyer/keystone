@@ -14,44 +14,65 @@
 
 """This module provides support for dependency injection.
 
-Providers are registered via the 'provider' decorator, and dependencies on them
-are registered with 'requires' or 'optional'. Providers are available to their
+Providers are registered via the ``@provider()`` decorator, and dependencies on
+them are registered with ``@requires()``. Providers are available to their
 consumers via an attribute. See the documentation for the individual functions
 for more detail.
 
 See also:
 
     https://en.wikipedia.org/wiki/Dependency_injection
+
 """
 
-import six
+import traceback
 
 from keystone.i18n import _
-from keystone import notifications
 
 
-REGISTRY = {}
+_REGISTRY = {}
 
 _future_dependencies = {}
-_future_optionals = {}
 _factories = {}
 
 
+def _set_provider(name, provider):
+    _original_provider, where_registered = _REGISTRY.get(name, (None, None))
+    if where_registered:
+        raise Exception('%s already has a registered provider, at\n%s' %
+                        (name, ''.join(where_registered)))
+    _REGISTRY[name] = (provider, traceback.format_stack())
+
+
+GET_REQUIRED = object()
+GET_OPTIONAL = object()
+
+
+def get_provider(name, optional=GET_REQUIRED):
+    if optional is GET_REQUIRED:
+        return _REGISTRY[name][0]
+    return _REGISTRY.get(name, (None, None))[0]
+
+
 class UnresolvableDependencyException(Exception):
-    """An UnresolvableDependencyException is raised when a required dependency
-    is not resolvable; see 'resolve_future_dependencies'.
+    """Raised when a required dependency is not resolvable.
+
+    See ``resolve_future_dependencies()`` for more details.
+
     """
-    def __init__(self, name):
-        msg = 'Unregistered dependency: %s' % name
+
+    def __init__(self, name, targets):
+        msg = _('Unregistered dependency: %(name)s for %(targets)s') % {
+            'name': name, 'targets': targets}
         super(UnresolvableDependencyException, self).__init__(msg)
 
 
 def provider(name):
-    """'provider' is a class decorator used to register providers.
+    """A class decorator used to register providers.
 
-    When 'provider' is used to decorate a class, members of that class will
-    register themselves as providers for the named dependency. As an example,
-    In the code fragment::
+    When ``@provider()`` is used to decorate a class, members of that class
+    will register themselves as providers for the named dependency. As an
+    example, In the code fragment::
 
         @dependency.provider('foo_api')
         class Foo:
@@ -62,52 +83,19 @@ def provider(name):
 
         foo = Foo()
 
-    The object 'foo' will be registered as a provider for 'foo_api'. No more
-    than one such instance should be created; additional instances will replace
-    the previous ones, possibly resulting in different instances being used by
-    different consumers.
+    The object ``foo`` will be registered as a provider for ``foo_api``. No
+    more than one such instance should be created; additional instances will
+    replace the previous ones, possibly resulting in different instances being
+    used by different consumers.
+
     """
     def wrapper(cls):
         def wrapped(init):
-            def register_event_callbacks(self):
-                # NOTE(morganfainberg): A provider who has an implicit
-                # dependency on other providers may utilize the event callback
-                # mechanism to react to any changes in those providers. This is
-                # performed at the .provider() mechanism so that we can ensure
-                # that the callback is only ever called once and guaranteed
-                # to be on the properly configured and instantiated backend.
-                if not hasattr(self, 'event_callbacks'):
-                    return
-
-                if not isinstance(self.event_callbacks, dict):
-                    msg = _('event_callbacks must be a dict')
-                    raise ValueError(msg)
-
-                for event in self.event_callbacks:
-                    if not isinstance(self.event_callbacks[event], dict):
-                        msg = _('event_callbacks[%s] must be a dict') % event
-                        raise ValueError(msg)
-                    for resource_type in self.event_callbacks[event]:
-                        # Make sure we register the provider for each event it
-                        # cares to call back.
-                        callbacks = self.event_callbacks[event][resource_type]
-                        if not callbacks:
-                            continue
-                        if not hasattr(callbacks, '__iter__'):
-                            # ensure the callback information is a list
-                            # allowing multiple callbacks to exist
-                            callbacks = [callbacks]
-                        notifications.register_event_callback(event,
-                                                              resource_type,
-                                                              callbacks)
-
             def __wrapped_init__(self, *args, **kwargs):
                 """Initialize the wrapped object and add it to the registry."""
                 init(self, *args, **kwargs)
-                REGISTRY[name] = self
-                register_event_callbacks(self)
-
-                resolve_future_dependencies(name)
+                _set_provider(name, self)
+                resolve_future_dependencies(__provider_name=name)
 
             return __wrapped_init__
 
@@ -124,23 +112,22 @@ def _process_dependencies(obj):
 
     def process(obj, attr_name, unresolved_in_out):
         for dependency in getattr(obj, attr_name, []):
-            if dependency not in REGISTRY:
+            if dependency not in _REGISTRY:
                 # We don't know about this dependency, so save it for later.
                 unresolved_in_out.setdefault(dependency, []).append(obj)
                 continue
 
-            setattr(obj, dependency, REGISTRY[dependency])
+            setattr(obj, dependency, get_provider(dependency))
 
     process(obj, '_dependencies', _future_dependencies)
-    process(obj, '_optionals', _future_optionals)
 
 
 def requires(*dependencies):
-    """'requires' is a class decorator used to inject providers into consumers.
+    """A class decorator used to inject providers into consumers.
 
     The required providers will be made available to instances of the decorated
-    class via an attribute with the same name as the provider. For example,
-    in the code fragment::
+    class via an attribute with the same name as the provider. For example, in
+    the code fragment::
 
         @dependency.requires('foo_api', 'bar_api')
         class FooBarClient:
@@ -151,15 +138,17 @@ def requires(*dependencies):
 
         client = FooBarClient()
 
-    The object 'client' will have attributes named 'foo_api' and 'bar_api',
-    which are instances of the named providers.
+    The object ``client`` will have attributes named ``foo_api`` and
+    ``bar_api``, which are instances of the named providers.
 
     Objects must not rely on the existence of these attributes until after
-    'resolve_future_dependencies' has been called; they may not exist
+    ``resolve_future_dependencies()`` has been called; they may not exist
     beforehand.
 
-    Dependencies registered via 'required' must have providers - if not, an
-    exception will be raised when 'resolve_future_dependencies' is called.
+    Dependencies registered via ``@required()`` must have providers; if not,
+    an ``UnresolvableDependencyException`` will be raised when
+    ``resolve_future_dependencies()`` is called.
+
     """
     def wrapper(self, *args, **kwargs):
         """Inject each dependency from the registry."""
@@ -171,6 +160,7 @@ def requires(*dependencies):
 
         The dependencies of the parent class are combined with that of the
         child class to create a new set of dependencies.
+
         """
         existing_dependencies = getattr(cls, '_dependencies', set())
         cls._dependencies = existing_dependencies.union(dependencies)
@@ -182,34 +172,8 @@ def requires(*dependencies):
     return wrapped
 
 
-def optional(*dependencies):
-    """'optional' is the same as 'requires', except that the dependencies are
-    optional - if no provider is available, the attributes will be set to None.
-    """
-    def wrapper(self, *args, **kwargs):
-        """Inject each dependency from the registry."""
-        self.__wrapped_init__(*args, **kwargs)
-        _process_dependencies(self)
-
-    def wrapped(cls):
-        """Note the optional dependencies on the object for later injection.
-
-        The dependencies of the parent class are combined with that of the
-        child class to create a new set of dependencies.
-        """
-
-        existing_optionals = getattr(cls, '_optionals', set())
-        cls._optionals = existing_optionals.union(dependencies)
-        if not hasattr(cls, '__wrapped_init__'):
-            cls.__wrapped_init__ = cls.__init__
-            cls.__init__ = wrapper
-        return cls
-
-    return wrapped
-
-
-def resolve_future_dependencies(provider_name=None):
-    """'resolve_future_dependencies' forces injection of all dependencies.
+def resolve_future_dependencies(__provider_name=None):
+    """Force injection of all dependencies.
 
     Before this function is called, circular dependencies may not have been
     injected. This function should be called only once, after all global
@@ -217,54 +181,40 @@ def resolve_future_dependencies(provider_name=None):
     call, it must not have circular dependencies.
 
     If any required dependencies are unresolvable, this function will raise an
-    UnresolvableDependencyException.
+    ``UnresolvableDependencyException``.
 
     Outside of this module, this function should be called with no arguments;
-    the optional argument is used internally, and should be treated as an
-    implementation detail.
+    the optional argument, ``__provider_name`` is used internally, and should
+    be treated as an implementation detail.
+
     """
     new_providers = dict()
-    if provider_name:
+    if __provider_name:
         # A provider was registered, so take care of any objects depending on
         # it.
-        targets = _future_dependencies.pop(provider_name, [])
-        targets.extend(_future_optionals.pop(provider_name, []))
+        targets = _future_dependencies.pop(__provider_name, [])
 
         for target in targets:
-            setattr(target, provider_name, REGISTRY[provider_name])
+            setattr(target, __provider_name, get_provider(__provider_name))
 
         return
-
-    # Resolve optional dependencies, sets the attribute to None if there's no
-    # provider registered.
-    for dependency, targets in six.iteritems(_future_optionals.copy()):
-        provider = REGISTRY.get(dependency)
-        if provider is None:
-            factory = _factories.get(dependency)
-            if factory:
-                provider = factory()
-                REGISTRY[dependency] = provider
-                new_providers[dependency] = provider
-        for target in targets:
-            setattr(target, dependency, provider)
 
     # Resolve future dependencies, raises UnresolvableDependencyException if
     # there's no provider registered.
     try:
-        for dependency, targets in six.iteritems(_future_dependencies.copy()):
-            if dependency not in REGISTRY:
+        for dependency, targets in _future_dependencies.copy().items():
+            if dependency not in _REGISTRY:
                 # a Class was registered that could fulfill the dependency, but
                 # it has not yet been initialized.
                 factory = _factories.get(dependency)
                 if factory:
                     provider = factory()
-                    REGISTRY[dependency] = provider
                     new_providers[dependency] = provider
                 else:
-                    raise UnresolvableDependencyException(dependency)
+                    raise UnresolvableDependencyException(dependency, targets)
 
             for target in targets:
-                setattr(target, dependency, REGISTRY[dependency])
+                setattr(target, dependency, get_provider(dependency))
     finally:
         _future_dependencies.clear()
     return new_providers
@@ -276,7 +226,5 @@ def reset():
     This is useful for unit testing to ensure that tests don't use providers
     from previous tests.
     """
-
-    REGISTRY.clear()
+    _REGISTRY.clear()
     _future_dependencies.clear()
-    _future_optionals.clear()

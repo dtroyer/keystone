@@ -15,61 +15,34 @@
 
 """Main entry point into the Catalog service."""
 
-import abc
-
-import six
-
 from keystone.common import cache
 from keystone.common import dependency
 from keystone.common import driver_hints
 from keystone.common import manager
-from keystone import config
+import keystone.conf
 from keystone import exception
 from keystone.i18n import _
 from keystone import notifications
-from keystone.openstack.common import log
 
 
-CONF = config.CONF
-LOG = log.getLogger(__name__)
-SHOULD_CACHE = cache.should_cache_fn('catalog')
-
-EXPIRATION_TIME = lambda: CONF.catalog.cache_time
+CONF = keystone.conf.CONF
 
 
-def format_url(url, substitutions):
-    """Formats a user-defined URL with the given substitutions.
+# This is a general cache region for catalog administration (CRUD operations).
+MEMOIZE = cache.get_memoization_decorator(group='catalog')
 
-    :param string url: the URL to be formatted
-    :param dict substitutions: the dictionary used for substitution
-    :returns: a formatted URL
-
-    """
-    try:
-        result = url.replace('$(', '%(') % substitutions
-    except AttributeError:
-        LOG.error(_('Malformed endpoint - %(url)r is not a string'),
-                  {"url": url})
-        raise exception.MalformedEndpoint(endpoint=url)
-    except KeyError as e:
-        LOG.error(_("Malformed endpoint %(url)s - unknown key %(keyerror)s"),
-                  {"url": url,
-                   "keyerror": e})
-        raise exception.MalformedEndpoint(endpoint=url)
-    except TypeError as e:
-        LOG.error(_("Malformed endpoint '%(url)s'. The following type error "
-                    "occurred during string substitution: %(typeerror)s"),
-                  {"url": url,
-                   "typeerror": e})
-        raise exception.MalformedEndpoint(endpoint=url)
-    except ValueError as e:
-        LOG.error(_("Malformed endpoint %s - incomplete format "
-                    "(are you missing a type notifier ?)"), url)
-        raise exception.MalformedEndpoint(endpoint=url)
-    return result
+# This builds a discrete cache region dedicated to complete service catalogs
+# computed for a given user + project pair. Any write operation to create,
+# modify or delete elements of the service catalog should invalidate this
+# entire cache region.
+COMPUTED_CATALOG_REGION = cache.create_region(name='computed catalog region')
+MEMOIZE_COMPUTED_CATALOG = cache.get_memoization_decorator(
+    group='catalog',
+    region=COMPUTED_CATALOG_REGION)
 
 
 @dependency.provider('catalog_api')
+@dependency.requires('resource_api')
 class Manager(manager.Manager):
     """Default pivot point for the Catalog backend.
 
@@ -77,6 +50,9 @@ class Manager(manager.Manager):
     dynamically calls the backend.
 
     """
+
+    driver_namespace = 'keystone.catalog'
+
     _ENDPOINT = 'endpoint'
     _SERVICE = 'service'
     _REGION = 'region'
@@ -84,44 +60,58 @@ class Manager(manager.Manager):
     def __init__(self):
         super(Manager, self).__init__(CONF.catalog.driver)
 
-    @notifications.created(_REGION, public=False, result_id_arg_attr='id')
-    def create_region(self, region_ref):
+    def create_region(self, region_ref, initiator=None):
         # Check duplicate ID
         try:
             self.get_region(region_ref['id'])
-        except exception.RegionNotFound:
+        except exception.RegionNotFound:  # nosec
+            # A region with the same id doesn't exist already, good.
             pass
         else:
             msg = _('Duplicate ID, %s.') % region_ref['id']
             raise exception.Conflict(type='region', details=msg)
 
-        # NOTE(lbragstad): The description column of the region database
-        # can not be null. So if the user doesn't pass in a description then
-        # set it to an empty string.
-        region_ref.setdefault('description', '')
+        # NOTE(lbragstad,dstanek): The description column of the region
+        # database cannot be null. So if the user doesn't pass in a
+        # description or passes in a null description then set it to an
+        # empty string.
+        if region_ref.get('description') is None:
+            region_ref['description'] = ''
         try:
-            return self.driver.create_region(region_ref)
+            ret = self.driver.create_region(region_ref)
         except exception.NotFound:
             parent_region_id = region_ref.get('parent_region_id')
             raise exception.RegionNotFound(region_id=parent_region_id)
 
-    @cache.on_arguments(should_cache_fn=SHOULD_CACHE,
-                        expiration_time=EXPIRATION_TIME)
+        notifications.Audit.created(self._REGION, ret['id'], initiator)
+        COMPUTED_CATALOG_REGION.invalidate()
+        return ret
+
+    @MEMOIZE
     def get_region(self, region_id):
         try:
             return self.driver.get_region(region_id)
         except exception.NotFound:
             raise exception.RegionNotFound(region_id=region_id)
 
-    @notifications.updated(_REGION, public=False)
-    def update_region(self, region_id, region_ref):
-        return self.driver.update_region(region_id, region_ref)
+    def update_region(self, region_id, region_ref, initiator=None):
+        # NOTE(lbragstad,dstanek): The description column of the region
+        # database cannot be null. So if the user passes in a null
+        # description set it to an empty string.
+        if 'description' in region_ref and region_ref['description'] is None:
+            region_ref['description'] = ''
+        ref = self.driver.update_region(region_id, region_ref)
+        notifications.Audit.updated(self._REGION, region_id, initiator)
+        self.get_region.invalidate(self, region_id)
+        COMPUTED_CATALOG_REGION.invalidate()
+        return ref
 
-    @notifications.deleted(_REGION, public=False)
-    def delete_region(self, region_id):
+    def delete_region(self, region_id, initiator=None):
         try:
             ret = self.driver.delete_region(region_id)
+            notifications.Audit.deleted(self._REGION, region_id, initiator)
             self.get_region.invalidate(self, region_id)
+            COMPUTED_CATALOG_REGION.invalidate()
             return ret
         except exception.NotFound:
             raise exception.RegionNotFound(region_id=region_id)
@@ -130,32 +120,38 @@ class Manager(manager.Manager):
     def list_regions(self, hints=None):
         return self.driver.list_regions(hints or driver_hints.Hints())
 
-    @notifications.created(_SERVICE, public=False)
-    def create_service(self, service_id, service_ref):
+    def create_service(self, service_id, service_ref, initiator=None):
         service_ref.setdefault('enabled', True)
-        return self.driver.create_service(service_id, service_ref)
+        service_ref.setdefault('name', '')
+        ref = self.driver.create_service(service_id, service_ref)
+        notifications.Audit.created(self._SERVICE, service_id, initiator)
+        COMPUTED_CATALOG_REGION.invalidate()
+        return ref
 
-    @cache.on_arguments(should_cache_fn=SHOULD_CACHE,
-                        expiration_time=EXPIRATION_TIME)
+    @MEMOIZE
     def get_service(self, service_id):
         try:
             return self.driver.get_service(service_id)
         except exception.NotFound:
             raise exception.ServiceNotFound(service_id=service_id)
 
-    @notifications.updated(_SERVICE, public=False)
-    def update_service(self, service_id, service_ref):
-        return self.driver.update_service(service_id, service_ref)
+    def update_service(self, service_id, service_ref, initiator=None):
+        ref = self.driver.update_service(service_id, service_ref)
+        notifications.Audit.updated(self._SERVICE, service_id, initiator)
+        self.get_service.invalidate(self, service_id)
+        COMPUTED_CATALOG_REGION.invalidate()
+        return ref
 
-    @notifications.deleted(_SERVICE, public=False)
-    def delete_service(self, service_id):
+    def delete_service(self, service_id, initiator=None):
         try:
             endpoints = self.list_endpoints()
             ret = self.driver.delete_service(service_id)
+            notifications.Audit.deleted(self._SERVICE, service_id, initiator)
             self.get_service.invalidate(self, service_id)
             for endpoint in endpoints:
                 if endpoint['service_id'] == service_id:
                     self.get_endpoint.invalidate(self, endpoint['id'])
+            COMPUTED_CATALOG_REGION.invalidate()
             return ret
         except exception.NotFound:
             raise exception.ServiceNotFound(service_id=service_id)
@@ -164,29 +160,51 @@ class Manager(manager.Manager):
     def list_services(self, hints=None):
         return self.driver.list_services(hints or driver_hints.Hints())
 
-    @notifications.created(_ENDPOINT, public=False)
-    def create_endpoint(self, endpoint_id, endpoint_ref):
+    def _assert_region_exists(self, region_id):
         try:
-            return self.driver.create_endpoint(endpoint_id, endpoint_ref)
-        except exception.NotFound:
-            service_id = endpoint_ref.get('service_id')
-            raise exception.ServiceNotFound(service_id=service_id)
+            if region_id is not None:
+                self.get_region(region_id)
+        except exception.RegionNotFound:
+            raise exception.ValidationError(attribute='endpoint region_id',
+                                            target='region table')
 
-    @notifications.updated(_ENDPOINT, public=False)
-    def update_endpoint(self, endpoint_id, endpoint_ref):
-        return self.driver.update_endpoint(endpoint_id, endpoint_ref)
+    def _assert_service_exists(self, service_id):
+        try:
+            if service_id is not None:
+                self.get_service(service_id)
+        except exception.ServiceNotFound:
+            raise exception.ValidationError(attribute='endpoint service_id',
+                                            target='service table')
 
-    @notifications.deleted(_ENDPOINT, public=False)
-    def delete_endpoint(self, endpoint_id):
+    def create_endpoint(self, endpoint_id, endpoint_ref, initiator=None):
+        self._assert_region_exists(endpoint_ref.get('region_id'))
+        self._assert_service_exists(endpoint_ref['service_id'])
+        ref = self.driver.create_endpoint(endpoint_id, endpoint_ref)
+
+        notifications.Audit.created(self._ENDPOINT, endpoint_id, initiator)
+        COMPUTED_CATALOG_REGION.invalidate()
+        return ref
+
+    def update_endpoint(self, endpoint_id, endpoint_ref, initiator=None):
+        self._assert_region_exists(endpoint_ref.get('region_id'))
+        self._assert_service_exists(endpoint_ref.get('service_id'))
+        ref = self.driver.update_endpoint(endpoint_id, endpoint_ref)
+        notifications.Audit.updated(self._ENDPOINT, endpoint_id, initiator)
+        self.get_endpoint.invalidate(self, endpoint_id)
+        COMPUTED_CATALOG_REGION.invalidate()
+        return ref
+
+    def delete_endpoint(self, endpoint_id, initiator=None):
         try:
             ret = self.driver.delete_endpoint(endpoint_id)
+            notifications.Audit.deleted(self._ENDPOINT, endpoint_id, initiator)
             self.get_endpoint.invalidate(self, endpoint_id)
+            COMPUTED_CATALOG_REGION.invalidate()
             return ret
         except exception.NotFound:
             raise exception.EndpointNotFound(endpoint_id=endpoint_id)
 
-    @cache.on_arguments(should_cache_fn=SHOULD_CACHE,
-                        expiration_time=EXPIRATION_TIME)
+    @MEMOIZE
     def get_endpoint(self, endpoint_id):
         try:
             return self.driver.get_endpoint(endpoint_id)
@@ -197,260 +215,114 @@ class Manager(manager.Manager):
     def list_endpoints(self, hints=None):
         return self.driver.list_endpoints(hints or driver_hints.Hints())
 
-    def get_catalog(self, user_id, tenant_id, metadata=None):
+    @MEMOIZE_COMPUTED_CATALOG
+    def get_catalog(self, user_id, tenant_id):
         try:
-            return self.driver.get_catalog(user_id, tenant_id, metadata)
+            return self.driver.get_catalog(user_id, tenant_id)
         except exception.NotFound:
             raise exception.NotFound('Catalog not found for user and tenant')
 
+    @MEMOIZE_COMPUTED_CATALOG
+    def get_v3_catalog(self, user_id, tenant_id):
+        return self.driver.get_v3_catalog(user_id, tenant_id)
 
-@six.add_metaclass(abc.ABCMeta)
-class Driver(object):
-    """Interface description for an Catalog driver."""
+    def add_endpoint_to_project(self, endpoint_id, project_id):
+        self.driver.add_endpoint_to_project(endpoint_id, project_id)
+        COMPUTED_CATALOG_REGION.invalidate()
 
-    def _get_list_limit(self):
-        return CONF.catalog.list_limit or CONF.list_limit
+    def remove_endpoint_from_project(self, endpoint_id, project_id):
+        self.driver.remove_endpoint_from_project(endpoint_id, project_id)
+        COMPUTED_CATALOG_REGION.invalidate()
 
-    @abc.abstractmethod
-    def create_region(self, region_ref):
-        """Creates a new region.
+    def add_endpoint_group_to_project(self, endpoint_group_id, project_id):
+        self.driver.add_endpoint_group_to_project(
+            endpoint_group_id, project_id)
+        COMPUTED_CATALOG_REGION.invalidate()
 
-        :raises: keystone.exception.Conflict
-        :raises: keystone.exception.RegionNotFound (if parent region invalid)
+    def remove_endpoint_group_from_project(self, endpoint_group_id,
+                                           project_id):
+        self.driver.remove_endpoint_group_from_project(
+            endpoint_group_id, project_id)
+        COMPUTED_CATALOG_REGION.invalidate()
 
-        """
-        raise exception.NotImplemented()  # pragma: no cover
+    def delete_endpoint_group_association_by_project(self, project_id):
+        try:
+            self.driver.delete_endpoint_group_association_by_project(
+                project_id)
+        except exception.NotImplemented:
+            # Some catalog drivers don't support this
+            pass
 
-    @abc.abstractmethod
-    def list_regions(self, hints):
-        """List all regions.
+    def get_endpoint_groups_for_project(self, project_id):
+        # recover the project endpoint group memberships and for each
+        # membership recover the endpoint group
+        self.resource_api.get_project(project_id)
+        try:
+            refs = self.list_endpoint_groups_for_project(project_id)
+            endpoint_groups = [self.get_endpoint_group(
+                ref['endpoint_group_id']) for ref in refs]
+            return endpoint_groups
+        except exception.EndpointGroupNotFound:
+            return []
 
-        :param hints: contains the list of filters yet to be satisfied.
-                      Any filters satisfied here will be removed so that
-                      the caller will know if any filters remain.
+    def get_endpoints_filtered_by_endpoint_group(self, endpoint_group_id):
+        endpoints = self.list_endpoints()
+        filters = self.get_endpoint_group(endpoint_group_id)['filters']
+        filtered_endpoints = []
 
-        :returns: list of region_refs or an empty list.
+        for endpoint in endpoints:
+            is_candidate = True
+            for key, value in filters.items():
+                if endpoint[key] != value:
+                    is_candidate = False
+                    break
+            if is_candidate:
+                filtered_endpoints.append(endpoint)
+        return filtered_endpoints
 
-        """
-        raise exception.NotImplemented()  # pragma: no cover
+    def list_endpoints_for_project(self, project_id):
+        """List all endpoints associated with a project.
 
-    @abc.abstractmethod
-    def get_region(self, region_id):
-        """Get region by id.
-
-        :returns: region_ref dict
-        :raises: keystone.exception.RegionNotFound
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
-    def update_region(self, region_id, region_ref):
-        """Update region by id.
-
-        :returns: region_ref dict
-        :raises: keystone.exception.RegionNotFound
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
-    def delete_region(self, region_id):
-        """Deletes an existing region.
-
-        :raises: keystone.exception.RegionNotFound
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
-    def create_service(self, service_id, service_ref):
-        """Creates a new service.
-
-        :raises: keystone.exception.Conflict
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
-    def list_services(self, hints):
-        """List all services.
-
-        :param hints: contains the list of filters yet to be satisfied.
-                      Any filters satisfied here will be removed so that
-                      the caller will know if any filters remain.
-
-        :returns: list of service_refs or an empty list.
+        :param project_id: project identifier to check
+        :type project_id: string
+        :returns: a list of endpoint ids or an empty list.
 
         """
-        raise exception.NotImplemented()  # pragma: no cover
+        refs = self.driver.list_endpoints_for_project(project_id)
+        filtered_endpoints = {}
+        for ref in refs:
+            try:
+                endpoint = self.get_endpoint(ref['endpoint_id'])
+                filtered_endpoints.update({ref['endpoint_id']: endpoint})
+            except exception.EndpointNotFound:
+                # remove bad reference from association
+                self.remove_endpoint_from_project(ref['endpoint_id'],
+                                                  project_id)
 
-    @abc.abstractmethod
-    def get_service(self, service_id):
-        """Get service by id.
+        # need to recover endpoint_groups associated with project
+        # then for each endpoint group return the endpoints.
+        endpoint_groups = self.get_endpoint_groups_for_project(project_id)
+        for endpoint_group in endpoint_groups:
+            endpoint_refs = self.get_endpoints_filtered_by_endpoint_group(
+                endpoint_group['id'])
+            # now check if any endpoints for current endpoint group are not
+            # contained in the list of filtered endpoints
+            for endpoint_ref in endpoint_refs:
+                if endpoint_ref['id'] not in filtered_endpoints:
+                    filtered_endpoints[endpoint_ref['id']] = endpoint_ref
 
-        :returns: service_ref dict
-        :raises: keystone.exception.ServiceNotFound
+        return filtered_endpoints
 
-        """
-        raise exception.NotImplemented()  # pragma: no cover
+    def delete_association_by_endpoint(self, endpoint_id):
+        try:
+            self.driver.delete_association_by_endpoint(endpoint_id)
+        except exception.NotImplemented:
+            # Some catalog drivers don't support this
+            pass
 
-    @abc.abstractmethod
-    def update_service(self, service_id, service_ref):
-        """Update service by id.
-
-        :returns: service_ref dict
-        :raises: keystone.exception.ServiceNotFound
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
-    def delete_service(self, service_id):
-        """Deletes an existing service.
-
-        :raises: keystone.exception.ServiceNotFound
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
-    def create_endpoint(self, endpoint_id, endpoint_ref):
-        """Creates a new endpoint for a service.
-
-        :raises: keystone.exception.Conflict,
-                 keystone.exception.ServiceNotFound
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
-    def get_endpoint(self, endpoint_id):
-        """Get endpoint by id.
-
-        :returns: endpoint_ref dict
-        :raises: keystone.exception.EndpointNotFound
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
-    def list_endpoints(self, hints):
-        """List all endpoints.
-
-        :param hints: contains the list of filters yet to be satisfied.
-                      Any filters satisfied here will be removed so that
-                      the caller will know if any filters remain.
-
-        :returns: list of endpoint_refs or an empty list.
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
-    def update_endpoint(self, endpoint_id, endpoint_ref):
-        """Get endpoint by id.
-
-        :returns: endpoint_ref dict
-        :raises: keystone.exception.EndpointNotFound
-                 keystone.exception.ServiceNotFound
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
-    def delete_endpoint(self, endpoint_id):
-        """Deletes an endpoint for a service.
-
-        :raises: keystone.exception.EndpointNotFound
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    @abc.abstractmethod
-    def get_catalog(self, user_id, tenant_id, metadata=None):
-        """Retrieve and format the current service catalog.
-
-        Example::
-
-            { 'RegionOne':
-                {'compute': {
-                    'adminURL': u'http://host:8774/v1.1/tenantid',
-                    'internalURL': u'http://host:8774/v1.1/tenant_id',
-                    'name': 'Compute Service',
-                    'publicURL': u'http://host:8774/v1.1/tenantid'},
-                 'ec2': {
-                    'adminURL': 'http://host:8773/services/Admin',
-                    'internalURL': 'http://host:8773/services/Cloud',
-                    'name': 'EC2 Service',
-                    'publicURL': 'http://host:8773/services/Cloud'}}
-
-        :returns: A nested dict representing the service catalog or an
-                  empty dict.
-        :raises: keystone.exception.NotFound
-
-        """
-        raise exception.NotImplemented()  # pragma: no cover
-
-    def get_v3_catalog(self, user_id, tenant_id, metadata=None):
-        """Retrieve and format the current V3 service catalog.
-
-        The default implementation builds the V3 catalog from the V2 catalog.
-
-        Example::
-
-            [
-                {
-                    "endpoints": [
-                    {
-                        "interface": "public",
-                        "id": "--endpoint-id--",
-                        "region": "RegionOne",
-                        "url": "http://external:8776/v1/--project-id--"
-                    },
-                    {
-                        "interface": "internal",
-                        "id": "--endpoint-id--",
-                        "region": "RegionOne",
-                        "url": "http://internal:8776/v1/--project-id--"
-                    }],
-                "id": "--service-id--",
-                "type": "volume"
-            }]
-
-        :returns: A list representing the service catalog or an empty list
-        :raises: keystone.exception.NotFound
-
-        """
-        v2_catalog = self.get_catalog(user_id, tenant_id, metadata=metadata)
-        v3_catalog = []
-
-        for region_name, region in six.iteritems(v2_catalog):
-            for service_type, service in six.iteritems(region):
-                service_v3 = {
-                    'type': service_type,
-                    'endpoints': []
-                }
-
-                for attr, value in six.iteritems(service):
-                    # Attributes that end in URL are interfaces. In the V2
-                    # catalog, these are internalURL, publicURL, and adminURL.
-                    # For example, <region_name>.publicURL=<URL> in the V2
-                    # catalog becomes the V3 interface for the service:
-                    # { 'interface': 'public', 'url': '<URL>', 'region':
-                    #   'region: '<region_name>' }
-                    if attr.endswith('URL'):
-                        v3_interface = attr[:-len('URL')]
-                        service_v3['endpoints'].append({
-                            'interface': v3_interface,
-                            'region': region_name,
-                            'url': value,
-                        })
-                        continue
-
-                    # Other attributes are copied to the service.
-                    service_v3[attr] = value
-
-                v3_catalog.append(service_v3)
-
-        return v3_catalog
+    def delete_association_by_project(self, project_id):
+        try:
+            self.driver.delete_association_by_project(project_id)
+        except exception.NotImplemented:
+            # Some catalog drivers don't support this
+            pass

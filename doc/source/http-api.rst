@@ -26,8 +26,8 @@ The original source of truth for the v2.0 API is defined by a set of WADL and
 XSD files. The original source of truth for the v3 API is defined by
 documentation.
 
-.. _`Identity API v2.0`: https://github.com/openstack/identity-api/tree/master/v2.0/src
-.. _`Identity API v3`: https://github.com/openstack/identity-api/tree/master/v3/src/markdown
+.. _`Identity API v2.0`: http://developer.openstack.org/api-ref/identity/v2/
+.. _`Identity API v3`: http://developer.openstack.org/api-ref/identity/v3/
 
 History
 =======
@@ -73,14 +73,14 @@ method:
 .. code-block:: ini
 
     [app:service_v3]
-    paste.app_factory = keystone.service:v3_app_factory
+    use = egg:keystone#service_v3
 
 Then define a v3 pipeline, which terminates with the v3 application you defined
 above:
 
 .. code-block:: ini
 
-    [app:app_v3]
+    [pipeline:api_v3]
     pipeline = ... service_v3
 
 Replace "..." with whatever middleware you'd like to run in front of the API
@@ -125,8 +125,8 @@ Keystone clients can use to automatically detect available API versions.
 With unversioned ``identity`` endpoints in the service catalog, you should be
 able to `authenticate with keystoneclient`_ successfully.
 
-.. _`latest sample configuration`: https://github.com/openstack/keystone/blob/master/etc/keystone-paste.ini
-.. _`authenticate with keystoneclient`: http://docs.openstack.org/developer/python-keystoneclient/using-api-v3.html#authenticating
+.. _`latest sample configuration`: https://git.openstack.org/cgit/openstack/keystone/tree/etc/keystone-paste.ini
+.. _`authenticate with keystoneclient`: http://docs.openstack.org/developer/python-keystoneclient/using-api-v3.html#authenticating-using-sessions
 
 I have a Python client
 ----------------------
@@ -148,7 +148,7 @@ I have a non-Python client
 You'll likely need to heavily reference our `API documentation`_ to port your
 application to Identity API v3.
 
-.. _`API documentation`: https://github.com/openstack/identity-api/blob/master/v3/src/markdown/identity-api-v3.md
+.. _`API documentation`: https://git.openstack.org/cgit/openstack-attic/identity-api/tree/v3/src/markdown/identity-api-v3.md
 
 The most common operation would be password-based authentication including a
 tenant name (i.e. project name) to specify an authorization scope. In Identity
@@ -214,3 +214,13 @@ Note a few key differences when compared to the v2.0 API:
 - In v3, your token is returned to you in an ``X-Subject-Token`` header,
   instead of as part of the request body. You should still authenticate
   yourself to other services using the ``X-Auth-Token`` header.
+
+
+HTTP/1.1 Chunked Encoding
+=========================
+.. WARNING::
+
+    Running Keystone under HTTPD in the recommended (and tested) configuration does not support
+    the use of ``Transfer-Encoding: chunked``. This is due to a limitation with the WSGI spec
+    and the implementation used by ``mod_wsgi``. It is recommended that all
+    clients assume Keystone will not support ``Transfer-Encoding: chunked``.

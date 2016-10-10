@@ -15,30 +15,55 @@
 import sys
 
 from keystoneclient.common import cms
-from oslo.utils import timeutils
+from oslo_log import log
+from oslo_log import versionutils
+from oslo_serialization import jsonutils
+from oslo_utils import importutils
 import six
+import stevedore
 
-from keystone.assignment import controllers as assignment_controllers
-from keystone.common import authorization
 from keystone.common import controller
 from keystone.common import dependency
+from keystone.common import utils
 from keystone.common import wsgi
-from keystone import config
-from keystone.contrib import federation
+import keystone.conf
 from keystone import exception
-from keystone.i18n import _, _LI
-from keystone.openstack.common import importutils
-from keystone.openstack.common import jsonutils
-from keystone.openstack.common import log
+from keystone.federation import constants
+from keystone.i18n import _, _LI, _LW
+from keystone.resource import controllers as resource_controllers
 
 
 LOG = log.getLogger(__name__)
 
-CONF = config.CONF
+CONF = keystone.conf.CONF
 
 # registry of authentication methods
 AUTH_METHODS = {}
 AUTH_PLUGINS_LOADED = False
+
+
+def load_auth_method(method):
+    plugin_name = CONF.auth.get(method) or 'default'
+    namespace = 'keystone.auth.%s' % method
+    try:
+        driver_manager = stevedore.DriverManager(namespace, plugin_name,
+                                                 invoke_on_load=True)
+        return driver_manager.driver
+    except RuntimeError:
+        LOG.debug('Failed to load the %s driver (%s) using stevedore, will '
+                  'attempt to load using import_object instead.',
+                  method, plugin_name)
+
+    driver = importutils.import_object(plugin_name)
+
+    msg = (_(
+        'Direct import of auth plugin %(name)r is deprecated as of Liberty in '
+        'favor of its entrypoint from %(namespace)r and may be removed in '
+        'N.') %
+        {'name': plugin_name, 'namespace': namespace})
+    versionutils.report_deprecated_feature(LOG, msg)
+
+    return driver
 
 
 def load_auth_methods():
@@ -49,29 +74,9 @@ def load_auth_methods():
         return
     # config.setup_authentication should be idempotent, call it to ensure we
     # have setup all the appropriate configuration options we may need.
-    config.setup_authentication()
-    for plugin in CONF.auth.methods:
-        if '.' in plugin:
-            # NOTE(morganfainberg): if '.' is in the plugin name, it should be
-            # imported rather than used as a plugin identifier.
-            plugin_class = plugin
-            driver = importutils.import_object(plugin)
-            if not hasattr(driver, 'method'):
-                raise ValueError(_('Cannot load an auth-plugin by class-name '
-                                   'without a "method" attribute defined: %s'),
-                                 plugin_class)
-
-            LOG.info(_LI('Loading auth-plugins by class-name is deprecated.'))
-            plugin_name = driver.method
-        else:
-            plugin_name = plugin
-            plugin_class = CONF.auth.get(plugin)
-            driver = importutils.import_object(plugin_class)
-        if plugin_name in AUTH_METHODS:
-            raise ValueError(_('Auth plugin %(plugin)s is requesting '
-                               'previously registered method %(method)s') %
-                             {'plugin': plugin_class, 'method': driver.method})
-        AUTH_METHODS[plugin_name] = driver
+    keystone.conf.auth.setup_authentication()
+    for plugin in set(CONF.auth.methods):
+        AUTH_METHODS[plugin] = load_auth_method(plugin)
     AUTH_PLUGINS_LOADED = True
 
 
@@ -97,6 +102,7 @@ class AuthContext(dict):
                                      'expires_at'])
 
     def __setitem__(self, key, val):
+        """Override __setitem__ to prevent conflicting values."""
         if key in self.IDENTITY_ATTRIBUTES and key in self:
             existing_val = self[key]
             if key == 'expires_at':
@@ -121,93 +127,99 @@ class AuthContext(dict):
         return super(AuthContext, self).__setitem__(key, val)
 
 
-# TODO(blk-u): this class doesn't use identity_api directly, but makes it
-# available for consumers. Consumers should probably not be getting
-# identity_api from this since it's available in global registry, then
-# identity_api should be removed from this list.
-@dependency.requires('assignment_api', 'identity_api', 'trust_api')
+@dependency.requires('resource_api', 'trust_api')
 class AuthInfo(object):
     """Encapsulation of "auth" request."""
 
     @staticmethod
-    def create(context, auth=None):
-        auth_info = AuthInfo(context, auth=auth)
-        auth_info._validate_and_normalize_auth_data()
+    def create(auth=None, scope_only=False):
+        auth_info = AuthInfo(auth=auth)
+        auth_info._validate_and_normalize_auth_data(scope_only)
         return auth_info
 
-    def __init__(self, context, auth=None):
-        self.context = context
+    def __init__(self, auth=None):
         self.auth = auth
-        self._scope_data = (None, None, None)
-        # self._scope_data is (domain_id, project_id, trust_ref)
-        # project scope: (None, project_id, None)
-        # domain scope: (domain_id, None, None)
-        # trust scope: (None, None, trust_ref)
-        # unscoped: (None, None, None)
+        self._scope_data = (None, None, None, None)
+        # self._scope_data is (domain_id, project_id, trust_ref, unscoped)
+        # project scope: (None, project_id, None, None)
+        # domain scope: (domain_id, None, None, None)
+        # trust scope: (None, None, trust_ref, None)
+        # unscoped: (None, None, None, 'unscoped')
 
     def _assert_project_is_enabled(self, project_ref):
         # ensure the project is enabled
         try:
-            self.assignment_api.assert_project_enabled(
+            self.resource_api.assert_project_enabled(
                 project_id=project_ref['id'],
                 project=project_ref)
         except AssertionError as e:
-            LOG.warning(e)
+            LOG.warning(six.text_type(e))
             six.reraise(exception.Unauthorized, exception.Unauthorized(e),
                         sys.exc_info()[2])
 
     def _assert_domain_is_enabled(self, domain_ref):
         try:
-            self.assignment_api.assert_domain_enabled(
+            self.resource_api.assert_domain_enabled(
                 domain_id=domain_ref['id'],
                 domain=domain_ref)
         except AssertionError as e:
-            LOG.warning(e)
+            LOG.warning(six.text_type(e))
             six.reraise(exception.Unauthorized, exception.Unauthorized(e),
                         sys.exc_info()[2])
 
     def _lookup_domain(self, domain_info):
+        if isinstance(domain_info, dict) is False:
+            raise exception.ValidationError(attribute='dict',
+                                            target='domain')
         domain_id = domain_info.get('id')
         domain_name = domain_info.get('name')
-        domain_ref = None
         if not domain_id and not domain_name:
             raise exception.ValidationError(attribute='id or name',
                                             target='domain')
         try:
             if domain_name:
-                domain_ref = self.assignment_api.get_domain_by_name(
+                if (CONF.resource.domain_name_url_safe == 'strict' and
+                        utils.is_not_url_safe(domain_name)):
+                    msg = _('Domain name cannot contain reserved characters.')
+                    raise exception.Unauthorized(message=msg)
+                domain_ref = self.resource_api.get_domain_by_name(
                     domain_name)
             else:
-                domain_ref = self.assignment_api.get_domain(domain_id)
+                domain_ref = self.resource_api.get_domain(domain_id)
         except exception.DomainNotFound as e:
-            LOG.exception(e)
+            LOG.warning(six.text_type(e))
             raise exception.Unauthorized(e)
         self._assert_domain_is_enabled(domain_ref)
         return domain_ref
 
     def _lookup_project(self, project_info):
+        if isinstance(project_info, dict) is False:
+            raise exception.ValidationError(attribute='dict',
+                                            target='project')
         project_id = project_info.get('id')
         project_name = project_info.get('name')
-        project_ref = None
         if not project_id and not project_name:
             raise exception.ValidationError(attribute='id or name',
                                             target='project')
         try:
             if project_name:
+                if (CONF.resource.project_name_url_safe == 'strict' and
+                        utils.is_not_url_safe(project_name)):
+                    msg = _('Project name cannot contain reserved characters.')
+                    raise exception.Unauthorized(message=msg)
                 if 'domain' not in project_info:
                     raise exception.ValidationError(attribute='domain',
                                                     target='project')
                 domain_ref = self._lookup_domain(project_info['domain'])
-                project_ref = self.assignment_api.get_project_by_name(
+                project_ref = self.resource_api.get_project_by_name(
                     project_name, domain_ref['id'])
             else:
-                project_ref = self.assignment_api.get_project(project_id)
+                project_ref = self.resource_api.get_project(project_id)
                 # NOTE(morganfainberg): The _lookup_domain method will raise
                 # exception.Unauthorized if the domain isn't found or is
                 # disabled.
                 self._lookup_domain({'id': project_ref['domain_id']})
         except exception.ProjectNotFound as e:
-            LOG.exception(e)
             raise exception.Unauthorized(e)
         self._assert_project_is_enabled(project_ref)
         return project_ref
@@ -218,8 +230,6 @@ class AuthInfo(object):
             raise exception.ValidationError(attribute='trust_id',
                                             target='trust')
         trust = self.trust_api.get_trust(trust_id)
-        if not trust:
-            raise exception.TrustNotFound(trust_id=trust_id)
         return trust
 
     def _validate_and_normalize_scope_data(self):
@@ -228,17 +238,20 @@ class AuthInfo(object):
             return
         if sum(['project' in self.auth['scope'],
                 'domain' in self.auth['scope'],
+                'unscoped' in self.auth['scope'],
                 'OS-TRUST:trust' in self.auth['scope']]) != 1:
             raise exception.ValidationError(
-                attribute='project, domain, or OS-TRUST:trust',
+                attribute='project, domain, OS-TRUST:trust or unscoped',
                 target='scope')
-
+        if 'unscoped' in self.auth['scope']:
+            self._scope_data = (None, None, None, 'unscoped')
+            return
         if 'project' in self.auth['scope']:
             project_ref = self._lookup_project(self.auth['scope']['project'])
-            self._scope_data = (None, project_ref['id'], None)
+            self._scope_data = (None, project_ref['id'], None, None)
         elif 'domain' in self.auth['scope']:
             domain_ref = self._lookup_domain(self.auth['scope']['domain'])
-            self._scope_data = (domain_ref['id'], None, None)
+            self._scope_data = (domain_ref['id'], None, None, None)
         elif 'OS-TRUST:trust' in self.auth['scope']:
             if not CONF.trust.enabled:
                 raise exception.Forbidden('Trusts are disabled.')
@@ -248,9 +261,9 @@ class AuthInfo(object):
             if trust_ref.get('project_id') is not None:
                 project_ref = self._lookup_project(
                     {'id': trust_ref['project_id']})
-                self._scope_data = (None, project_ref['id'], trust_ref)
+                self._scope_data = (None, project_ref['id'], trust_ref, None)
             else:
-                self._scope_data = (None, None, trust_ref)
+                self._scope_data = (None, None, trust_ref, None)
 
     def _validate_auth_methods(self):
         if 'identity' not in self.auth:
@@ -273,18 +286,29 @@ class AuthInfo(object):
             if method_name not in AUTH_METHODS:
                 raise exception.AuthMethodNotSupported()
 
-    def _validate_and_normalize_auth_data(self):
-        """Make sure "auth" is valid."""
+    def _validate_and_normalize_auth_data(self, scope_only=False):
+        """Make sure "auth" is valid.
+
+        :param scope_only: If it is True, auth methods will not be
+                           validated but only the scope data.
+        :type scope_only: boolean
+        """
         # make sure "auth" exist
         if not self.auth:
             raise exception.ValidationError(attribute='auth',
                                             target='request body')
 
-        self._validate_auth_methods()
+        # NOTE(chioleong): Tokenless auth does not provide auth methods,
+        # we only care about using this method to validate the scope
+        # information. Therefore, validating the auth methods here is
+        # insignificant and we can skip it when scope_only is set to
+        # true.
+        if scope_only is False:
+            self._validate_auth_methods()
         self._validate_and_normalize_scope_data()
 
     def get_method_names(self):
-        """Returns the identity method names.
+        """Return the identity method names.
 
         :returns: list of auth method names
 
@@ -313,20 +337,22 @@ class AuthInfo(object):
 
         Verify and return the scoping information.
 
-        :returns: (domain_id, project_id, trust_ref).
-                   If scope to a project, (None, project_id, None)
+        :returns: (domain_id, project_id, trust_ref, unscoped).
+                   If scope to a project, (None, project_id, None, None)
                    will be returned.
-                   If scoped to a domain, (domain_id, None, None)
+                   If scoped to a domain, (domain_id, None, None, None)
                    will be returned.
-                   If scoped to a trust, (None, project_id, trust_ref),
+                   If scoped to a trust, (None, project_id, trust_ref, None),
                    Will be returned, where the project_id comes from the
                    trust definition.
-                   If unscoped, (None, None, None) will be returned.
+                   If unscoped, (None, None, None, 'unscoped') will be
+                   returned.
 
         """
         return self._scope_data
 
-    def set_scope(self, domain_id=None, project_id=None, trust=None):
+    def set_scope(self, domain_id=None, project_id=None, trust=None,
+                  unscoped=None):
         """Set scope information."""
         if domain_id and project_id:
             msg = _('Scoping to both domain and project is not allowed')
@@ -337,11 +363,11 @@ class AuthInfo(object):
         if project_id and trust:
             msg = _('Scoping to both project and trust is not allowed')
             raise ValueError(msg)
-        self._scope_data = (domain_id, project_id, trust)
+        self._scope_data = (domain_id, project_id, trust, unscoped)
 
 
 @dependency.requires('assignment_api', 'catalog_api', 'identity_api',
-                     'token_provider_api', 'trust_api')
+                     'resource_api', 'token_provider_api', 'trust_api')
 class Auth(controller.V3Controller):
 
     # Note(atiwari): From V3 auth controller code we are
@@ -359,22 +385,22 @@ class Auth(controller.V3Controller):
 
     def __init__(self, *args, **kw):
         super(Auth, self).__init__(*args, **kw)
-        config.setup_authentication()
+        keystone.conf.auth.setup_authentication()
 
-    def authenticate_for_token(self, context, auth=None):
+    def authenticate_for_token(self, request, auth=None):
         """Authenticate user and issue a token."""
-        include_catalog = 'nocatalog' not in context['query_string']
+        include_catalog = 'nocatalog' not in request.params
 
         try:
-            auth_info = AuthInfo.create(context, auth=auth)
+            auth_info = AuthInfo.create(auth=auth)
             auth_context = AuthContext(extras={},
                                        method_names=[],
                                        bind={})
-            self.authenticate(context, auth_info, auth_context)
+            self.authenticate(request, auth_info, auth_context)
             if auth_context.get('access_token_id'):
                 auth_info.set_scope(None, auth_context['project_id'], None)
             self._check_and_set_default_scoping(auth_info, auth_context)
-            (domain_id, project_id, trust) = auth_info.get_scope()
+            (domain_id, project_id, trust, unscoped) = auth_info.get_scope()
 
             method_names = auth_info.get_method_names()
             method_names += auth_context.get('method_names', [])
@@ -387,10 +413,11 @@ class Auth(controller.V3Controller):
 
             token_audit_id = auth_context.get('audit_id')
 
+            is_domain = auth_context.get('is_domain')
             (token_id, token_data) = self.token_provider_api.issue_v3_token(
                 auth_context['user_id'], method_names, expires_at, project_id,
-                domain_id, auth_context, trust, metadata_ref, include_catalog,
-                parent_audit_id=token_audit_id)
+                is_domain, domain_id, auth_context, trust, metadata_ref,
+                include_catalog, parent_audit_id=token_audit_id)
 
             # NOTE(wanghong): We consume a trust use only when we are using
             # trusts and have successfully issued a token.
@@ -403,7 +430,7 @@ class Auth(controller.V3Controller):
             raise exception.Unauthorized(e)
 
     def _check_and_set_default_scoping(self, auth_info, auth_context):
-        (domain_id, project_id, trust) = auth_info.get_scope()
+        (domain_id, project_id, trust, unscoped) = auth_info.get_scope()
         if trust:
             project_id = trust['project_id']
         if domain_id or project_id or trust:
@@ -411,14 +438,18 @@ class Auth(controller.V3Controller):
             return
 
         # Skip scoping when unscoped federated token is being issued
-        if federation.IDENTITY_PROVIDER in auth_context:
+        if constants.IDENTITY_PROVIDER in auth_context:
+            return
+
+        # Do not scope if request is for explicitly unscoped token
+        if unscoped is not None:
             return
 
         # fill in default_project_id if it is available
         try:
             user_ref = self.identity_api.get_user(auth_context['user_id'])
         except exception.UserNotFound as e:
-            LOG.exception(e)
+            LOG.warning(six.text_type(e))
             raise exception.Unauthorized(e)
 
         default_project_id = user_ref.get('default_project_id')
@@ -428,9 +459,9 @@ class Auth(controller.V3Controller):
 
         # make sure user's default project is legit before scoping to it
         try:
-            default_project_ref = self.assignment_api.get_project(
+            default_project_ref = self.resource_api.get_project(
                 default_project_id)
-            default_project_domain_ref = self.assignment_api.get_domain(
+            default_project_domain_ref = self.resource_api.get_domain(
                 default_project_ref['domain_id'])
             if (default_project_ref.get('enabled', True) and
                     default_project_domain_ref.get('enabled', True)):
@@ -438,38 +469,40 @@ class Auth(controller.V3Controller):
                         user_ref['id'], default_project_id):
                     auth_info.set_scope(project_id=default_project_id)
                 else:
-                    msg = _("User %(user_id)s doesn't have access to"
-                            " default project %(project_id)s. The token will"
-                            " be unscoped rather than scoped to the project.")
+                    msg = _LW("User %(user_id)s doesn't have access to"
+                              " default project %(project_id)s. The token"
+                              " will be unscoped rather than scoped to the"
+                              " project.")
                     LOG.warning(msg,
                                 {'user_id': user_ref['id'],
                                  'project_id': default_project_id})
             else:
-                msg = _("User %(user_id)s's default project %(project_id)s is"
-                        " disabled. The token will be unscoped rather than"
-                        " scoped to the project.")
+                msg = _LW("User %(user_id)s's default project %(project_id)s"
+                          " is disabled. The token will be unscoped rather"
+                          " than scoped to the project.")
                 LOG.warning(msg,
                             {'user_id': user_ref['id'],
                              'project_id': default_project_id})
         except (exception.ProjectNotFound, exception.DomainNotFound):
             # default project or default project domain doesn't exist,
             # will issue unscoped token instead
-            msg = _("User %(user_id)s's default project %(project_id)s not"
-                    " found. The token will be unscoped rather than"
-                    " scoped to the project.")
+            msg = _LW("User %(user_id)s's default project %(project_id)s not"
+                      " found. The token will be unscoped rather than"
+                      " scoped to the project.")
             LOG.warning(msg, {'user_id': user_ref['id'],
                               'project_id': default_project_id})
 
-    def authenticate(self, context, auth_info, auth_context):
+    def authenticate(self, request, auth_info, auth_context):
         """Authenticate user."""
-
         # The 'external' method allows any 'REMOTE_USER' based authentication
         # In some cases the server can set REMOTE_USER as '' instead of
         # dropping it, so this must be filtered out
-        if context['environment'].get('REMOTE_USER'):
+        if request.remote_user:
             try:
                 external = get_auth_method('external')
-                external.authenticate(context, auth_info, auth_context)
+                external.authenticate(request,
+                                      auth_info,
+                                      auth_context)
             except exception.AuthMethodNotSupported:
                 # This will happen there is no 'external' plugin registered
                 # and the container is performing authentication.
@@ -477,18 +510,18 @@ class Auth(controller.V3Controller):
                 # In those cases, it is correct to not register an
                 # 'external' plugin;  if there is both an 'external' and a
                 # 'kerberos' plugin, it would run the check on identity twice.
-                pass
+                LOG.debug("No 'external' plugin is registered.")
             except exception.Unauthorized:
                 # If external fails then continue and attempt to determine
                 # user identity using remaining auth methods
-                pass
+                LOG.debug("Authorization failed for 'external' auth method.")
 
         # need to aggregate the results in case two or more methods
         # are specified
         auth_response = {'methods': []}
         for method_name in auth_info.get_method_names():
             method = get_auth_method(method_name)
-            resp = method.authenticate(context,
+            resp = method.authenticate(request,
                                        auth_info.get_method_data(method_name),
                                        auth_context)
             if resp:
@@ -504,8 +537,8 @@ class Auth(controller.V3Controller):
             raise exception.Unauthorized(msg)
 
     @controller.protected()
-    def check_token(self, context):
-        token_id = context.get('subject_token_id')
+    def check_token(self, request):
+        token_id = request.context_dict.get('subject_token_id')
         token_data = self.token_provider_api.validate_v3_token(
             token_id)
         # NOTE(morganfainberg): The code in
@@ -514,14 +547,14 @@ class Auth(controller.V3Controller):
         return render_token_data_response(token_id, token_data)
 
     @controller.protected()
-    def revoke_token(self, context):
-        token_id = context.get('subject_token_id')
+    def revoke_token(self, request):
+        token_id = request.context_dict.get('subject_token_id')
         return self.token_provider_api.revoke_token(token_id)
 
     @controller.protected()
-    def validate_token(self, context):
-        token_id = context.get('subject_token_id')
-        include_catalog = 'nocatalog' not in context['query_string']
+    def validate_token(self, request):
+        token_id = request.context_dict.get('subject_token_id')
+        include_catalog = 'nocatalog' not in request.params
         token_data = self.token_provider_api.validate_v3_token(
             token_id)
         if not include_catalog and 'catalog' in token_data['token']:
@@ -529,16 +562,26 @@ class Auth(controller.V3Controller):
         return render_token_data_response(token_id, token_data)
 
     @controller.protected()
-    def revocation_list(self, context, auth=None):
+    def revocation_list(self, request):
         if not CONF.token.revoke_by_id:
             raise exception.Gone()
+
+        audit_id_only = 'audit_id_only' in request.params
+
         tokens = self.token_provider_api.list_revoked_tokens()
 
         for t in tokens:
             expires = t['expires']
             if not (expires and isinstance(expires, six.text_type)):
-                    t['expires'] = timeutils.isotime(expires)
+                t['expires'] = utils.isotime(expires)
+            if audit_id_only:
+                t.pop('id', None)
         data = {'revoked': tokens}
+
+        if audit_id_only:
+            # No need to obfuscate if no token IDs.
+            return data
+
         json_data = jsonutils.dumps(data)
         signed_text = cms.cms_sign_text(json_data,
                                         CONF.signing.certfile,
@@ -546,67 +589,60 @@ class Auth(controller.V3Controller):
 
         return {'signed': signed_text}
 
-    def get_auth_context(self, context):
-        # TODO(dolphm): this method of accessing the auth context is terrible,
-        # but context needs to be refactored to always have reasonable values.
-        env_context = context.get('environment', {})
-        return env_context.get(authorization.AUTH_CONTEXT_ENV, {})
-
     def _combine_lists_uniquely(self, a, b):
         # it's most likely that only one of these will be filled so avoid
         # the combination if possible.
         if a and b:
-            return dict((x['id'], x) for x in a + b).values()
+            return {x['id']: x for x in a + b}.values()
         else:
             return a or b
 
     @controller.protected()
-    def get_auth_projects(self, context):
-        auth_context = self.get_auth_context(context)
+    def get_auth_projects(self, request):
+        user_id = request.auth_context.get('user_id')
+        group_ids = request.auth_context.get('group_ids')
 
-        user_id = auth_context.get('user_id')
         user_refs = []
         if user_id:
             try:
                 user_refs = self.assignment_api.list_projects_for_user(user_id)
-            except exception.UserNotFound:
+            except exception.UserNotFound:  # nosec
                 # federated users have an id but they don't link to anything
                 pass
 
-        group_ids = auth_context.get('group_ids')
         grp_refs = []
         if group_ids:
             grp_refs = self.assignment_api.list_projects_for_groups(group_ids)
 
         refs = self._combine_lists_uniquely(user_refs, grp_refs)
-        return assignment_controllers.ProjectV3.wrap_collection(context, refs)
+        return resource_controllers.ProjectV3.wrap_collection(
+            request.context_dict, refs)
 
     @controller.protected()
-    def get_auth_domains(self, context):
-        auth_context = self.get_auth_context(context)
+    def get_auth_domains(self, request):
+        user_id = request.auth_context.get('user_id')
+        group_ids = request.auth_context.get('group_ids')
 
-        user_id = auth_context.get('user_id')
         user_refs = []
         if user_id:
             try:
                 user_refs = self.assignment_api.list_domains_for_user(user_id)
-            except exception.UserNotFound:
+            except exception.UserNotFound:  # nosec
                 # federated users have an id but they don't link to anything
                 pass
 
-        group_ids = auth_context.get('group_ids')
         grp_refs = []
         if group_ids:
             grp_refs = self.assignment_api.list_domains_for_groups(group_ids)
 
         refs = self._combine_lists_uniquely(user_refs, grp_refs)
-        return assignment_controllers.DomainV3.wrap_collection(context, refs)
+        return resource_controllers.DomainV3.wrap_collection(
+            request.context_dict, refs)
 
     @controller.protected()
-    def get_auth_catalog(self, context):
-        auth_context = self.get_auth_context(context)
-        user_id = auth_context.get('user_id')
-        project_id = auth_context.get('project_id')
+    def get_auth_catalog(self, request):
+        user_id = request.auth_context.get('user_id')
+        project_id = request.auth_context.get('project_id')
 
         if not project_id:
             raise exception.Forbidden(
@@ -621,7 +657,8 @@ class Auth(controller.V3Controller):
         # several private methods.
         return {
             'catalog': self.catalog_api.get_v3_catalog(user_id, project_id),
-            'links': {'self': self.base_url(context, path='auth/catalog')}
+            'links': {'self': self.base_url(request.context_dict,
+                                            path='auth/catalog')}
         }
 
 
